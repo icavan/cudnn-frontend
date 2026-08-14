@@ -27,6 +27,7 @@ class FlashAttentionDSABackwardSm100:
         max_topk: int = 0,
         lse_includes_sink: bool = False,
         num_dkv_shards: int | None = None,
+        num_load_kv_warps: int = 16,
     ):
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
@@ -78,16 +79,19 @@ class FlashAttentionDSABackwardSm100:
         self.dSink_num_threads = 32
 
         # =============== Bwd ====================
-        self.load_KV_warp_id = tuple(range(16))
-        self.compute_warp_id = (16, 17, 18, 19)
-        self.reduce_warp_id = (20, 21, 22, 23, 24, 25, 26, 27)
-        self.mma_warp_id = 28
-        self.load_warp_id = 29
-        self.empty_warp_id = 30
-
-        self.num_load_KV_warps = 16
+        assert block_tile % (4 * num_load_kv_warps) == 0
+        self.num_load_KV_warps = num_load_kv_warps
         self.num_compute_warps = 4
         self.num_reduce_warps = 8
+
+        self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
+        compute_warp_begin = self.num_load_KV_warps
+        self.compute_warp_id = tuple(range(compute_warp_begin, compute_warp_begin + self.num_compute_warps))
+        reduce_warp_begin = compute_warp_begin + self.num_compute_warps
+        self.reduce_warp_id = tuple(range(reduce_warp_begin, reduce_warp_begin + self.num_reduce_warps))
+        self.mma_warp_id = reduce_warp_begin + self.num_reduce_warps
+        self.load_warp_id = self.mma_warp_id + 1
+        self.empty_warp_id = self.load_warp_id + 1
 
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * (self.num_load_KV_warps + self.num_compute_warps + self.num_reduce_warps + 4)
@@ -160,7 +164,7 @@ class FlashAttentionDSABackwardSm100:
         # The asymmetric path needs more registers in the sparse gather for
         # long-lived top-k indices and copy addresses. Compute stays below its
         # 128-register cap, so this redistribution also lowers the CTA total.
-        self.num_regs_load_KV = 24
+        self.num_regs_load_KV = 40 if num_load_kv_warps <= 8 else 24
         self.num_regs_compute = 128
         self.num_regs_reduce = 96
         self.num_regs_mma = 40
@@ -1444,15 +1448,13 @@ class FlashAttentionDSABackwardSm100:
         mTopkLength: Optional[cute.Tensor],
         is_first: bool,
         local_tidx: Int32,
-        local_warp_idx: Int32,
+        row: Int32,
         async_copy_atom: cute.CopyAtom,
         async_thr_copy: cute.TiledCopy,
     ):
-        """Load four rows per warp using independent eight-lane subgroups."""
+        """Load one row per eight-lane subgroup."""
         _, _, batch_idx = cute.arch.block_idx()
-        subgroup = local_tidx // 8
         lane_in_subwarp = local_tidx % 8
-        row = local_warp_idx * 4 + subgroup
         idx = tile_index * self.block_tile + row
         tile_sK = sK_slice[row, (None, None)]
 
@@ -1529,48 +1531,54 @@ class FlashAttentionDSABackwardSm100:
 
         tile_index = tile_count - 1
         full_tiles = (topk % self.block_tile) == 0
+        rows_per_warp = self.block_tile // self.num_load_KV_warps
+        row_batches = rows_per_warp // 4
+        rTopkIdx = cute.make_rmem_tensor((row_batches,), cutlass.Int32)
 
         while tile_index >= 0:
-            row = local_warp_idx * 4 + subgroup
-            idx = tile_index * self.block_tile + row
-            topk_idx = Int32(-1)
-            if lane_in_subwarp == 0:
-                if idx < self.max_topk:
-                    topk_idx = mTopkIdxs[idx, (token_idx, batch_idx)]
-            topk_idx = cute.arch.shuffle_sync(topk_idx, subgroup * 8)
+            for row_batch in cutlass.range_constexpr(row_batches):
+                row = local_warp_idx * rows_per_warp + row_batch * 4 + subgroup
+                idx = tile_index * self.block_tile + row
+                topk_idx = Int32(-1)
+                if lane_in_subwarp == 0:
+                    if idx < self.max_topk:
+                        topk_idx = mTopkIdxs[idx, (token_idx, batch_idx)]
+                rTopkIdx[row_batch] = cute.arch.shuffle_sync(topk_idx, subgroup * 8)
 
             load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
             sK_slice = sK[(None, None), 0, (None, None), load_mma_K_producer_state.index]
             sK_slice = cute.composition(sK_slice, cute.make_layout((self.block_tile, self.head_dim)))
 
-            if full_tiles:
-                self._load_kv_rows(
-                    mKV,
-                    sK_slice,
-                    topk_idx,
-                    tile_index,
-                    topk,
-                    mTopkLength,
-                    is_first=False,
-                    local_tidx=local_tidx,
-                    local_warp_idx=local_warp_idx,
-                    async_copy_atom=async_copy_atom,
-                    async_thr_copy=async_thr_copy,
-                )
-            else:
-                self._load_kv_rows(
-                    mKV,
-                    sK_slice,
-                    topk_idx,
-                    tile_index,
-                    topk,
-                    mTopkLength,
-                    is_first=True,
-                    local_tidx=local_tidx,
-                    local_warp_idx=local_warp_idx,
-                    async_copy_atom=async_copy_atom,
-                    async_thr_copy=async_thr_copy,
-                )
+            for row_batch in cutlass.range_constexpr(row_batches):
+                row = local_warp_idx * rows_per_warp + row_batch * 4 + subgroup
+                if full_tiles:
+                    self._load_kv_rows(
+                        mKV,
+                        sK_slice,
+                        rTopkIdx[row_batch],
+                        tile_index,
+                        topk,
+                        mTopkLength,
+                        is_first=False,
+                        local_tidx=local_tidx,
+                        row=row,
+                        async_copy_atom=async_copy_atom,
+                        async_thr_copy=async_thr_copy,
+                    )
+                else:
+                    self._load_kv_rows(
+                        mKV,
+                        sK_slice,
+                        rTopkIdx[row_batch],
+                        tile_index,
+                        topk,
+                        mTopkLength,
+                        is_first=True,
+                        local_tidx=local_tidx,
+                        row=row,
+                        async_copy_atom=async_copy_atom,
+                        async_thr_copy=async_thr_copy,
+                    )
 
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
