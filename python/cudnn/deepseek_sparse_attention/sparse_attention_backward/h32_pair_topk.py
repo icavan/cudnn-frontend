@@ -21,7 +21,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass._mlir.dialects import nvvm
 from cutlass.utils.smem_allocator import SmemAllocator
 
 
@@ -118,10 +117,11 @@ class H32PairTopkUnion:
                     if kv_idx >= 0 and kv_idx < self.seqlen_kv:
                         word_idx = kv_idx // 32
                         bit_idx = kv_idx % 32
-                        nvvm.atomicrmw(
-                            "or",
+                        cute.arch.atomic_or(
                             membership_bits.iterator + query_in_pair * self.num_words + word_idx,
                             Int32(1) << bit_idx,
+                            sem="relaxed",
+                            scope="cta",
                         )
         cute.arch.sync_threads()
 
