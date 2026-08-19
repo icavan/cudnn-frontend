@@ -298,6 +298,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     )
                     dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
+                # The second M64 half is the final consumer of this K128
+                # gather.  Release the single-stage K buffer before dKV2/3,
+                # which only consume Q/dO and P/dS, so the loaders can gather
+                # the next sparse tile under the remaining MMA and atomics.
+                if half_iter == self.num_kv_subtiles - 1:
+                    load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
+                    load_mma_K_consumer_state.advance()
+
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
@@ -344,8 +352,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 is_first_generation = False
                 is_first_dkv_half = False
 
-            load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
-            load_mma_K_consumer_state.advance()
             tile_index -= 1
 
         # Balance the reducer's final one-way dKV2/3 T2R notification.
