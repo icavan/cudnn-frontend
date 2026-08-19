@@ -72,10 +72,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        # Keep the 1024-thread CTA within the SM register budget.  Raising
-        # four compute warps to 192 registers while retaining 16 loaders and
-        # eight reducers requests more than 64K registers and can deadlock at
-        # setmaxnreg.inc before any pipeline work starts.
+        # The inherited 1024-thread CTA already sits near the SM register
+        # budget.  Keep compute at 128 registers; setmaxnreg.inc(192) cannot
+        # be satisfied with 16 loaders and eight reducers resident.
         self.num_regs_compute = 128
 
     def _setup_attributes(self):
@@ -738,115 +737,3 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
-
-    @cute.jit
-    def compute(
-        self,
-        tma_atom_dQ: cute.CopyAtom,
-        tma_tensor_dQ: cute.Tensor,
-        tma_atom_dQ_64: cute.CopyAtom,
-        tma_tensor_dQ_64: cute.Tensor,
-        dQ4_tiled_mma: cute.TiledMma,
-        tStS: cute.Tensor,
-        tdPtdP: cute.Tensor,
-        tdQtdQ: Tuple,
-        sLSE: cute.Tensor,
-        sSum_OdO: cute.Tensor,
-        sP: cute.Tensor,
-        sP_store: cute.Tensor,
-        sdS: cute.Tensor,
-        sdS_store: cute.Tensor,
-        sdQ: cute.Tensor,
-        sdQ4: cute.Tensor,
-        scale_softmax: Float32,
-        tile_count: Int32,
-        pipelines,
-    ):
-        # Temporary isolation: use the proven single-generation H16 compute
-        # schedule to distinguish pipeline deadlock from the H32 logical split.
-        return FlashAttentionDSABackwardSm100H16.compute(
-            self,
-            tma_atom_dQ,
-            tma_tensor_dQ,
-            tma_atom_dQ_64,
-            tma_tensor_dQ_64,
-            dQ4_tiled_mma,
-            tStS,
-            tdPtdP,
-            tdQtdQ,
-            sLSE,
-            sSum_OdO,
-            sP,
-            sP_store,
-            sdS,
-            sdS_store,
-            sdQ,
-            sdQ4,
-            scale_softmax,
-            tile_count,
-            pipelines,
-        )
-
-    @cute.jit
-    def mma(
-        self,
-        QK_tiled_mma: cute.TiledMma,
-        dOV_tiled_mma: cute.TiledMma,
-        dOP_tiled_mma: cute.TiledMma,
-        QdS_tiled_mma: cute.TiledMma,
-        KdS_tiled_mma: cute.TiledMma,
-        dKV4_tiled_mma: cute.TiledMma,
-        dQ4_tiled_mma: cute.TiledMma,
-        tSrQ: cute.Tensor,
-        tSrK: cute.Tensor,
-        tdPrdO: cute.Tensor,
-        tdPrV: cute.Tensor,
-        tdKVrdOT: cute.Tensor,
-        tdKVrP: cute.Tensor,
-        tdQrK: cute.Tensor,
-        tdQrdST: cute.Tensor,
-        tdKVrQT: cute.Tensor,
-        tdKVrdS: cute.Tensor,
-        tdQrK_tail: cute.Tensor,
-        tdKVrQT_tail: cute.Tensor,
-        tdKVrdS_4: cute.Tensor,
-        tStS: cute.Tensor,
-        tdPtdP: cute.Tensor,
-        tdKVtdKV: Tuple,
-        tdQtdQ: Tuple,
-        tile_count: Int32,
-        sdS: cute.Tensor,
-        pipelines,
-    ):
-        # Temporary isolation: keep the H32 tilers and storage allocation but
-        # use the proven H16 producer schedule.
-        return FlashAttentionDSABackwardSm100H16.mma(
-            self,
-            QK_tiled_mma,
-            dOV_tiled_mma,
-            dOP_tiled_mma,
-            QdS_tiled_mma,
-            KdS_tiled_mma,
-            dKV4_tiled_mma,
-            dQ4_tiled_mma,
-            tSrQ,
-            tSrK,
-            tdPrdO,
-            tdPrV,
-            tdKVrdOT,
-            tdKVrP,
-            tdQrK,
-            tdQrdST,
-            tdKVrQT,
-            tdKVrdS,
-            tdQrK_tail,
-            tdKVrQT_tail,
-            tdKVrdS_4,
-            tStS,
-            tdPtdP,
-            tdKVtdKV,
-            tdQtdQ,
-            tile_count,
-            sdS,
-            pipelines,
-        )
