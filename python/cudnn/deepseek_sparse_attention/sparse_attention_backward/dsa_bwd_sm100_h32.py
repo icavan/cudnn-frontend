@@ -89,7 +89,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
     def _setup_attributes(self):
         super()._setup_attributes()
-        self.mma_reduce_dKV_stage = 3
+        # Two stages give sufficient backpressure for the three disjoint dKV
+        # destinations without the severe producer/consumer serialization
+        # observed with a three-stage PipelineUmmaAsync ring.
+        self.mma_reduce_dKV_stage = 2
 
     @cute.jit
     def mma(
