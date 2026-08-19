@@ -120,7 +120,7 @@ class H32PairTopkUnion:
                         bit_idx = kv_idx % 32
                         nvvm.atomicrmw(
                             "or",
-                            membership_bits.data_ptr(query_in_pair * self.num_words + word_idx),
+                            membership_bits.iterator + query_in_pair * self.num_words + word_idx,
                             Int32(1) << bit_idx,
                             space=nvvm.SharedSpace.shared_cta,
                         )
