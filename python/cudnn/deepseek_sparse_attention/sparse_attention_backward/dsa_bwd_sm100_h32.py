@@ -425,7 +425,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_rdP = cute.make_rmem_tensor(tTR_cdP.shape, self.acc_dtype)
         tTR_rS_f16 = cute.make_rmem_tensor(tTR_cS.shape, self.element_dtype)
         tTR_rdP_f16 = cute.make_rmem_tensor(tTR_cdP.shape, self.element_dtype)
-        warp_half = tidx_in_wg // (2 * self.threads_per_warp)
 
         load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
         load_compute_sum_OdO_pipeline.consumer_wait(load_compute_sum_OdO_consumer_state)
@@ -440,10 +439,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
-                if warp_half == kv_half:
-                    cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
+                cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
 
-                    for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
+                for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
+                    row = cute.get(tTR_cS[i], mode=[0])
+                    if row // self.kv_subtile == kv_half:
                         lse = (
                             sLSE[cute.get(tTR_cS[i], mode=[1]), load_compute_LSE_consumer_state.index],
                             sLSE[cute.get(tTR_cS[i + 1], mode=[1]), load_compute_LSE_consumer_state.index],
@@ -455,14 +455,15 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         )
                         tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                         tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
-                    tTR_rS_f16 = self.quantize(tTR_rS, 1)
+                tTR_rS_f16 = self.quantize(tTR_rS, 1)
 
                 cute.arch.fence_view_async_tmem_load()
                 self.compute_sync_barrier.arrive_and_wait()
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
-                if warp_half == kv_half:
-                    for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
-                        row = cute.get(tTR_cS[i], mode=[0]) - kv_half * self.kv_subtile
+                for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
+                    global_row = cute.get(tTR_cS[i], mode=[0])
+                    if global_row // self.kv_subtile == kv_half:
+                        row = global_row - kv_half * self.kv_subtile
                         col = cute.get(tTR_cS[i], mode=[1])
                         sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -470,9 +471,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 compute_mma_P_producer_state.advance()
 
                 compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
-                if warp_half == kv_half:
-                    cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
-                    for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
+                cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
+                for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
+                    row = cute.get(tTR_cdP[i], mode=[0])
+                    if row // self.kv_subtile == kv_half:
                         tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.add_packed_f32x2(
                             (tTR_rdP[i], tTR_rdP[i + 1]),
                             (
@@ -484,14 +486,15 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             (tTR_rdP[i], tTR_rdP[i + 1]),
                             (tTR_rS[i], tTR_rS[i + 1]),
                         )
-                    tTR_rdP_f16 = self.quantize(tTR_rdP, 1, scale_softmax)
+                tTR_rdP_f16 = self.quantize(tTR_rdP, 1, scale_softmax)
 
                 cute.arch.fence_view_async_tmem_load()
                 self.compute_sync_barrier.arrive_and_wait()
                 ds_stage = 0 if self.compute_mma_dS_stage == 1 else compute_mma_dS_producer_state.index
-                if warp_half == kv_half:
-                    for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
-                        row = cute.get(tTR_cdP[i], mode=[0]) - kv_half * self.kv_subtile
+                for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
+                    global_row = cute.get(tTR_cdP[i], mode=[0])
+                    if global_row // self.kv_subtile == kv_half:
+                        row = global_row - kv_half * self.kv_subtile
                         col = cute.get(tTR_cdP[i], mode=[1])
                         sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
