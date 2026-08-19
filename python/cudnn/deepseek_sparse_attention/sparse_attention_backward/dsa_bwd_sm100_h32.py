@@ -172,13 +172,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
-                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 if not is_first_generation:
                     # Reducers encounter dKV4 before dKV2/dKV3.  Match that
-                    # barrier order here; waiting on dKV23 first deadlocks
-                    # against reducers already blocked in the dKV4 barrier.
+                    # barrier order before producer_acquire.  The acquire may
+                    # itself wait for the dKV4 generation's consumer_release,
+                    # which occurs only after this barrier is satisfied.
                     self.t2r_dKV4_done_barrier.arrive_and_wait()
                     self.t2r_dKV23_done_barrier.arrive_and_wait()
+                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
 
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
