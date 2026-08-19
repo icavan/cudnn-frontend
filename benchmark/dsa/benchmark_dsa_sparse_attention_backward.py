@@ -56,6 +56,8 @@ def make_inputs(seqlen_q, topk, seqlen_kv, nheads, head_dim, head_dim_v, dtype, 
         attn_sink = torch.full((nheads,), float("-inf"), device=device, dtype=torch.float32)
 
     topk_idxs = torch.rand(seqlen_q, seqlen_kv, device=device).argsort(dim=-1)[:, :topk].to(torch.int32)
+    if os.environ.get("CUDNN_DSA_BENCH_SORT_TOPK", "0") == "1":
+        topk_idxs = topk_idxs.sort(dim=-1).values
     topk_length = None
     if use_topk_length:
         topk_length = torch.full((seqlen_q,), topk, dtype=torch.int32, device=device)
