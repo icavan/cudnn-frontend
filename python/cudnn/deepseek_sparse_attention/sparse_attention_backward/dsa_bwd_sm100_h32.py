@@ -906,7 +906,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV23_done_barrier.arrive_and_wait()
+                if cutlass.const_expr(self.use_tma_dkv_reduce):
+                    self.t2r_dKV23_done_barrier.arrive()
+                else:
+                    self.t2r_dKV23_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 if cutlass.const_expr(not self.skip_atomic_diagnostic):
