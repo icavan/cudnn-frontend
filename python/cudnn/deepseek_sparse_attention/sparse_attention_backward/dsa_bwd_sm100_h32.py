@@ -428,6 +428,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_tdP = thr_t2r_dP.partition_S(tdPtdP)
         tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
         tTR_rdP = cute.make_rmem_tensor(tTR_cdP.shape, self.acc_dtype)
+        tTR_rS_f16 = cute.make_rmem_tensor(tTR_cS.shape, self.element_dtype)
         rConvert = cute.make_rmem_tensor((2,), self.acc_dtype)
         rConvert_f16 = cute.make_rmem_tensor((2,), self.element_dtype)
 
@@ -457,6 +458,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 )
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+            tTR_rS_f16 = self.quantize(tTR_rS, 2)
 
             cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
             for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
@@ -479,16 +481,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
-                for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
-                    rConvert[0] = tTR_rS[i]
-                    rConvert[1] = tTR_rS[i + 1]
-                    rConvert_f16.store(rConvert.load().to(self.element_dtype))
-                    for j in cutlass.range_constexpr(2):
-                        global_row = cute.get(tTR_cS[i + j], mode=[0])
-                        if global_row // self.kv_subtile == kv_half:
-                            row = global_row - kv_half * self.kv_subtile
-                            col = cute.get(tTR_cS[i + j], mode=[1])
-                            sP[(row, col), 0, 0, p_stage] = rConvert_f16[j]
+                for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
+                    global_row = cute.get(tTR_cS[i], mode=[0])
+                    if global_row // self.kv_subtile == kv_half:
+                        row = global_row - kv_half * self.kv_subtile
+                        col = cute.get(tTR_cS[i], mode=[1])
+                        sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
                 compute_mma_P_producer_state.advance()
