@@ -87,7 +87,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
     def _setup_attributes(self):
         super()._setup_attributes()
-        self.mma_reduce_dKV_stage = 2
+        self.mma_reduce_dKV_stage = int(os.environ.get("CUDNN_DSA_H32_DKV_STAGES", "2"))
 
     @cute.jit
     def mma(
