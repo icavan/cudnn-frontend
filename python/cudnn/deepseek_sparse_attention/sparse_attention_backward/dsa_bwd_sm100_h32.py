@@ -42,6 +42,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         # enough CTA register budget for the wider N32 compute fragments while
         # preserving the four-compute/eight-reducer specialization.
         self.num_load_KV_warps = 8
+        self.kv_rows_per_subgroup = 2
         self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
         compute_warp_begin = self.num_load_KV_warps
         self.compute_warp_id = tuple(range(compute_warp_begin, compute_warp_begin + self.num_compute_warps))
