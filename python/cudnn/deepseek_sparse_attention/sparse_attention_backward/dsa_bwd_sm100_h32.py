@@ -36,7 +36,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         self.h_tile = 32
         self.kv_subtile = 64
-        self.num_kv_subtiles = 2
+        self.num_kv_subtiles = 1  # Temporary pipeline isolation; restore to 2 after the first-generation smoke test.
 
         # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
         # half at a time so P/dS only occupy 4 KiB each in shared memory.
