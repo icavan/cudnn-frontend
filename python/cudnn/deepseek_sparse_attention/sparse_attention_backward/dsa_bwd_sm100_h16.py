@@ -73,6 +73,8 @@ class FlashAttentionDSABackwardSm100H16:
         self.num_load_KV_warps = 16
         self.num_compute_warps = 4
         self.num_reduce_warps = 8
+        self.dkv_tma_rows = 0
+        self.use_tma_dkv_reduce = False
         self.reduce_rows_per_thread = block_tile // self.num_reduce_warps
 
         self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
@@ -397,6 +399,7 @@ class FlashAttentionDSABackwardSm100H16:
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+        tma_reduce_op = cpasync.CopyReduceBulkTensorTileS2GOp()
 
         Q_smem_layout = cute.select(Q_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
@@ -471,6 +474,18 @@ class FlashAttentionDSABackwardSm100H16:
             self.acc_dtype,
         )
         mdKV_acc = cute.make_tensor(mdKV_acc.iterator, mdKV.layout)
+        tma_atom_dKV_acc = None
+        tma_tensor_dKV_acc = None
+        dKV_reduce_smem_layout = None
+        if cutlass.const_expr(self.use_tma_dkv_reduce):
+            dKV_reduce_smem_layout = cute.make_layout((128, self.dkv_tma_rows), stride=(1, 128))
+            dKV_reduce_row_layout = cute.make_layout((128, 1), stride=(1, 128))
+            tma_atom_dKV_acc, tma_tensor_dKV_acc = cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_reduce_op,
+                mdKV_acc,
+                dKV_reduce_row_layout,
+                (128, 1),
+            )
 
         # ============ Sum OdO ============
         sum_OdO_scale = Float32(-1.0)
@@ -518,6 +533,8 @@ class FlashAttentionDSABackwardSm100H16:
             mKV,
             mdQ,
             mdKV_acc,
+            tma_atom_dKV_acc,
+            tma_tensor_dKV_acc,
             mdSink,
             mAttnSink,
             mTopkIdxs,
@@ -544,6 +561,7 @@ class FlashAttentionDSABackwardSm100H16:
             dQ4_smem_layout_staged,
             LSE_smem_layout,
             sum_OdO_smem_layout,
+            dKV_reduce_smem_layout,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -745,6 +763,8 @@ class FlashAttentionDSABackwardSm100H16:
         mKV: cute.Tensor,
         mdQ: cute.Tensor,
         mdKV_acc: cute.Tensor,
+        tma_atom_dKV_acc,
+        tma_tensor_dKV_acc,
         mdSink: cute.Tensor,
         mAttnSink: cute.Tensor,
         mTopkIdxs: cute.Tensor,
@@ -771,6 +791,7 @@ class FlashAttentionDSABackwardSm100H16:
         dQ4_smem_layout_staged: cute.ComposedLayout,
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
+        dKV_reduce_smem_layout,
     ):
         token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         tidx, _, batch_idx = cute.arch.thread_idx()
@@ -850,6 +871,10 @@ class FlashAttentionDSABackwardSm100H16:
         sV = storage.sK.get_tensor(V_smem_layout_staged.outer, swizzle=V_smem_layout_staged.inner)
         sP = storage.sP.get_tensor(P_smem_layout_staged.outer, swizzle=P_smem_layout_staged.inner)
         sP_store = storage.sP.get_tensor(P_smem_layout_store_staged.outer, swizzle=P_smem_layout_store_staged.inner)
+        sDkvReduce = None
+        if cutlass.const_expr(self.use_tma_dkv_reduce):
+            sDkvReduce_ptr = cute.recast_ptr(sP.iterator, dtype=self.acc_dtype)
+            sDkvReduce = cute.make_tensor(sDkvReduce_ptr, dKV_reduce_smem_layout)
         sdO = storage.sdO.get_tensor(dO_smem_layout_staged.outer, swizzle=dO_smem_layout_staged.inner)
         sdS = storage.sdS.get_tensor(dS_smem_layout_staged.outer, swizzle=dS_smem_layout_staged.inner)
         sdS_store = storage.sdS.get_tensor(dS_smem_layout_store_staged.outer, swizzle=dS_smem_layout_store_staged.inner)
@@ -1068,6 +1093,9 @@ class FlashAttentionDSABackwardSm100H16:
                 tile_count,
                 topk,
                 mma_reduce_dKV_pipeline,
+                tma_atom_dKV_acc,
+                tma_tensor_dKV_acc,
+                sDkvReduce,
             )
             # All T2R reads issued by this warp are complete here (each
             # store_dKV / T2R block fences before its pipeline release);
@@ -2066,6 +2094,9 @@ class FlashAttentionDSABackwardSm100H16:
         tile_count: Int32,
         topk: Int32,
         mma_reduce_dKV_pipeline,
+        tma_atom_dKV_acc=None,
+        tma_tensor_dKV_acc=None,
+        sDkvReduce=None,
     ):
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
 

@@ -87,8 +87,18 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.num_regs_load_KV = int(os.environ.get("CUDNN_DSA_H32_LOAD_REGS", "40"))
         self.skip_atomic_diagnostic = os.environ.get("CUDNN_DSA_H32_SKIP_ATOMIC", "0") == "1"
         self.cache_dkv_l2 = os.environ.get("CUDNN_DSA_H32_CACHE_DKV_L2", "0") == "1"
+        self.use_tma_dkv_reduce = os.environ.get("CUDNN_DSA_H32_TMA_DKV", "0") == "1"
+        self.dkv_tma_rows = 8
         self.t2r_dKV01_done_barrier = pipeline.NamedBarrier(
             barrier_id=11,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
+        self.dkv_tma_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=12,
+            num_threads=self.num_reduce_warps * self.threads_per_warp,
+        )
+        self.dkv_tma_scratch_done_barrier = pipeline.NamedBarrier(
+            barrier_id=13,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
 
@@ -338,8 +348,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         tdKVtdKV3,
                     )
                     dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                compute_mma_P_pipeline.consumer_release(compute_mma_P_consumer_state)
-                compute_mma_P_consumer_state.advance()
+                if cutlass.const_expr(not self.use_tma_dkv_reduce):
+                    compute_mma_P_pipeline.consumer_release(compute_mma_P_consumer_state)
+                    compute_mma_P_consumer_state.advance()
 
                 for k_block in cutlass.range(0, cute.size(tdKVrdS, mode=[2]), unroll=2):
                     cute.gemm(
@@ -358,6 +369,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     )
                 mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
                 mma_reduce_dKV_producer_state.advance()
+                if cutlass.const_expr(self.use_tma_dkv_reduce):
+                    self.dkv_tma_scratch_done_barrier.arrive_and_wait()
+                    compute_mma_P_pipeline.consumer_release(compute_mma_P_consumer_state)
+                    compute_mma_P_consumer_state.advance()
                 compute_mma_dS_pipeline.consumer_release(compute_mma_dS_consumer_state)
                 compute_mma_dS_consumer_state.advance()
                 is_first_generation = False
@@ -754,6 +769,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tile_count: Int32,
         topk: Int32,
         mma_reduce_dKV_pipeline,
+        tma_atom_dKV_acc=None,
+        tma_tensor_dKV_acc=None,
+        sDkvReduce=None,
     ):
         """Consume three reducer generations for each of two M64 halves."""
         if cutlass.const_expr(self.num_kv_subtiles == 1):
@@ -778,6 +796,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, batch_idx = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Query CTAs accumulate into independent FP32 shards.  The workspace
         # uses an 8-row-rounded leading extent, matching its allocator.
         shard_stride = ((max_seqlen_kv + 7) // 8 * 8) * ((self.head_dim + 7) // 8 * 8)
@@ -787,6 +806,18 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         dp_idx = tidx_in_wg % 128
         wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
         num_warp_groups = self.num_reduce_warps // 4
+
+        tma_store_pipeline = None
+        tma_store_producer_state = None
+        if cutlass.const_expr(self.use_tma_dkv_reduce):
+            tma_store_pipeline = pipeline.PipelineTmaStore.create(
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.num_reduce_warps * self.threads_per_warp,
+                ),
+            )
+            tma_store_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
@@ -855,15 +886,122 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
                 cute.arch.fence_view_async_tmem_load()
                 if cutlass.const_expr(not self.skip_atomic_diagnostic):
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                    if cutlass.const_expr(self.use_tma_dkv_reduce):
+                        tma_store_producer_state = self._reduce_dKV_main_tma(
+                            mdKV_acc,
+                            mTopkIdxs,
+                            rdKV2,
+                            tTR_cdKV,
+                            sDkvReduce,
+                            tma_atom_dKV_acc,
+                            tma_store_pipeline,
+                            tma_store_producer_state,
+                            row_base,
+                            2,
+                            topk,
+                            warp_idx,
+                        )
+                    else:
+                        self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV23_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 if cutlass.const_expr(not self.skip_atomic_diagnostic):
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                    if cutlass.const_expr(self.use_tma_dkv_reduce):
+                        tma_store_producer_state = self._reduce_dKV_main_tma(
+                            mdKV_acc,
+                            mTopkIdxs,
+                            rdKV3,
+                            tTR_cdKV,
+                            sDkvReduce,
+                            tma_atom_dKV_acc,
+                            tma_store_pipeline,
+                            tma_store_producer_state,
+                            row_base,
+                            3,
+                            topk,
+                            warp_idx,
+                        )
+                        tma_store_pipeline.producer_tail()
+                        self.dkv_tma_scratch_done_barrier.arrive_and_wait()
+                    else:
+                        self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
+
+    @cute.jit
+    def _reduce_dKV_main_tma(
+        self,
+        mdKV_acc: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        tTR_rdKV: cute.Tensor,
+        tTR_cdKV: cute.Tensor,
+        sDkvReduce: cute.Tensor,
+        tma_atom_dKV_acc: cute.CopyAtom,
+        tma_store_pipeline,
+        producer_state,
+        row_base: Int32,
+        sub_tile_idx: int,
+        topk: Int32,
+        warp_idx: Int32,
+    ):
+        """Stage one D128 fragment in the aliased P buffer and TMA-reduce it."""
+        tidx, _, _ = cute.arch.thread_idx()
+        token_idx, _, batch_idx = cute.arch.block_idx()
+        tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
+        dp_idx = tidx_in_wg % 128
+        gdKV = cute.local_tile(mdKV_acc, (128, 1), (None, None, (0, batch_idx)))
+
+        for row_batch in cutlass.range_constexpr(self.kv_subtile // self.dkv_tma_rows):
+            if warp_idx == self.reduce_warp_id[0]:
+                tma_store_pipeline.producer_acquire()
+            self.dkv_tma_sync_barrier.arrive_and_wait()
+
+            for i in cutlass.range_constexpr(self.reduce_rows_per_thread):
+                coord_base = i * 2 - i % 2
+                local_row = cute.get(tTR_cdKV[coord_base], mode=[1])
+                if local_row // self.dkv_tma_rows == row_batch:
+                    rdKV_frg = cute.make_rmem_tensor((4,), self.acc_dtype)
+                    rdKV_frg[0] = tTR_rdKV[coord_base]
+                    rdKV_frg[1] = tTR_rdKV[coord_base + 2]
+                    rdKV_frg[2] = tTR_rdKV[coord_base + 16]
+                    rdKV_frg[3] = tTR_rdKV[coord_base + 18]
+                    scratch_row = sDkvReduce[None, local_row % self.dkv_tma_rows]
+                    scratch_vec = cute.flat_divide(scratch_row, (4,))[None, dp_idx // 4]
+                    scratch_vec.store(rdKV_frg.load())
+
+            cute.arch.fence_proxy("async.shared", space="cta")
+            self.dkv_tma_sync_barrier.arrive_and_wait()
+
+            if warp_idx == self.reduce_warp_id[0]:
+                for row in cutlass.range_constexpr(self.dkv_tma_rows):
+                    global_row = row_base + row_batch * self.dkv_tma_rows + row
+                    topk_idx = Int32(-1)
+                    if global_row < topk:
+                        topk_idx = mTopkIdxs[global_row, (token_idx, batch_idx)]
+                    if topk_idx >= 0:
+                        scratch_row = sDkvReduce[None, row]
+                        scratch_tile = cute.make_tensor(
+                            scratch_row.iterator,
+                            cute.make_layout((128, 1), stride=(1, 128)),
+                        )
+                        tma_s, tma_g = cute.nvgpu.cpasync.tma_partition(
+                            tma_atom_dKV_acc,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(scratch_tile, 0, 2),
+                            cute.group_modes(gdKV, 0, 2),
+                        )
+                        cute.copy(
+                            tma_atom_dKV_acc,
+                            tma_s,
+                            tma_g[None, sub_tile_idx, topk_idx, (0, batch_idx)],
+                        )
+                tma_store_pipeline.producer_commit()
+            producer_state.advance()
+
+        return producer_state
 
     @cute.kernel
     def convert(
