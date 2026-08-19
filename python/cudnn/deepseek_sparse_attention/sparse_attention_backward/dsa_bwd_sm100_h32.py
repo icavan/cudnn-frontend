@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import Tuple
 
 import cutlass
@@ -29,6 +30,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         head_dim_v: int,
         block_tile: int,
         max_topk: int = 0,
+        dkv_shards: int = 1,
     ):
         super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk)
         if head_dim != 576 or head_dim_v != 512 or block_tile != 128:
@@ -37,7 +39,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.h_tile = 32
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
-        self.dkv_shards = 2
+        self.dkv_shards = dkv_shards
+        if self.dkv_shards not in (1, 2, 4, 8):
+            raise ValueError("dkv_shards must be one of 1, 2, 4, or 8")
 
         # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
         # half at a time so P/dS only occupy 4 KiB each in shared memory.
@@ -76,7 +80,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         # The inherited 1024-thread CTA already sits near the SM register
         # budget.  Keep compute at 128 registers; setmaxnreg.inc(192) cannot
         # be satisfied with 16 loaders and eight reducers resident.
-        self.num_regs_compute = 128
+        self.num_regs_compute = int(os.environ.get("CUDNN_DSA_H32_COMPUTE_REGS", "128"))
+        self.num_regs_reduce = int(os.environ.get("CUDNN_DSA_H32_REDUCE_REGS", "88"))
+        self.num_regs_load_KV = int(os.environ.get("CUDNN_DSA_H32_LOAD_REGS", "40"))
+        self.skip_atomic_diagnostic = os.environ.get("CUDNN_DSA_H32_SKIP_ATOMIC", "0") == "1"
 
     def _setup_attributes(self):
         super()._setup_attributes()
@@ -804,30 +811,35 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
                 cute.arch.fence_view_async_tmem_load()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+                if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
                 rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
                 cute.arch.fence_view_async_tmem_load()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
                 cute.arch.fence_view_async_tmem_load()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
-                self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
+                if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
                 cute.arch.fence_view_async_tmem_load()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV23_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
 
     @cute.kernel

@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Jerry Chen
 # SPDX-License-Identifier: MIT
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -106,7 +107,9 @@ def flash_attn_bwd_sm100(
     # H32 uses two independent FP32 dKV accumulation shards.  Splitting query
     # CTAs by token parity reduces global-atomic serialization; the existing
     # conversion kernel folds the shards before the BF16 output store.
-    dkv_shards = 2 if backend == "h32_m128_m64" else 1
+    dkv_shards = int(os.environ.get("CUDNN_DSA_H32_DKV_SHARDS", "1")) if backend == "h32_m128_m64" else 1
+    if dkv_shards not in (1, 2, 4, 8):
+        raise ValueError("CUDNN_DSA_H32_DKV_SHARDS must be one of 1, 2, 4, or 8")
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
@@ -183,7 +186,7 @@ def flash_attn_bwd_sm100(
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length, dkv_shards)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -219,6 +222,7 @@ def flash_attn_bwd_sm100(
                 head_dim_v=head_dim_v,
                 block_tile=block_tile,
                 max_topk=max_topk,
+                dkv_shards=dkv_shards,
             )
         else:
             # Keep this constructor and class byte-for-byte on the tuned H64
