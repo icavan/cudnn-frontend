@@ -37,6 +37,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.h_tile = 32
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
+        self.skip_reduce_diagnostic = True
 
         # Keep 16 independent loader warps for sparse-row memory-level
         # parallelism.  Their register cap is reduced below so the wider N32
@@ -740,6 +741,19 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         mma_reduce_dKV_pipeline,
     ):
         """Consume three reducer generations for each of two M64 halves."""
+        if cutlass.const_expr(self.skip_reduce_diagnostic):
+            consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
+            tile_index = tile_count - 1
+            while tile_index >= 0:
+                for _ in cutlass.range_constexpr(self.num_kv_subtiles):
+                    for _ in cutlass.range_constexpr(3):
+                        mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                        mma_reduce_dKV_pipeline.consumer_release(consumer_state)
+                        consumer_state.advance()
+                    self.t2r_dKV23_done_barrier.arrive_and_wait()
+                tile_index -= 1
+            return
+
         if cutlass.const_expr(self.num_kv_subtiles == 1):
             # Temporary isolation: prove the producer/consumer phase schedule
             # independently of the new M128xN64 T2R layout.
