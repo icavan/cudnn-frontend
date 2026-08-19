@@ -640,6 +640,19 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         mma_reduce_dKV_pipeline,
     ):
         """Consume three reducer generations for each of two M64 halves."""
+        if cutlass.const_expr(self.num_kv_subtiles == 1):
+            # Temporary isolation: prove the producer/consumer phase schedule
+            # independently of the new M128xN64 T2R layout.
+            consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
+            tile_index = tile_count - 1
+            while tile_index >= 0:
+                for _ in cutlass.range_constexpr(3):
+                    mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
+                    consumer_state.advance()
+                tile_index -= 1
+            return
+
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
         tdKVtdKV0 = tdKVtdKV0[(None, None), 0, 0]
         tdKVtdKV1 = tdKVtdKV1[(None, None), 0, 0]
