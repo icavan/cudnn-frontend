@@ -71,7 +71,6 @@ class FlashAttentionDSABackwardSm100H16:
 
         # =============== Bwd ====================
         self.num_load_KV_warps = 16
-        self.kv_rows_per_subgroup = 1
         self.num_compute_warps = 4
         self.num_reduce_warps = 8
         self.reduce_rows_per_thread = block_tile // self.num_reduce_warps
@@ -1238,7 +1237,8 @@ class FlashAttentionDSABackwardSm100H16:
         mTopkLength: Optional[cute.Tensor],
         is_first: bool,
         local_tidx: Int32,
-        row: Int32,
+        local_warp_idx: Int32,
+        row_offset: Int32,
         async_copy_atom: cute.CopyAtom,
         async_thr_copy: cute.TiledCopy,
     ):
@@ -1246,6 +1246,7 @@ class FlashAttentionDSABackwardSm100H16:
         _, _, batch_idx = cute.arch.block_idx()
         subgroup = local_tidx // 8
         lane_in_subwarp = local_tidx % 8
+        row = local_warp_idx * 4 + subgroup + row_offset
         idx = tile_index * self.block_tile + row
         tile_sK = sK_slice[row, (None, None)]
 
@@ -1328,47 +1329,47 @@ class FlashAttentionDSABackwardSm100H16:
             sK_slice = sK[(None, None), 0, (None, None), load_mma_K_producer_state.index]
             sK_slice = cute.composition(sK_slice, cute.make_layout((self.block_tile, self.head_dim)))
 
-            rows_per_warp = 4 * self.kv_rows_per_subgroup
-            rows_per_pass = self.num_load_KV_warps * rows_per_warp
+            rows_per_pass = self.num_load_KV_warps * 4
             row_passes = self.block_tile // rows_per_pass
             for row_pass in cutlass.range_constexpr(row_passes):
-                for subgroup_row in cutlass.range_constexpr(self.kv_rows_per_subgroup):
-                    row = local_warp_idx * rows_per_warp + subgroup_row * 4 + subgroup + row_pass * rows_per_pass
-                    idx = tile_index * self.block_tile + row
-                    topk_idx = Int32(-1)
-                    if lane_in_subwarp == 0:
-                        if idx < self.max_topk:
-                            topk_idx = mTopkIdxs[idx, (token_idx, batch_idx)]
-                    topk_idx = cute.arch.shuffle_sync(topk_idx, subgroup * 8)
+                row = local_warp_idx * 4 + subgroup + row_pass * rows_per_pass
+                idx = tile_index * self.block_tile + row
+                topk_idx = Int32(-1)
+                if lane_in_subwarp == 0:
+                    if idx < self.max_topk:
+                        topk_idx = mTopkIdxs[idx, (token_idx, batch_idx)]
+                topk_idx = cute.arch.shuffle_sync(topk_idx, subgroup * 8)
 
-                    if full_tiles:
-                        self._load_kv_rows(
-                            mKV,
-                            sK_slice,
-                            topk_idx,
-                            tile_index,
-                            topk,
-                            mTopkLength,
-                            is_first=False,
-                            local_tidx=local_tidx,
-                            row=row,
-                            async_copy_atom=async_copy_atom,
-                            async_thr_copy=async_thr_copy,
-                        )
-                    else:
-                        self._load_kv_rows(
-                            mKV,
-                            sK_slice,
-                            topk_idx,
-                            tile_index,
-                            topk,
-                            mTopkLength,
-                            is_first=True,
-                            local_tidx=local_tidx,
-                            row=row,
-                            async_copy_atom=async_copy_atom,
-                            async_thr_copy=async_thr_copy,
-                        )
+                if full_tiles:
+                    self._load_kv_rows(
+                        mKV,
+                        sK_slice,
+                        topk_idx,
+                        tile_index,
+                        topk,
+                        mTopkLength,
+                        is_first=False,
+                        local_tidx=local_tidx,
+                        local_warp_idx=local_warp_idx,
+                        row_offset=row_pass * rows_per_pass,
+                        async_copy_atom=async_copy_atom,
+                        async_thr_copy=async_thr_copy,
+                    )
+                else:
+                    self._load_kv_rows(
+                        mKV,
+                        sK_slice,
+                        topk_idx,
+                        tile_index,
+                        topk,
+                        mTopkLength,
+                        is_first=True,
+                        local_tidx=local_tidx,
+                        local_warp_idx=local_warp_idx,
+                        row_offset=row_pass * rows_per_pass,
+                        async_copy_atom=async_copy_atom,
+                        async_thr_copy=async_thr_copy,
+                    )
 
                 # Keep each 64-row pass in a separate cp.async group.  A
                 # single 128-row group lowers MIO throttle slightly but raises
