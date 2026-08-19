@@ -35,6 +35,12 @@ class FlashAttentionDSABackwardSm100H16:
         self.max_topk = max_topk
         # The 128-row sparse KV tile occupies M and the 16 heads occupy N.
         self.QK_mma_tiler = (block_tile, 16, head_dim)
+        # The physical P/dS operands match the full score tile for H16.  Keep
+        # these as explicit attributes so the H32 specialization can retain
+        # an M128 score while streaming the downstream operands as two M64
+        # halves without duplicating the layout construction machinery.
+        self.P_store_tiler = self.QK_mma_tiler[:2]
+        self.dS_store_tiler = self.QK_mma_tiler[:2]
         # head_dim_main: 128-aligned portion for the main 4 sub-tiles
         head_dim_main = (head_dim // 128) * 128
         self.head_dim_main = head_dim_main
@@ -356,7 +362,7 @@ class FlashAttentionDSABackwardSm100H16:
         dOT_smem_layout_staged = sm100_utils.make_smem_layout_a(dOP_tiled_mma, self.dOP_cta_tiler, self.element_dtype, self.load_mma_QdO_stage)
         P_smem_layout_staged = sm100_utils.make_smem_layout_b(dOP_tiled_mma, self.dOP_mma_tiler, self.element_dtype, self.compute_mma_P_stage)
         P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.compute_mma_P_stage
+            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.P_store_tiler, self.compute_mma_P_stage
         )
         K_smem_layout_staged_2 = sm100_utils.make_smem_layout_a(KdS_tiled_mma, self.KdS_cta_tiler, self.element_dtype, self.load_mma_K_stage)
         # Tail view: partition sK with 64-wide blocks, giving head_dim/64 sub-tiles
@@ -374,7 +380,7 @@ class FlashAttentionDSABackwardSm100H16:
         )
         dS_smem_layout_staged = sm100_utils.make_smem_layout_b(QdS_tiled_mma, self.QdS_mma_tiler, self.element_dtype, self.compute_mma_dS_stage)
         dS_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.compute_mma_dS_stage
+            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dS_store_tiler, self.compute_mma_dS_stage
         )
 
         dQ_smem_layout_staged = sm100_utils.make_smem_layout_epi(

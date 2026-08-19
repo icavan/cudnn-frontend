@@ -57,7 +57,7 @@ def _allocate(cfg, has_topk_length: bool):
     [
         (16, 576, "h16_m128", 128),
         (16, 512, "generic_m64", 64),
-        (32, 576, "generic_m64", 64),
+        (32, 576, "h32_m128_m64", 128),
         (64, 576, "generic_m64", 64),
     ],
 )
