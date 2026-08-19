@@ -79,11 +79,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
     def _setup_attributes(self):
         super()._setup_attributes()
-        # Start from a provably acyclic reducer schedule.  Every TMEM
-        # generation is acquired after the preceding generation has completed
-        # T2R.  Once numerics are established, stage=2 can be reintroduced as
-        # a separate performance ablation.
-        self.mma_reduce_dKV_stage = 1
+        self.mma_reduce_dKV_stage = 2
 
     @cute.jit
     def mma(
@@ -143,6 +139,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         mma_compute_dQ_pipeline.producer_acquire(mma_compute_dQ_producer_state)
         tile_index = tile_count - 1
         is_first_generation = True
+        is_first_dkv_half = True
         while tile_index >= 0:
             load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
 
@@ -182,6 +179,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                if not is_first_dkv_half:
+                    # dKV2/3 alias dKV0/1.  A two-stage ring otherwise waits
+                    # on the intervening tail generation instead of the
+                    # aliased TMEM columns from the preceding half.
+                    self.t2r_dKV23_done_barrier.arrive_and_wait()
 
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
@@ -340,11 +342,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 compute_mma_dS_pipeline.consumer_release(compute_mma_dS_consumer_state)
                 compute_mma_dS_consumer_state.advance()
                 is_first_generation = False
+                is_first_dkv_half = False
 
             load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
             load_mma_K_consumer_state.advance()
             tile_index -= 1
 
+        # Balance the reducer's final dKV2/3 T2R arrival.
+        self.t2r_dKV23_done_barrier.arrive_and_wait()
         mma_compute_dQ_pipeline.producer_commit(mma_compute_dQ_producer_state)
         mma_compute_dQ_producer_state.advance()
         load_mma_QdO_pipeline.consumer_release(load_mma_QdO_consumer_state)
@@ -813,6 +818,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
+                self.t2r_dKV23_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
