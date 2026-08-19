@@ -894,6 +894,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             tTR_cdKV,
                             sDkvReduce,
                             tma_atom_dKV_acc,
+                            tma_tensor_dKV_acc,
                             tma_store_pipeline,
                             tma_store_producer_state,
                             row_base,
@@ -917,6 +918,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             tTR_cdKV,
                             sDkvReduce,
                             tma_atom_dKV_acc,
+                            tma_tensor_dKV_acc,
                             tma_store_pipeline,
                             tma_store_producer_state,
                             row_base,
@@ -939,6 +941,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_cdKV: cute.Tensor,
         sDkvReduce: cute.Tensor,
         tma_atom_dKV_acc: cute.CopyAtom,
+        tma_tensor_dKV_acc: cute.Tensor,
         tma_store_pipeline,
         producer_state,
         row_base: Int32,
@@ -951,7 +954,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         token_idx, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
-        gdKV = cute.local_tile(mdKV_acc, (128, 1), (None, None, (0, batch_idx)))
+        gdKV = cute.local_tile(tma_tensor_dKV_acc, (128, 1), (None, None, (0, batch_idx)))
 
         for row_batch in cutlass.range_constexpr(self.kv_subtile // self.dkv_tma_rows):
             if warp_idx == self.reduce_warp_id[0]:
