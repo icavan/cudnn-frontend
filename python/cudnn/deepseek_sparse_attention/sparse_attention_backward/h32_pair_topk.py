@@ -68,6 +68,7 @@ class H32PairTopkUnion:
         self.seqlen_kv = int(seqlen_kv)
         self.max_topk = int(max_topk)
         self.max_union = min(self.seqlen_kv, 2 * self.max_topk)
+        self.num_words = (self.seqlen_kv + 31) // 32
 
     @cute.kernel
     def kernel(
@@ -81,9 +82,9 @@ class H32PairTopkUnion:
         tidx, _, _ = cute.arch.thread_idx()
 
         smem = SmemAllocator()
-        membership = smem.allocate_tensor(
+        membership_bits = smem.allocate_tensor(
             element_type=Int32,
-            layout=cute.make_ordered_layout((self.seqlen_kv,), order=(0,)),
+            layout=cute.make_ordered_layout((2 * self.num_words,), order=(0,)),
             byte_alignment=128,
         )
         warp_sums = smem.allocate_tensor(
@@ -97,8 +98,8 @@ class H32PairTopkUnion:
             byte_alignment=16,
         )
 
-        for kv_idx in cutlass.range(tidx, self.seqlen_kv, self.block_threads):
-            membership[kv_idx] = Int32(0)
+        for word_idx in cutlass.range(tidx, 2 * self.num_words, self.block_threads):
+            membership_bits[word_idx] = Int32(0)
         if tidx == 0:
             control[0] = Int32(0)
         cute.arch.sync_threads()
@@ -115,30 +116,45 @@ class H32PairTopkUnion:
                 if pos < valid:
                     kv_idx = topk_idxs[query_idx, pos]
                     if kv_idx >= 0 and kv_idx < self.seqlen_kv:
+                        word_idx = kv_idx // 32
+                        bit_idx = kv_idx % 32
                         nvvm.atomicrmw(
                             "or",
-                            membership.data_ptr(kv_idx),
-                            Int32(1 << query_in_pair),
+                            membership_bits.data_ptr(query_in_pair * self.num_words + word_idx),
+                            Int32(1) << bit_idx,
                             space=nvvm.SharedSpace.shared_cta,
                         )
         cute.arch.sync_threads()
 
-        # Compact in ascending KV order. Processing one 256-entry stripe at a
-        # time needs only eight warp sums and avoids a contended shared atomic
-        # for every emitted index.
-        num_stripes = (self.seqlen_kv + self.block_threads - 1) // self.block_threads
+        # Compact one bitset word per thread. For the core 4K-KV shape all 128
+        # words fit in a single block scan; larger supported contexts use a
+        # small number of 256-word stripes.
+        num_stripes = (self.num_words + self.block_threads - 1) // self.block_threads
         for stripe in cutlass.range_constexpr(num_stripes):
-            kv_idx = stripe * self.block_threads + tidx
-            member = Int32(0)
-            if kv_idx < self.seqlen_kv:
-                member = membership[kv_idx]
-            present = Int32(1) if member != 0 else Int32(0)
-            rank = _block_scan_inclusive(present, warp_sums, tidx)
+            word_idx = stripe * self.block_threads + tidx
+            bits0 = Int32(0)
+            bits1 = Int32(0)
+            if word_idx < self.num_words:
+                bits0 = membership_bits[word_idx]
+                bits1 = membership_bits[self.num_words + word_idx]
+            union_bits = bits0 | bits1
+            count = cute.arch.popc(union_bits)
+            rank = _block_scan_inclusive(count, warp_sums, tidx)
             base = control[0]
-            if present != 0:
-                out_pos = base + rank - 1
-                if out_pos < self.max_union:
-                    union_idxs[pair_idx, out_pos] = Int32(kv_idx) | (member << 29)
+            out_pos = base + rank - count
+            while union_bits != 0:
+                low_bit = union_bits & -union_bits
+                bit_idx = cute.arch.popc(low_bit - Int32(1))
+                kv_idx = word_idx * 32 + bit_idx
+                member = Int32(0)
+                if (bits0 & low_bit) != 0:
+                    member = member | Int32(1)
+                if (bits1 & low_bit) != 0:
+                    member = member | Int32(2)
+                if kv_idx < self.seqlen_kv and out_pos < self.max_union:
+                    union_idxs[pair_idx, out_pos] = kv_idx | (member << 29)
+                out_pos = out_pos + 1
+                union_bits = union_bits ^ low_bit
             cute.arch.sync_threads()
             if tidx == self.block_threads - 1:
                 control[0] = base + rank
