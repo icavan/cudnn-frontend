@@ -736,3 +736,51 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
+
+    @cute.jit
+    def compute(
+        self,
+        tma_atom_dQ: cute.CopyAtom,
+        tma_tensor_dQ: cute.Tensor,
+        tma_atom_dQ_64: cute.CopyAtom,
+        tma_tensor_dQ_64: cute.Tensor,
+        dQ4_tiled_mma: cute.TiledMma,
+        tStS: cute.Tensor,
+        tdPtdP: cute.Tensor,
+        tdQtdQ: Tuple,
+        sLSE: cute.Tensor,
+        sSum_OdO: cute.Tensor,
+        sP: cute.Tensor,
+        sP_store: cute.Tensor,
+        sdS: cute.Tensor,
+        sdS_store: cute.Tensor,
+        sdQ: cute.Tensor,
+        sdQ4: cute.Tensor,
+        scale_softmax: Float32,
+        tile_count: Int32,
+        pipelines,
+    ):
+        # Temporary isolation: use the proven single-generation H16 compute
+        # schedule to distinguish pipeline deadlock from the H32 logical split.
+        return FlashAttentionDSABackwardSm100H16.compute(
+            self,
+            tma_atom_dQ,
+            tma_tensor_dQ,
+            tma_atom_dQ_64,
+            tma_tensor_dQ_64,
+            dQ4_tiled_mma,
+            tStS,
+            tdPtdP,
+            tdQtdQ,
+            sLSE,
+            sSum_OdO,
+            sP,
+            sP_store,
+            sdS,
+            sdS_store,
+            sdQ,
+            sdQ4,
+            scale_softmax,
+            tile_count,
+            pipelines,
+        )
