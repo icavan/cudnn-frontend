@@ -103,6 +103,10 @@ def flash_attn_bwd_sm100(
     # H16 KV-major specialization can use the full M128 UMMA tile.  This
     # halves the top-k loop count while keeping one CTA per query token.
     backend, block_tile = _select_sm100_backend(num_head, head_dim)
+    # H32 uses two independent FP32 dKV accumulation shards.  Splitting query
+    # CTAs by token parity reduces global-atomic serialization; the existing
+    # conversion kernel folds the shards before the BF16 output store.
+    dkv_shards = 2 if backend == "h32_m128_m64" else 1
     num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
@@ -166,6 +170,7 @@ def flash_attn_bwd_sm100(
             batch_size,
             acc_dtype,
         )
+        ws_dkv_shape = (ws_dkv_shape[0], ws_dkv_shape[1] * dkv_shards, *ws_dkv_shape[2:])
         workspace_dKV = torch.zeros(
             *ws_dkv_shape,
             dtype=torch.uint8,

@@ -37,6 +37,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.h_tile = 32
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
+        self.dkv_shards = 2
 
         # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
         # half at a time so P/dS only occupy 4 KiB each in shared memory.
@@ -748,6 +749,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, batch_idx = cute.arch.block_idx()
+        # Query CTAs accumulate into independent FP32 shards.  The workspace
+        # uses an 8-row-rounded leading extent, matching its allocator.
+        shard_stride = ((max_seqlen_kv + 7) // 8 * 8) * ((self.head_dim + 7) // 8 * 8)
+        shard_idx = token_idx % self.dkv_shards
+        mdKV_acc = cute.make_tensor(mdKV_acc.iterator + shard_idx * shard_stride, mdKV_acc.layout)
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
         wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
@@ -823,3 +829,42 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
+
+    @cute.kernel
+    def convert(
+        self,
+        mdKV_acc: cute.Tensor,
+        mdKV: cute.Tensor,
+        seqlen: Int32,
+    ):
+        """Fold FP32 dKV shards and convert the result to the output dtype."""
+        tidx, tidy, _ = cute.arch.thread_idx()
+        seq_block_idx, _, batch_idx = cute.arch.block_idx()
+        seq_id = self.block_seq * seq_block_idx + tidy
+
+        if seq_id < seqlen:
+            shard_stride = ((seqlen + 7) // 8 * 8) * ((self.head_dim + 7) // 8 * 8)
+            cur_mdKV_row = mdKV[None, seq_id, (0, batch_idx)]
+            num_128_tiles = self.head_dim_main // 64
+
+            for i in cutlass.range(num_128_tiles, unroll_full=True):
+                for j in cutlass.range(2, unroll_full=True):
+                    value = Float32(0.0)
+                    for shard in cutlass.range_constexpr(self.dkv_shards):
+                        shard_tensor = cute.make_tensor(mdKV_acc.iterator + shard * shard_stride, mdKV_acc.layout)
+                        shard_row = shard_tensor[None, seq_id, (0, batch_idx)]
+                        shard_tiles = cute.flat_divide(cute.flat_divide(shard_row, (64,)), (32,))
+                        value += shard_tiles[tidx, j, i]
+                    dim_idx = tidx // 4 + tidx % 4 * 8 + j * 32 + i * 64
+                    cur_mdKV_row[dim_idx] = self.element_dtype(value)
+
+            for j in cutlass.range(2, unroll_full=True):
+                value = Float32(0.0)
+                for shard in cutlass.range_constexpr(self.dkv_shards):
+                    shard_tensor = cute.make_tensor(mdKV_acc.iterator + shard * shard_stride, mdKV_acc.layout)
+                    shard_row = shard_tensor[None, seq_id, (0, batch_idx)]
+                    shard_tiles = cute.flat_divide(cute.flat_divide(shard_row, (64,)), (32,))
+                    value += shard_tiles[tidx, j, num_128_tiles]
+                k = tidx // 2 + j * 16
+                dim_idx = self.head_dim_main + (k // 8) * 16 + k % 8 + (tidx % 2) * 8
+                cur_mdKV_row[dim_idx] = self.element_dtype(value)
