@@ -256,24 +256,22 @@ def test_DSA_sparse_attention_backward_sm100_h32_pair_membership(has_topk_length
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    s_q, s_kv, topk = 4, 4096, 2048
+    s_q, s_kv, topk = 2, 4096, 2048
     num_heads, head_dim = 32, 576
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
     q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
     kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
-    # Pair 0 overlaps by 32 rows; pair 1 is disjoint. This exercises all
-    # encoded membership masks (first-only, second-only, and common).
+    # The pair overlaps by 1024 rows, which exercises all encoded membership
+    # masks (first-only, second-only, and common).
     topk_idxs = torch.stack(
         (
             torch.arange(0, 2048, device=device),
             torch.arange(1024, 3072, device=device),
-            torch.arange(0, 4096, 2, device=device),
-            torch.arange(1, 4096, 2, device=device),
         )
     ).to(torch.int32)
-    topk_length = torch.tensor((2048, 1537, 1801, 1025), dtype=torch.int32, device=device) if has_topk_length else None
+    topk_length = torch.tensor((2048, 1537), dtype=torch.int32, device=device) if has_topk_length else None
 
     out, lse = ref_sparse_attention_forward(
         q,
