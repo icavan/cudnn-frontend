@@ -239,6 +239,84 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("has_topk_length", [False, True], ids=["full-topk", "lengths"])
+@torch_fork_set_rng(seed=421)
+def test_DSA_sparse_attention_backward_sm100_h32_pair_membership(has_topk_length):
+    """The paired H32 path must mask common and token-private KV rows."""
+    if not torch.cuda.is_available():
+        pytest.skip("SM100 GPU required")
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("paired H32 regression test targets the SM100 kernel")
+
+    try:
+        from cudnn import DSA
+        from cuda.bindings import driver as cuda
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    s_q, s_kv, topk = 4, 128, 64
+    num_heads, head_dim = 32, 576
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    # Pair 0 overlaps by 32 rows; pair 1 is disjoint. This exercises all
+    # encoded membership masks (first-only, second-only, and common).
+    topk_idxs = torch.stack(
+        (
+            torch.arange(0, 64, device=device),
+            torch.arange(32, 96, device=device),
+            torch.arange(0, 128, 2, device=device),
+            torch.arange(1, 128, 2, device=device),
+        )
+    ).to(torch.int32)
+    topk_length = torch.tensor((64, 47, 55, 33), dtype=torch.int32, device=device) if has_topk_length else None
+
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        stream=stream,
+    )
+
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        result["dq"],
+        result["dkv"],
+        result["d_sink"],
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=433)
 @pytest.mark.parametrize(
     "head_dim,num_heads,topk_length_values",
