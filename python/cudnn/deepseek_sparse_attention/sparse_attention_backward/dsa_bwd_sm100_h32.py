@@ -37,14 +37,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.h_tile = 32
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
-        self.skip_reduce_diagnostic = True
+        self.skip_reduce_diagnostic = False
 
-        # Keep 16 independent loader warps for sparse-row memory-level
-        # parallelism.  Their register cap is reduced below so the wider N32
-        # compute fragments can retain more values without changing the total
-        # CTA register budget.
-        self.num_load_KV_warps = 16
-        self.kv_rows_per_subgroup = 1
+        self.num_load_KV_warps = 8
+        self.kv_rows_per_subgroup = 2
+        self.num_reduce_warps = 16
         self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
         compute_warp_begin = self.num_load_KV_warps
         self.compute_warp_id = tuple(range(compute_warp_begin, compute_warp_begin + self.num_compute_warps))
@@ -53,9 +50,25 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.mma_warp_id = reduce_warp_begin + self.num_reduce_warps
         self.load_warp_id = self.mma_warp_id + 1
         self.threads_per_cta = self.threads_per_warp * (self.num_load_KV_warps + self.num_compute_warps + self.num_reduce_warps + 4)
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=2,
+            num_threads=self.threads_per_warp * (self.num_compute_warps + self.num_reduce_warps + 1),
+        )
         self.load_KV_sync_barrier = pipeline.NamedBarrier(
             barrier_id=5,
             num_threads=self.num_load_KV_warps * self.threads_per_warp,
+        )
+        self.t2r_dKV4_done_barrier = pipeline.NamedBarrier(
+            barrier_id=8,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
+        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
+        self.t2r_dKV23_done_barrier = pipeline.NamedBarrier(
+            barrier_id=10,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
 
         # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
@@ -93,8 +106,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dKV4_offset = 352
 
         self.num_regs_load_KV = 40
-        self.num_regs_compute = 128
-        self.num_regs_reduce = 88
+        self.num_regs_compute = 160
+        self.num_regs_reduce = 56
 
     def _setup_attributes(self):
         super()._setup_attributes()
@@ -447,6 +460,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_tdP = thr_t2r_dP.partition_S(tdPtdP)
         tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
         tTR_rdP = cute.make_rmem_tensor(tTR_cdP.shape, self.acc_dtype)
+        tTR_rS_f16 = cute.make_rmem_tensor(tTR_cS.shape, self.element_dtype)
+        tTR_rdP_f16 = cute.make_rmem_tensor(tTR_cdP.shape, self.element_dtype)
 
         load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
         load_compute_sum_OdO_pipeline.consumer_wait(load_compute_sum_OdO_consumer_state)
@@ -474,6 +489,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 )
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+            tTR_rS_f16 = self.quantize(tTR_rS, 2)
 
             cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
             for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
@@ -488,6 +504,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     (tTR_rdP[i], tTR_rdP[i + 1]),
                     (tTR_rS[i], tTR_rS[i + 1]),
                 )
+            tTR_rdP_f16 = self.quantize(tTR_rdP, 2, scale_softmax)
 
             cute.arch.fence_view_async_tmem_load()
             self.compute_sync_barrier.arrive_and_wait()
@@ -496,24 +513,24 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
-                for i in cutlass.range_constexpr(cute.size(tTR_rS)):
+                for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
                     global_row = cute.get(tTR_cS[i], mode=[0])
                     if global_row // self.kv_subtile == kv_half:
                         row = global_row - kv_half * self.kv_subtile
                         col = cute.get(tTR_cS[i], mode=[1])
-                        sP[(row, col), 0, 0, p_stage] = self.element_dtype(tTR_rS[i])
+                        sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
                 compute_mma_P_producer_state.advance()
 
                 compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
                 ds_stage = 0 if self.compute_mma_dS_stage == 1 else compute_mma_dS_producer_state.index
-                for i in cutlass.range_constexpr(cute.size(tTR_rdP)):
+                for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
                     global_row = cute.get(tTR_cdP[i], mode=[0])
                     if global_row // self.kv_subtile == kv_half:
                         row = global_row - kv_half * self.kv_subtile
                         col = cute.get(tTR_cdP[i], mode=[1])
-                        sdS[(row, col), 0, 0, ds_stage] = self.element_dtype(tTR_rdP[i] * scale_softmax)
+                        sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
                 compute_mma_dS_producer_state.advance()
