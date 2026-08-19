@@ -423,6 +423,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_tdP = thr_t2r_dP.partition_S(tdPtdP)
         tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
         tTR_rdP = cute.make_rmem_tensor(tTR_cdP.shape, self.acc_dtype)
+        tTR_rS_f16 = cute.make_rmem_tensor(tTR_cS.shape, self.element_dtype)
+        tTR_rdP_f16 = cute.make_rmem_tensor(tTR_cdP.shape, self.element_dtype)
         warp_half = tidx_in_wg // (2 * self.threads_per_warp)
 
         load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
