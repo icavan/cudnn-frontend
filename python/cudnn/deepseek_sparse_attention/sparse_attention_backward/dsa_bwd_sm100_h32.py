@@ -415,16 +415,25 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         cS_tiled = cute.logical_divide(cute.make_identity_tensor((self.block_tile, self.h_tile)), score_half_layout)
         cdP_tiled = cute.logical_divide(cute.make_identity_tensor((self.block_tile, self.h_tile)), score_half_layout)
 
-        tiled_t2r_S = tcgen05.make_tmem_copy(tmem_load_atom, tStS_tiled[None, 0])
-        tiled_t2r_dP = tcgen05.make_tmem_copy(tmem_load_atom, tdPtdP_tiled[None, 0])
+        # The copy atom, its source partition and its coordinate partition
+        # must describe the same M64 view.  Partitioning the full logical-
+        # divide tensor here assigns rows 64:127 to the last compute warp and
+        # makes it write beyond the physical M64 P/dS buffers.
+        tStS_half = tStS_tiled[None, 0]
+        tdPtdP_half = tdPtdP_tiled[None, 0]
+        cS_half = cS_tiled[None, 0]
+        cdP_half = cdP_tiled[None, 0]
+
+        tiled_t2r_S = tcgen05.make_tmem_copy(tmem_load_atom, tStS_half)
+        tiled_t2r_dP = tcgen05.make_tmem_copy(tmem_load_atom, tdPtdP_half)
         thr_t2r_S = tiled_t2r_S.get_slice(tidx % 128)
         thr_t2r_dP = tiled_t2r_dP.get_slice(tidx % 128)
-        tTR_cS = thr_t2r_S.partition_D(cS_tiled)
-        tTR_tS = thr_t2r_S.partition_S(tStS_tiled)
-        tTR_cdP = thr_t2r_dP.partition_D(cdP_tiled)
-        tTR_tdP = thr_t2r_dP.partition_S(tdPtdP_tiled)
-        tTR_rS = cute.make_rmem_tensor(tTR_cS[None, None, 0].shape, self.acc_dtype)
-        tTR_rdP = cute.make_rmem_tensor(tTR_cdP[None, None, 0].shape, self.acc_dtype)
+        tTR_cS = thr_t2r_S.partition_D(cS_half)
+        tTR_tS = thr_t2r_S.partition_S(tStS_half)
+        tTR_cdP = thr_t2r_dP.partition_D(cdP_half)
+        tTR_tdP = thr_t2r_dP.partition_S(tdPtdP_half)
+        tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
+        tTR_rdP = cute.make_rmem_tensor(tTR_cdP.shape, self.acc_dtype)
 
         load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
         load_compute_sum_OdO_pipeline.consumer_wait(load_compute_sum_OdO_consumer_state)
@@ -439,14 +448,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
-                tTR_tS_half = tTR_tS[None, None, kv_half]
-                tTR_cS_half = tTR_cS[None, None, kv_half]
-                cute.copy(tiled_t2r_S, tTR_tS_half, tTR_rS)
+                cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
 
                 for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
                     lse = (
-                        sLSE[cute.get(tTR_cS_half[i], mode=[1]), load_compute_LSE_consumer_state.index],
-                        sLSE[cute.get(tTR_cS_half[i + 1], mode=[1]), load_compute_LSE_consumer_state.index],
+                        sLSE[cute.get(tTR_cS[i], mode=[1]), load_compute_LSE_consumer_state.index],
+                        sLSE[cute.get(tTR_cS[i + 1], mode=[1]), load_compute_LSE_consumer_state.index],
                     )
                     tTR_rS[i], tTR_rS[i + 1] = cute.arch.fma_packed_f32x2(
                         (tTR_rS[i], tTR_rS[i + 1]),
@@ -461,23 +468,21 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 self.compute_sync_barrier.arrive_and_wait()
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
                 for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
-                    row = cute.get(tTR_cS_half[i], mode=[0]) - kv_half * self.kv_subtile
-                    col = cute.get(tTR_cS_half[i], mode=[1])
+                    row = cute.get(tTR_cS[i], mode=[0])
+                    col = cute.get(tTR_cS[i], mode=[1])
                     sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
                 compute_mma_P_producer_state.advance()
 
                 compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
-                tTR_tdP_half = tTR_tdP[None, None, kv_half]
-                tTR_cdP_half = tTR_cdP[None, None, kv_half]
-                cute.copy(tiled_t2r_dP, tTR_tdP_half, tTR_rdP)
+                cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
                 for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
                     tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.add_packed_f32x2(
                         (tTR_rdP[i], tTR_rdP[i + 1]),
                         (
-                            sSum_OdO[cute.get(tTR_cdP_half[i], mode=[1]), load_compute_sum_OdO_consumer_state.index],
-                            sSum_OdO[cute.get(tTR_cdP_half[i + 1], mode=[1]), load_compute_sum_OdO_consumer_state.index],
+                            sSum_OdO[cute.get(tTR_cdP[i], mode=[1]), load_compute_sum_OdO_consumer_state.index],
+                            sSum_OdO[cute.get(tTR_cdP[i + 1], mode=[1]), load_compute_sum_OdO_consumer_state.index],
                         ),
                     )
                     tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.mul_packed_f32x2(
@@ -490,8 +495,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 self.compute_sync_barrier.arrive_and_wait()
                 ds_stage = 0 if self.compute_mma_dS_stage == 1 else compute_mma_dS_producer_state.index
                 for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
-                    row = cute.get(tTR_cdP_half[i], mode=[0]) - kv_half * self.kv_subtile
-                    col = cute.get(tTR_cdP_half[i], mode=[1])
+                    row = cute.get(tTR_cdP[i], mode=[0])
+                    col = cute.get(tTR_cdP[i], mode=[1])
                     sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
