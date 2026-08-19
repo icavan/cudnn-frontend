@@ -91,8 +91,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        self.num_regs_load_KV = 32
+        self.num_regs_load_KV = 40
         self.num_regs_compute = 160
+        self.num_regs_reduce = 72
 
     def _setup_attributes(self):
         super()._setup_attributes()
