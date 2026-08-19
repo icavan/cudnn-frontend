@@ -598,6 +598,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         warp_idx: Int32,
     ):
         """Store one M128xN32 main dQ accumulator."""
+        for col in cutlass.range_constexpr(self.h_tile):
+            sdQ[dp_idx, col] = self.element_dtype(0.0)
+        self.compute_sync_barrier.arrive_and_wait()
+
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
@@ -637,6 +641,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         warp_idx: Int32,
     ):
         """Store the M64xN32 dQ tail accumulator."""
+        if dp_idx < 64:
+            for col in cutlass.range_constexpr(self.h_tile):
+                sdQ[dp_idx, col] = self.element_dtype(0.0)
+        self.compute_sync_barrier.arrive_and_wait()
+
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
