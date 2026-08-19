@@ -226,19 +226,23 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
                 mma_reduce_dKV_producer_state.advance()
 
-                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
-                    cute.gemm(
-                        dKV4_tiled_mma,
-                        tdKVtdKV4,
-                        tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
-                        tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
-                        tdKVtdKV4,
-                    )
-                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
-                mma_reduce_dKV_producer_state.advance()
+                # Keep the first half's original reducer overlap.  On the
+                # final half, defer the K-independent dKV tail until after dQ
+                # so the K buffer can be released one MMA group earlier.
+                if half_iter != self.num_kv_subtiles - 1:
+                    mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
+                        cute.gemm(
+                            dKV4_tiled_mma,
+                            tdKVtdKV4,
+                            tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
+                            tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
+                            tdKVtdKV4,
+                        )
+                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
+                    mma_reduce_dKV_producer_state.advance()
 
                 accumulate_dq = not is_first_generation
                 KdS_tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate_dq)
@@ -305,6 +309,20 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 if half_iter == self.num_kv_subtiles - 1:
                     load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
                     load_mma_K_consumer_state.advance()
+
+                    mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
+                        cute.gemm(
+                            dKV4_tiled_mma,
+                            tdKVtdKV4,
+                            tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
+                            tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
+                            tdKVtdKV4,
+                        )
+                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
+                    mma_reduce_dKV_producer_state.advance()
 
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
