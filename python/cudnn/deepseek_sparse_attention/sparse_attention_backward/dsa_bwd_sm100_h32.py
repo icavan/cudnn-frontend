@@ -84,10 +84,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.num_regs_reduce = int(os.environ.get("CUDNN_DSA_H32_REDUCE_REGS", "88"))
         self.num_regs_load_KV = int(os.environ.get("CUDNN_DSA_H32_LOAD_REGS", "40"))
         self.skip_atomic_diagnostic = os.environ.get("CUDNN_DSA_H32_SKIP_ATOMIC", "0") == "1"
+        self.t2r_dKV01_done_barrier = pipeline.NamedBarrier(
+            barrier_id=11,
+            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
+        )
 
     def _setup_attributes(self):
         super()._setup_attributes()
-        self.mma_reduce_dKV_stage = int(os.environ.get("CUDNN_DSA_H32_DKV_STAGES", "2"))
+        self.mma_reduce_dKV_stage = int(os.environ.get("CUDNN_DSA_H32_DKV_STAGES", "3"))
 
     @cute.jit
     def mma(
@@ -306,6 +310,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     )
                     dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
+                # dKV2/3 alias dKV0/1.  With three logical pipeline stages the
+                # ring no longer orders this overwrite, so wait until reducers
+                # have copied both leading fragments out of TMEM.
+                self.t2r_dKV01_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
@@ -810,14 +818,13 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
-                cute.arch.fence_view_async_tmem_load()
-                if cutlass.const_expr(not self.skip_atomic_diagnostic):
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
                 rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
                 cute.arch.fence_view_async_tmem_load()
+                self.t2r_dKV01_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
                     self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
@@ -830,15 +837,13 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
-                cute.arch.fence_view_async_tmem_load()
-                if cutlass.const_expr(not self.skip_atomic_diagnostic):
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV23_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 if cutlass.const_expr(not self.skip_atomic_diagnostic):
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                     self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
 
