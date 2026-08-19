@@ -400,40 +400,30 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         load_compute_sum_OdO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_compute_sum_OdO_stage)
         compute_tmastore_dQ_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.compute_tmastore_dQ_stage)
 
-        # N32 requires four 256-bit repetitions.  logical_divide exposes the
-        # two M64 row halves as the final partition mode without materializing
-        # another shared-memory buffer.
+        # N32 requires four 256-bit repetitions.  Keep the native M128 TMEM
+        # lane mapping: rows 0:63 belong to the first two compute warps and
+        # rows 64:127 to the last two.  Reinterpreting this accumulator as an
+        # M64 TMEM tensor gives the upper warps invalid P/dS coordinates.
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
         )
         tStS = tStS[(None, None), 0, 0]
         tdPtdP = tdPtdP[(None, None), 0, 0]
-        score_half_layout = cute.make_layout((self.kv_subtile, self.h_tile))
-        tStS_tiled = cute.logical_divide(tStS, score_half_layout)
-        tdPtdP_tiled = cute.logical_divide(tdPtdP, score_half_layout)
-        cS_tiled = cute.logical_divide(cute.make_identity_tensor((self.block_tile, self.h_tile)), score_half_layout)
-        cdP_tiled = cute.logical_divide(cute.make_identity_tensor((self.block_tile, self.h_tile)), score_half_layout)
+        cS = cute.make_identity_tensor((self.block_tile, self.h_tile))
+        cdP = cute.make_identity_tensor((self.block_tile, self.h_tile))
 
-        # The copy atom, its source partition and its coordinate partition
-        # must describe the same M64 view.  Partitioning the full logical-
-        # divide tensor here assigns rows 64:127 to the last compute warp and
-        # makes it write beyond the physical M64 P/dS buffers.
-        tStS_half = tStS_tiled[None, 0]
-        tdPtdP_half = tdPtdP_tiled[None, 0]
-        cS_half = cS_tiled[None, 0]
-        cdP_half = cdP_tiled[None, 0]
-
-        tiled_t2r_S = tcgen05.make_tmem_copy(tmem_load_atom, tStS_half)
-        tiled_t2r_dP = tcgen05.make_tmem_copy(tmem_load_atom, tdPtdP_half)
+        tiled_t2r_S = tcgen05.make_tmem_copy(tmem_load_atom, tStS)
+        tiled_t2r_dP = tcgen05.make_tmem_copy(tmem_load_atom, tdPtdP)
         thr_t2r_S = tiled_t2r_S.get_slice(tidx % 128)
         thr_t2r_dP = tiled_t2r_dP.get_slice(tidx % 128)
-        tTR_cS = thr_t2r_S.partition_D(cS_half)
-        tTR_tS = thr_t2r_S.partition_S(tStS_half)
-        tTR_cdP = thr_t2r_dP.partition_D(cdP_half)
-        tTR_tdP = thr_t2r_dP.partition_S(tdPtdP_half)
+        tTR_cS = thr_t2r_S.partition_D(cS)
+        tTR_tS = thr_t2r_S.partition_S(tStS)
+        tTR_cdP = thr_t2r_dP.partition_D(cdP)
+        tTR_tdP = thr_t2r_dP.partition_S(tdPtdP)
         tTR_rS = cute.make_rmem_tensor(tTR_cS.shape, self.acc_dtype)
         tTR_rdP = cute.make_rmem_tensor(tTR_cdP.shape, self.acc_dtype)
+        warp_half = tidx_in_wg // (2 * self.threads_per_warp)
 
         load_compute_LSE_pipeline.consumer_wait(load_compute_LSE_consumer_state)
         load_compute_sum_OdO_pipeline.consumer_wait(load_compute_sum_OdO_consumer_state)
@@ -448,56 +438,60 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
-                cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
+                if warp_half == kv_half:
+                    cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
 
-                for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
-                    lse = (
-                        sLSE[cute.get(tTR_cS[i], mode=[1]), load_compute_LSE_consumer_state.index],
-                        sLSE[cute.get(tTR_cS[i + 1], mode=[1]), load_compute_LSE_consumer_state.index],
-                    )
-                    tTR_rS[i], tTR_rS[i + 1] = cute.arch.fma_packed_f32x2(
-                        (tTR_rS[i], tTR_rS[i + 1]),
-                        (softmax_scale_log2_e, softmax_scale_log2_e),
-                        lse,
-                    )
-                    tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
-                    tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
-                tTR_rS_f16 = self.quantize(tTR_rS, 1)
+                    for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
+                        lse = (
+                            sLSE[cute.get(tTR_cS[i], mode=[1]), load_compute_LSE_consumer_state.index],
+                            sLSE[cute.get(tTR_cS[i + 1], mode=[1]), load_compute_LSE_consumer_state.index],
+                        )
+                        tTR_rS[i], tTR_rS[i + 1] = cute.arch.fma_packed_f32x2(
+                            (tTR_rS[i], tTR_rS[i + 1]),
+                            (softmax_scale_log2_e, softmax_scale_log2_e),
+                            lse,
+                        )
+                        tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
+                        tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+                    tTR_rS_f16 = self.quantize(tTR_rS, 1)
 
                 cute.arch.fence_view_async_tmem_load()
                 self.compute_sync_barrier.arrive_and_wait()
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
-                for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
-                    row = cute.get(tTR_cS[i], mode=[0])
-                    col = cute.get(tTR_cS[i], mode=[1])
-                    sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
+                if warp_half == kv_half:
+                    for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
+                        row = cute.get(tTR_cS[i], mode=[0]) - kv_half * self.kv_subtile
+                        col = cute.get(tTR_cS[i], mode=[1])
+                        sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
                 compute_mma_P_producer_state.advance()
 
                 compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
-                cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
-                for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
-                    tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.add_packed_f32x2(
-                        (tTR_rdP[i], tTR_rdP[i + 1]),
-                        (
-                            sSum_OdO[cute.get(tTR_cdP[i], mode=[1]), load_compute_sum_OdO_consumer_state.index],
-                            sSum_OdO[cute.get(tTR_cdP[i + 1], mode=[1]), load_compute_sum_OdO_consumer_state.index],
-                        ),
-                    )
-                    tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.mul_packed_f32x2(
-                        (tTR_rdP[i], tTR_rdP[i + 1]),
-                        (tTR_rS[i], tTR_rS[i + 1]),
-                    )
-                tTR_rdP_f16 = self.quantize(tTR_rdP, 1, scale_softmax)
+                if warp_half == kv_half:
+                    cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
+                    for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
+                        tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.add_packed_f32x2(
+                            (tTR_rdP[i], tTR_rdP[i + 1]),
+                            (
+                                sSum_OdO[cute.get(tTR_cdP[i], mode=[1]), load_compute_sum_OdO_consumer_state.index],
+                                sSum_OdO[cute.get(tTR_cdP[i + 1], mode=[1]), load_compute_sum_OdO_consumer_state.index],
+                            ),
+                        )
+                        tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.mul_packed_f32x2(
+                            (tTR_rdP[i], tTR_rdP[i + 1]),
+                            (tTR_rS[i], tTR_rS[i + 1]),
+                        )
+                    tTR_rdP_f16 = self.quantize(tTR_rdP, 1, scale_softmax)
 
                 cute.arch.fence_view_async_tmem_load()
                 self.compute_sync_barrier.arrive_and_wait()
                 ds_stage = 0 if self.compute_mma_dS_stage == 1 else compute_mma_dS_producer_state.index
-                for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
-                    row = cute.get(tTR_cdP[i], mode=[0])
-                    col = cute.get(tTR_cdP[i], mode=[1])
-                    sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
+                if warp_half == kv_half:
+                    for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
+                        row = cute.get(tTR_cdP[i], mode=[0]) - kv_half * self.kv_subtile
+                        col = cute.get(tTR_cdP[i], mode=[1])
+                        sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
                 compute_mma_dS_producer_state.advance()
