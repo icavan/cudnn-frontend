@@ -809,7 +809,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
                 rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
                 cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV01_done_barrier.arrive_and_wait()
+                # T2R has detached dKV0/1 from TMEM.  Reducers only need to
+                # publish that lifetime boundary; waiting for the MMA warp to
+                # reach the overwrite point serializes the following global
+                # atomics with dQ/tail MMA work.
+                self.t2r_dKV01_done_barrier.arrive()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
@@ -827,7 +831,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
-                self.t2r_dKV23_done_barrier.arrive_and_wait()
+                # One-way notification mirrors dKV0/1 above.  The MMA warp is
+                # the sole waiter before reusing the aliased TMEM columns.
+                self.t2r_dKV23_done_barrier.arrive()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
