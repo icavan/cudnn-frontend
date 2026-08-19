@@ -496,7 +496,13 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     if global_row // self.kv_subtile == kv_half:
                         row = global_row - kv_half * self.kv_subtile
                         col = cute.get(tTR_cdP[i], mode=[1])
-                        sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
+                        # Temporary diagnostic: a head-0-only dO must produce
+                        # zero dS for heads 16:31.  Forcing that invariant
+                        # separates score/dP T2R corruption from dQ T2R.
+                        if col < 16:
+                            sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
+                        else:
+                            sdS[(row, col), 0, 0, ds_stage] = self.element_dtype(0.0)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
                 compute_mma_dS_producer_state.advance()
