@@ -455,7 +455,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         )
                         tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                         tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
-                tTR_rS_f16 = self.quantize(tTR_rS, 1)
+                tTR_rS_f16 = self.quantize(tTR_rS, 2)
 
                 cute.arch.fence_view_async_tmem_load()
                 self.compute_sync_barrier.arrive_and_wait()
@@ -486,7 +486,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             (tTR_rdP[i], tTR_rdP[i + 1]),
                             (tTR_rS[i], tTR_rS[i + 1]),
                         )
-                tTR_rdP_f16 = self.quantize(tTR_rdP, 1, scale_softmax)
+                tTR_rdP_f16 = self.quantize(tTR_rdP, 2, scale_softmax)
 
                 cute.arch.fence_view_async_tmem_load()
                 self.compute_sync_barrier.arrive_and_wait()
@@ -496,13 +496,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     if global_row // self.kv_subtile == kv_half:
                         row = global_row - kv_half * self.kv_subtile
                         col = cute.get(tTR_cdP[i], mode=[1])
-                        # Temporary diagnostic: a head-0-only dO must produce
-                        # zero dS for heads 16:31.  Forcing that invariant
-                        # separates score/dP T2R corruption from dQ T2R.
-                        if col < 16:
-                            sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
-                        else:
-                            sdS[(row, col), 0, 0, ds_stage] = self.element_dtype(0.0)
+                        sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
                 compute_mma_dS_producer_state.advance()
