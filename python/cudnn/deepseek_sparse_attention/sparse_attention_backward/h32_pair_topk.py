@@ -122,7 +122,6 @@ class H32PairTopkUnion:
                             "or",
                             membership_bits.iterator + query_in_pair * self.num_words + word_idx,
                             Int32(1) << bit_idx,
-                            space=nvvm.SharedSpace.shared_cta,
                         )
         cute.arch.sync_threads()
 
