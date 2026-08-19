@@ -38,11 +38,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
 
-        # Eight loaders cover a K128 tile in four 32-row passes.  This leaves
-        # enough CTA register budget for the wider N32 compute fragments while
-        # preserving the four-compute/eight-reducer specialization.
-        self.num_load_KV_warps = 8
-        self.kv_rows_per_subgroup = 2
+        # Keep 16 independent loader warps for sparse-row memory-level
+        # parallelism.  Their register cap is reduced below so the wider N32
+        # compute fragments can retain more values without changing the total
+        # CTA register budget.
+        self.num_load_KV_warps = 16
+        self.kv_rows_per_subgroup = 1
         self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
         compute_warp_begin = self.num_load_KV_warps
         self.compute_warp_id = tuple(range(compute_warp_begin, compute_warp_begin + self.num_compute_warps))
@@ -90,7 +91,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        self.num_regs_compute = 176
+        self.num_regs_load_KV = 32
+        self.num_regs_compute = 160
 
     def _setup_attributes(self):
         super()._setup_attributes()
