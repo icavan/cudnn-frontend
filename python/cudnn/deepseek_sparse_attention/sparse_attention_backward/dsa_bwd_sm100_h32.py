@@ -88,7 +88,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.P_store_tiler = (self.kv_subtile, self.h_tile)
         self.dS_store_tiler = (self.kv_subtile, self.h_tile)
 
-        self.reduce_rows_per_thread = self.kv_subtile // self.num_reduce_warps
+        # Two eight-warp reducer sets split the D subtiles, not the KV rows.
+        self.reduce_rows_per_thread = self.kv_subtile // 8
 
         # S/dP remain live while both sparse-row halves are consumed.  dKV4
         # therefore gets a disjoint region instead of aliasing their columns.
@@ -705,8 +706,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tidx, _, _ = cute.arch.thread_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
-        wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
-        num_warp_groups = self.num_reduce_warps // 4
+        wg_idx = (tidx_in_wg // (4 * self.threads_per_warp)) % 2
+        num_warp_groups = 2
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
@@ -717,6 +718,25 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_cdKV = self.split_wg(thr_t2r.partition_D(cdKV), num_warp_groups, wg_idx)
         tTR_rdKV = cute.make_rmem_tensor(tTR_cdKV.shape, self.acc_dtype)
         tTR_tdKV = self.split_wg(thr_t2r.partition_S(tdKVtdKV), num_warp_groups, wg_idx)
+        cute.copy(tiled_t2r, tTR_tdKV, tTR_rdKV)
+        return tTR_rdKV
+
+    @cute.jit
+    def _t2r_dKV_tail(self, tdKVtdKV: cute.Tensor):
+        tidx, _, _ = cute.arch.thread_idx()
+        tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
+        dp_idx = tidx_in_wg % 128
+        wg_idx = (tidx_in_wg // (4 * self.threads_per_warp)) % 2
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+            self.acc_dtype,
+        )
+        tiled_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV)
+        thr_t2r = tiled_t2r.get_slice(dp_idx)
+        cdKV = cute.make_identity_tensor((self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1]))
+        tTR_cdKV = self.split_wg(thr_t2r.partition_D(cdKV), 2, wg_idx)
+        tTR_rdKV = cute.make_rmem_tensor(tTR_cdKV.shape, self.acc_dtype)
+        tTR_tdKV = self.split_wg(thr_t2r.partition_S(tdKVtdKV), 2, wg_idx)
         cute.copy(tiled_t2r, tTR_tdKV, tTR_rdKV)
         return tTR_rdKV
 
@@ -796,7 +816,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
         wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
-        num_warp_groups = self.num_reduce_warps // 4
+        pair_wg_idx = wg_idx % 2
+        reducer_set = wg_idx // 2
+        num_warp_groups = 2
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
@@ -804,14 +826,16 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         )
         cdKV = cute.make_identity_tensor((self.dOP_mma_tiler[0], self.dOP_mma_tiler[1]))
         thr_main = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV0).get_slice(dp_idx)
-        tTR_cdKV = self.split_wg(thr_main.partition_D(cdKV), num_warp_groups, wg_idx)
+        tTR_cdKV = self.split_wg(thr_main.partition_D(cdKV), num_warp_groups, pair_wg_idx)
         cdKV_64 = cute.make_identity_tensor((self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1]))
         thr_tail = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV4).get_slice(dp_idx)
-        tTR_cdKV_64 = self.split_wg(thr_tail.partition_D(cdKV_64), num_warp_groups, wg_idx)
+        tTR_cdKV_64 = self.split_wg(thr_tail.partition_D(cdKV_64), num_warp_groups, pair_wg_idx)
 
         consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
         rTopkIdx = cute.make_rmem_tensor((self.reduce_rows_per_thread,), cutlass.Int32)
         rTopkIdx_64 = cute.make_rmem_tensor((self.reduce_rows_per_thread,), cutlass.Int32)
+        rdKV_main = cute.make_rmem_tensor(tTR_cdKV.shape, self.acc_dtype)
+        rdKV_tail = cute.make_rmem_tensor(tTR_cdKV_64.shape, self.acc_dtype)
         full_tiles = (topk % self.block_tile) == 0
 
         tile_index = tile_count - 1
@@ -841,30 +865,38 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             rTopkIdx_64[i] = Int32(-1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
-                cute.arch.fence_view_async_tmem_load()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
-                cute.arch.fence_view_async_tmem_load()
-                mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                consumer_state.advance()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
-
-                mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
+                if reducer_set == 0:
+                    rdKV_main = self._t2r_dKV_main(tdKVtdKV0)
+                else:
+                    rdKV_main = self._t2r_dKV_main(tdKVtdKV1)
                 cute.arch.fence_view_async_tmem_load()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
-                self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
+                if reducer_set == 0:
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV_main, rTopkIdx, 0)
+                else:
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV_main, rTopkIdx, 1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
+                if reducer_set == 0:
+                    rdKV_tail = self._t2r_dKV_tail(tdKVtdKV4)
                 cute.arch.fence_view_async_tmem_load()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
-                rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
+                mma_reduce_dKV_pipeline.consumer_release(consumer_state)
+                consumer_state.advance()
+                if reducer_set == 0:
+                    self.reduce_dKV_64_from_reg(mdKV_acc, rdKV_tail, rTopkIdx_64)
+
+                mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                if reducer_set == 0:
+                    rdKV_main = self._t2r_dKV_main(tdKVtdKV2)
+                else:
+                    rdKV_main = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
                 self.t2r_dKV23_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                if reducer_set == 0:
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV_main, rTopkIdx, 2)
+                else:
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV_main, rTopkIdx, 3)
             tile_index -= 1
