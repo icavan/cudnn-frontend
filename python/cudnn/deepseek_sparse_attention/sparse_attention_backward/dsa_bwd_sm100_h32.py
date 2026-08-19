@@ -166,7 +166,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             mma_compute_dP_producer_state.advance()
 
             k_blocks_per_half = cute.size(tdQrdST, mode=[2])
-            for kv_half in cutlass.range_constexpr(self.num_kv_subtiles):
+            # Preserve the generic M64 kernel's descending sparse-tile order
+            # inside each K128 tile so FP32 dQ accumulation is not needlessly
+            # reordered by the optimization.
+            for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
+                kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 if not is_first_generation:
@@ -428,7 +432,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
             mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
 
-            for kv_half in cutlass.range_constexpr(self.num_kv_subtiles):
+            for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
+                kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
                 tTR_tS_half = tTR_tS[None, None, kv_half]
                 tTR_cS_half = tTR_cS[None, None, kv_half]
@@ -664,22 +669,29 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         tile_index = tile_count - 1
         while tile_index >= 0:
-            for kv_half in cutlass.range_constexpr(self.num_kv_subtiles):
+            for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
+                kv_half = self.num_kv_subtiles - 1 - half_iter
                 row_base = tile_index * self.block_tile + kv_half * self.kv_subtile
                 for i in cutlass.range_constexpr(self.reduce_rows_per_thread):
                     coord_base = i * 2 - i % 2
                     local_row_idx = cute.get(tTR_cdKV[coord_base], mode=[1])
                     global_row_idx = row_base + local_row_idx
-                    if full_tiles or global_row_idx < topk:
+                    if full_tiles:
                         rTopkIdx[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
                     else:
-                        rTopkIdx[i] = Int32(-1)
+                        if global_row_idx < topk:
+                            rTopkIdx[i] = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        else:
+                            rTopkIdx[i] = Int32(-1)
                     local_row_idx_64 = cute.get(tTR_cdKV_64[coord_base], mode=[1])
                     global_row_idx_64 = row_base + local_row_idx_64
-                    if full_tiles or global_row_idx_64 < topk:
+                    if full_tiles:
                         rTopkIdx_64[i] = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
                     else:
-                        rTopkIdx_64[i] = Int32(-1)
+                        if global_row_idx_64 < topk:
+                            rTopkIdx_64[i] = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
+                        else:
+                            rTopkIdx_64[i] = Int32(-1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
