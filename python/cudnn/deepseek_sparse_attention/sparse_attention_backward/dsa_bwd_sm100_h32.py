@@ -38,40 +38,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
 
-        # Trade loader width for dKV retirement width.  Early K release gives
-        # eight loaders the whole remaining MMA window to assemble the next
-        # K128 tile, while sixteen reducers double T2R/atomic concurrency.
-        self.num_load_KV_warps = 8
-        self.num_reduce_warps = 16
-        self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
-        compute_warp_begin = self.num_load_KV_warps
-        self.compute_warp_id = tuple(range(compute_warp_begin, compute_warp_begin + self.num_compute_warps))
-        reduce_warp_begin = compute_warp_begin + self.num_compute_warps
-        self.reduce_warp_id = tuple(range(reduce_warp_begin, reduce_warp_begin + self.num_reduce_warps))
-        self.mma_warp_id = reduce_warp_begin + self.num_reduce_warps
-        self.load_warp_id = self.mma_warp_id + 1
-        self.threads_per_cta = self.threads_per_warp * (self.num_load_KV_warps + self.num_compute_warps + self.num_reduce_warps + 4)
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=2,
-            num_threads=self.threads_per_warp * (self.num_compute_warps + self.num_reduce_warps + 1),
-        )
-        self.load_KV_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=5,
-            num_threads=self.num_load_KV_warps * self.threads_per_warp,
-        )
-        self.t2r_dKV4_done_barrier = pipeline.NamedBarrier(
-            barrier_id=8,
-            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
-        )
-        self.tmem_dealloc_barrier = pipeline.NamedBarrier(
-            barrier_id=9,
-            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
-        )
-        self.t2r_dKV23_done_barrier = pipeline.NamedBarrier(
-            barrier_id=10,
-            num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
-        )
-
         # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
         # half at a time so P/dS only occupy 4 KiB each in shared memory.
         self.QK_mma_tiler = (block_tile, self.h_tile, head_dim)
@@ -89,10 +55,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.P_store_tiler = (self.kv_subtile, self.h_tile)
         self.dS_store_tiler = (self.kv_subtile, self.h_tile)
 
-        # Each M128xN64 fragment is natively split across two warp groups.
-        # Four groups process two D fragments concurrently, so every active
-        # fragment still has eight reducer warps and eight rows per thread.
-        self.reduce_rows_per_thread = self.kv_subtile // 8
+        self.reduce_rows_per_thread = self.kv_subtile // self.num_reduce_warps
 
         # S/dP remain live while both sparse-row halves are consumed.  dKV4
         # therefore gets a disjoint region instead of aliasing their columns.
@@ -109,10 +72,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        # Keep the aggregate register budget equal to the 16-loader/8-reducer
-        # configuration while redistributing it across twice as many reducers.
+        # The inherited 1024-thread CTA already sits near the SM register
+        # budget.  Keep compute at 128 registers; setmaxnreg.inc(192) cannot
+        # be satisfied with 16 loaders and eight reducers resident.
         self.num_regs_compute = 128
-        self.num_regs_reduce = 64
 
     def _setup_attributes(self):
         super()._setup_attributes()
@@ -734,8 +697,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tidx, _, _ = cute.arch.thread_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
-        wg_idx = (tidx_in_wg // (4 * self.threads_per_warp)) % 2
-        num_warp_groups = 2
+        wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
+        num_warp_groups = self.num_reduce_warps // 4
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
@@ -746,26 +709,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_cdKV = self.split_wg(thr_t2r.partition_D(cdKV), num_warp_groups, wg_idx)
         tTR_rdKV = cute.make_rmem_tensor(tTR_cdKV.shape, self.acc_dtype)
         tTR_tdKV = self.split_wg(thr_t2r.partition_S(tdKVtdKV), num_warp_groups, wg_idx)
-        cute.copy(tiled_t2r, tTR_tdKV, tTR_rdKV)
-        return tTR_rdKV
-
-    @cute.jit
-    def t2r_dKV_64(self, tdKVtdKV: cute.Tensor):
-        """Load the tail with the two native TMEM warp groups."""
-        tidx, _, _ = cute.arch.thread_idx()
-        tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
-        dp_idx = tidx_in_wg % 128
-        wg_idx = (tidx_in_wg // (4 * self.threads_per_warp)) % 2
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
-            self.acc_dtype,
-        )
-        tiled_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV)
-        thr_t2r = tiled_t2r.get_slice(dp_idx)
-        cdKV = cute.make_identity_tensor((self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1]))
-        tTR_cdKV = self.split_wg(thr_t2r.partition_D(cdKV), 2, wg_idx)
-        tTR_rdKV = cute.make_rmem_tensor(tTR_cdKV.shape, self.acc_dtype)
-        tTR_tdKV = self.split_wg(thr_t2r.partition_S(tdKVtdKV), 2, wg_idx)
         cute.copy(tiled_t2r, tTR_tdKV, tTR_rdKV)
         return tTR_rdKV
 
@@ -832,7 +775,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
         wg_idx = tidx_in_wg // (4 * self.threads_per_warp)
-        fragment_wg_idx = wg_idx % 2
+        num_warp_groups = self.num_reduce_warps // 4
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
@@ -840,10 +783,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         )
         cdKV = cute.make_identity_tensor((self.dOP_mma_tiler[0], self.dOP_mma_tiler[1]))
         thr_main = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV0).get_slice(dp_idx)
-        tTR_cdKV = self.split_wg(thr_main.partition_D(cdKV), 2, fragment_wg_idx)
+        tTR_cdKV = self.split_wg(thr_main.partition_D(cdKV), num_warp_groups, wg_idx)
         cdKV_64 = cute.make_identity_tensor((self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1]))
         thr_tail = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV4).get_slice(dp_idx)
-        tTR_cdKV_64 = self.split_wg(thr_tail.partition_D(cdKV_64), 2, fragment_wg_idx)
+        tTR_cdKV_64 = self.split_wg(thr_tail.partition_D(cdKV_64), num_warp_groups, wg_idx)
 
         consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
         rTopkIdx = cute.make_rmem_tensor((self.reduce_rows_per_thread,), cutlass.Int32)
@@ -877,43 +820,33 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             rTopkIdx_64[i] = Int32(-1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                if wg_idx < 2:
-                    rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
-                    cute.arch.fence_view_async_tmem_load()
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                else:
-                    rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
-                    cute.arch.fence_view_async_tmem_load()
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
+                cute.arch.fence_view_async_tmem_load()
+                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+                rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
+                cute.arch.fence_view_async_tmem_load()
+                mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
+                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                if wg_idx < 2:
-                    rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
-                    cute.arch.fence_view_async_tmem_load()
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                    self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
-                else:
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
+                rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
+                cute.arch.fence_view_async_tmem_load()
+                mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
+                self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                if wg_idx < 2:
-                    rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
-                    cute.arch.fence_view_async_tmem_load()
-                    self.t2r_dKV23_done_barrier.arrive()
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
-                else:
-                    rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
-                    cute.arch.fence_view_async_tmem_load()
-                    self.t2r_dKV23_done_barrier.arrive()
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
+                cute.arch.fence_view_async_tmem_load()
+                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
+                rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
+                cute.arch.fence_view_async_tmem_load()
                 # T2R has detached dKV2/3 from TMEM.  Publish the lifetime
-                # boundary without waiting for the MMA warp, so the global
+                # boundary without waiting for the MMA warp, so rdKV3 global
                 # atomics overlap the next half's dKV0/1 production.
+                self.t2r_dKV23_done_barrier.arrive()
+                mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
+                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
             tile_index -= 1
