@@ -999,7 +999,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         cute.copy(
                             tma_atom_dKV_acc,
                             tma_s,
-                            tma_g[None, sub_tile_idx, topk_idx, (0, batch_idx)],
+                            tma_g[None, sub_tile_idx, topk_idx],
                         )
                 tma_store_pipeline.producer_commit()
             producer_state.advance()
