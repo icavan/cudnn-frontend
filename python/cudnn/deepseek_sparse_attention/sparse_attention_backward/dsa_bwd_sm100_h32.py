@@ -72,9 +72,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        # H32 doubles score/dP T2R work per compute warp.  Loader/reducer
-        # allocations remain conservative until the 8-vs-16 loader ablation.
-        self.num_regs_compute = 192
+        # Keep the 1024-thread CTA within the SM register budget.  Raising
+        # four compute warps to 192 registers while retaining 16 loaders and
+        # eight reducers requests more than 64K registers and can deadlock at
+        # setmaxnreg.inc before any pipeline work starts.
+        self.num_regs_compute = 128
 
     def _setup_attributes(self):
         super()._setup_attributes()
