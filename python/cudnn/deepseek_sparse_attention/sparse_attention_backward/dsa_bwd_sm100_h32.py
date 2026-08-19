@@ -598,10 +598,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         warp_idx: Int32,
     ):
         """Store one M128xN32 main dQ accumulator."""
-        for col in cutlass.range_constexpr(self.h_tile):
-            sdQ[dp_idx, col] = self.element_dtype(0.0)
-        self.compute_sync_barrier.arrive_and_wait()
-
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
@@ -614,13 +610,16 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_tdQ = thr_t2r_dQ.partition_S(tdQtdQ)
 
         cute.copy(tiled_t2r_dQ, tTR_tdQ, tTR_rdQ)
-        tTR_rdQ_f16 = self.quantize(tTR_rdQ, 1)
+        tTR_rdQ_f16 = self.quantize(tTR_rdQ, 2)
         cute.arch.fence_view_async_tmem_load()
 
-        for i in cutlass.range_constexpr(cute.size(tTR_rdQ_f16)):
-            row = cute.get(tTR_cdQ[i], mode=[0])
-            col = cute.get(tTR_cdQ[i], mode=[1])
-            sdQ[row, col] = tTR_rdQ_f16[i]
+        # TMEM's register fragment is swizzled.  Compose it with the physical
+        # M128xN32 epilogue layout instead of treating its coordinate tensor
+        # as a scalar-store map.
+        thread_layout = cute.make_ordered_layout((128, self.h_tile), (0, 1))
+        sdQ_slice_tmp = cute.composition(sdQ, thread_layout)
+        sdQ_slice = cute.composition(sdQ_slice_tmp[dp_idx, None], cute.make_layout(tTR_cdQ.shape))
+        cute.autovec_copy(tTR_rdQ_f16, sdQ_slice)
 
         self.compute_sync_barrier.arrive_and_wait()
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -641,13 +640,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         warp_idx: Int32,
     ):
         """Store the M64xN32 dQ tail accumulator."""
-        if dp_idx < 64:
-            for col in cutlass.range_constexpr(self.h_tile):
-                sdQ[dp_idx, col] = self.element_dtype(0.0)
-        self.compute_sync_barrier.arrive_and_wait()
-
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(2)),
             self.acc_dtype,
         )
         cdQ = cute.make_identity_tensor(cute.select(self.dQ4_mma_tiler, mode=[0, 1]))
@@ -658,13 +652,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tTR_tdQ = thr_t2r_dQ.partition_S(tdQtdQ)
 
         cute.copy(tiled_t2r_dQ, tTR_tdQ, tTR_rdQ)
-        tTR_rdQ_f16 = self.quantize(tTR_rdQ, 1)
         cute.arch.fence_view_async_tmem_load()
 
-        for i in cutlass.range_constexpr(cute.size(tTR_rdQ_f16)):
+        for i in cutlass.range_constexpr(cute.size(tTR_rdQ)):
             row = cute.get(tTR_cdQ[i], mode=[0])
             col = cute.get(tTR_cdQ[i], mode=[1])
-            sdQ[row, col] = tTR_rdQ_f16[i]
+            sdQ[row, col] = self.element_dtype(tTR_rdQ[i])
 
         self.compute_sync_barrier.arrive_and_wait()
         cute.arch.fence_proxy("async.shared", space="cta")
