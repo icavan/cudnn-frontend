@@ -11,6 +11,8 @@ from cutlass.cute.typing import Float32, Int32
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from cudnn.deepseek_sparse_attention.utils.sm90.primitives import make_l2_evict_last_policy, reduce_add_fp32x4_l2
+
 from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
 
 
@@ -84,6 +86,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.num_regs_reduce = int(os.environ.get("CUDNN_DSA_H32_REDUCE_REGS", "88"))
         self.num_regs_load_KV = int(os.environ.get("CUDNN_DSA_H32_LOAD_REGS", "40"))
         self.skip_atomic_diagnostic = os.environ.get("CUDNN_DSA_H32_SKIP_ATOMIC", "0") == "1"
+        self.cache_dkv_l2 = os.environ.get("CUDNN_DSA_H32_CACHE_DKV_L2", "0") == "1"
         self.t2r_dKV01_done_barrier = pipeline.NamedBarrier(
             barrier_id=11,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
@@ -716,6 +719,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
+        cache_policy = make_l2_evict_last_policy() if cutlass.const_expr(self.cache_dkv_l2) else None
         for i in cutlass.range_constexpr(self.reduce_rows_per_thread):
             coord_base = i * 2 - i % 2
             rdKV_frg = cute.make_rmem_tensor((4,), self.acc_dtype)
@@ -728,7 +732,17 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 dKV_row = dKV_acc[None, topk_idx, (0, batch_idx)]
                 tile_dKV_row = cute.flat_divide(dKV_row, (128,))[None, sub_tile_idx]
                 cur_dKV_frg = cute.flat_divide(tile_dKV_row, (4,))[None, dp_idx // 4]
-                cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load(), sem="relaxed", scope="gpu")
+                if cutlass.const_expr(self.cache_dkv_l2):
+                    reduce_add_fp32x4_l2(
+                        rdKV_frg[0],
+                        rdKV_frg[1],
+                        rdKV_frg[2],
+                        rdKV_frg[3],
+                        cur_dKV_frg.iterator,
+                        cache_policy,
+                    )
+                else:
+                    cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load(), sem="relaxed", scope="gpu")
 
     @cute.jit
     def reduce_dKV(

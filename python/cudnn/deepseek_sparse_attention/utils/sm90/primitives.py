@@ -9,7 +9,7 @@ from typing import Type, Callable, overload
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, const_expr
+from cutlass import Float32, Int64, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -187,6 +187,55 @@ def atomic_add_fp32x4(
         ],
         "atom.relaxed.gpu.global.add.v4.f32 {$0,$1,$2,$3}, [$4], {$5,$6,$7,$8};",  # relaxed mode
         "=f,=f,=f,=f,l,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def make_l2_evict_last_policy(*, loc=None, ip=None) -> Int64:
+    """Create an opaque L2 policy for a repeatedly reduced accumulation tile."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def reduce_add_fp32x4_l2(
+    a0: Float32,
+    a1: Float32,
+    a2: Float32,
+    a3: Float32,
+    gmem_ptr: cute.Pointer,
+    cache_policy: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Vector FP32 reduction with an L2 evict-last policy."""
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.toint().ir_value(loc=loc, ip=ip),
+            Float32(a0).ir_value(loc=loc, ip=ip),
+            Float32(a1).ir_value(loc=loc, ip=ip),
+            Float32(a2).ir_value(loc=loc, ip=ip),
+            Float32(a3).ir_value(loc=loc, ip=ip),
+            cache_policy.ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.L2::cache_hint.v4.f32 [$0], {$1,$2,$3,$4}, $5;",
+        "l,f,f,f,f,l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
