@@ -38,6 +38,23 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.kv_subtile = 64
         self.num_kv_subtiles = 2
 
+        # Eight loaders cover a K128 tile in four 32-row passes.  This leaves
+        # enough CTA register budget for the wider N32 compute fragments while
+        # preserving the four-compute/eight-reducer specialization.
+        self.num_load_KV_warps = 8
+        self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
+        compute_warp_begin = self.num_load_KV_warps
+        self.compute_warp_id = tuple(range(compute_warp_begin, compute_warp_begin + self.num_compute_warps))
+        reduce_warp_begin = compute_warp_begin + self.num_compute_warps
+        self.reduce_warp_id = tuple(range(reduce_warp_begin, reduce_warp_begin + self.num_reduce_warps))
+        self.mma_warp_id = reduce_warp_begin + self.num_reduce_warps
+        self.load_warp_id = self.mma_warp_id + 1
+        self.threads_per_cta = self.threads_per_warp * (self.num_load_KV_warps + self.num_compute_warps + self.num_reduce_warps + 4)
+        self.load_KV_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.num_load_KV_warps * self.threads_per_warp,
+        )
+
         # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
         # half at a time so P/dS only occupy 4 KiB each in shared memory.
         self.QK_mma_tiler = (block_tile, self.h_tile, head_dim)
@@ -72,10 +89,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        # The inherited 1024-thread CTA already sits near the SM register
-        # budget.  Keep compute at 128 registers; setmaxnreg.inc(192) cannot
-        # be satisfied with 16 loaders and eight reducers resident.
-        self.num_regs_compute = 128
+        self.num_regs_compute = 192
 
     def _setup_attributes(self):
         super()._setup_attributes()
