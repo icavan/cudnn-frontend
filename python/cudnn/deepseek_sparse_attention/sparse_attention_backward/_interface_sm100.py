@@ -12,12 +12,52 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream, torch_stream_context
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
+from .h32_pair_topk import H32PairTopkUnion
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+
+_h32_pair_topk_compile_cache = {}
+
+
+def _build_h32_pair_topk(
+    topk_idxs: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    seqlen_kv: int,
+    current_stream,
+):
+    """Return the encoded union and length for adjacent H32 query pairs."""
+    num_pairs = topk_idxs.shape[0] // 2
+    max_topk = topk_idxs.shape[1]
+    max_union = min(seqlen_kv, 2 * max_topk)
+    union_idxs = torch.empty((num_pairs, max_union), dtype=torch.int32, device=topk_idxs.device)
+    union_length = torch.empty((num_pairs,), dtype=torch.int32, device=topk_idxs.device)
+
+    has_length = topk_length is not None
+    key = (seqlen_kv, max_topk, has_length)
+    if key not in _h32_pair_topk_compile_cache:
+        op = H32PairTopkUnion(seqlen_kv=seqlen_kv, max_topk=max_topk)
+        _h32_pair_topk_compile_cache[key] = cute.compile(
+            op,
+            to_cute_tensor(topk_idxs),
+            to_cute_tensor(topk_length) if has_length else None,
+            to_cute_tensor(union_idxs),
+            to_cute_tensor(union_length),
+            current_stream,
+            options=compile_options(),
+        )
+    _h32_pair_topk_compile_cache[key](
+        topk_idxs,
+        topk_length,
+        union_idxs,
+        union_length,
+        current_stream,
+    )
+    return union_idxs, union_length
 
 
 def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
@@ -100,13 +140,11 @@ def flash_attn_bwd_sm100(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    # H16 KV-major specialization can use the full M128 UMMA tile.  This
-    # halves the top-k loop count while keeping one CTA per query token.
-    backend, block_tile = _select_sm100_backend(num_head, head_dim)
-    num_head_blocks = (num_head + block_tile - 1) // block_tile
     batch_size = 1
 
     current_stream = resolve_stream(current_stream)
+    paired_h32 = num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and 0 < topk_idxs.shape[1] <= 2048 and total_S_kv <= 32768
+    original_q_shape = q.shape
 
     # Normalize inputs and allocate outputs/workspaces on the execution stream:
     # the kernel below launches on `current_stream`, so the semantically
@@ -145,6 +183,29 @@ def flash_attn_bwd_sm100(
             dkv.fill_(0)
         d_sink = torch.zeros_like(attn_sink)
 
+        # Pair adjacent H32 query tokens into one virtual H64 query. The
+        # union kernel encodes per-token membership in the index high bits;
+        # the H64 main kernel masks the absent half before P/dS are consumed.
+        # dQ keeps the original storage and is merely viewed as H64, while
+        # dKV is accumulated once for a common KV row inside the CTA.
+        dq_return = dq
+        if paired_h32:
+            topk_idxs, topk_length = _build_h32_pair_topk(
+                topk_idxs,
+                topk_length,
+                total_S_kv,
+                current_stream,
+            )
+            total_S_q //= 2
+            num_head = 64
+            q = q.view(total_S_q, num_head, head_dim)
+            out = out.view(total_S_q, num_head, head_dim_v)
+            dout = dout.view(total_S_q, num_head, head_dim_v)
+            lse = lse.view(total_S_q, num_head)
+            dq = dq.view(total_S_q, num_head, head_dim)
+            attn_sink = torch.cat((attn_sink, attn_sink))
+            d_sink = torch.zeros_like(attn_sink)
+
         # Allocate workspace tensors
         acc_dtype = cutlass.Float32
         ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
@@ -172,13 +233,14 @@ def flash_attn_bwd_sm100(
             device=device,
         )
 
+    backend, block_tile = _select_sm100_backend(num_head, head_dim)
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length)
+    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length, paired_h32)
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -225,6 +287,7 @@ def flash_attn_bwd_sm100(
                 head_dim_v=head_dim_v,
                 block_tile=block_tile,
                 max_topk=max_topk,
+                pair_mask_encoded=paired_h32,
             )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
@@ -269,6 +332,12 @@ def flash_attn_bwd_sm100(
             current_stream,
         )
 
+    if paired_h32:
+        # The virtual head halves correspond to even and odd original query
+        # tokens. Fold their independently accumulated sink gradients back to
+        # the original H32 contract.
+        d_sink = d_sink[:32] + d_sink[32:]
+        return dq_return.view(original_q_shape), dkv, d_sink
     return dq, dkv, d_sink
 
 

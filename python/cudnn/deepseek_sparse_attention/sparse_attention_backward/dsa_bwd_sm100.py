@@ -28,6 +28,7 @@ class FlashAttentionDSABackwardSm100:
         lse_includes_sink: bool = False,
         num_dkv_shards: int | None = None,
         num_load_kv_warps: int = 16,
+        pair_mask_encoded: bool = False,
     ):
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
@@ -35,6 +36,7 @@ class FlashAttentionDSABackwardSm100:
         self.block_tile = block_tile
         self.max_topk = max_topk
         self.lse_includes_sink = lse_includes_sink
+        self.pair_mask_encoded = pair_mask_encoded
         # Keep one FP32 accumulation buffer by default. Callers can still
         # request multiple shards to trade workspace for lower atomic
         # contention; all shards are reduced in FP32 before BF16 conversion.
@@ -558,6 +560,10 @@ class FlashAttentionDSABackwardSm100:
             sdS: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(dS_smem_layout_staged)], self.non_tma_align_bytes]
             sLSE: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(LSE_smem_layout)], self.non_tma_align_bytes]
             sSum_OdO: cute.struct.Align[cute.struct.MemRange[self.acc_dtype, cute.cosize(sum_OdO_smem_layout)], self.non_tma_align_bytes]
+            sTopkMask: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, self.block_tile],
+                self.non_tma_align_bytes,
+            ]
 
         assert (
             SharedStorage.size_in_bytes() <= _max_smem_bytes
@@ -1015,6 +1021,7 @@ class FlashAttentionDSABackwardSm100:
 
         sLSE = storage.sLSE.get_tensor(LSE_smem_layout)
         sSum_OdO = storage.sSum_OdO.get_tensor(sum_OdO_smem_layout)
+        sTopkMask = storage.sTopkMask.get_tensor(cute.make_layout((self.block_tile,)))
 
         sdST_ptr = cute.recast_ptr(sdS.iterator, dST_smem_layout_staged.inner)
         sdST = cute.make_tensor(sdST_ptr, dST_smem_layout_staged.outer)
@@ -1208,6 +1215,7 @@ class FlashAttentionDSABackwardSm100:
                 sdS_store,
                 sdQ,
                 sdQ4 if not self.same_hdim_kv else None,
+                sTopkMask,
                 scale_softmax,
                 tile_count,
                 (
@@ -1258,6 +1266,7 @@ class FlashAttentionDSABackwardSm100:
                 topk,
                 load_mma_K_pipeline,
                 mTopkLength,
+                sTopkMask,
             )
 
         else:
@@ -1509,6 +1518,7 @@ class FlashAttentionDSABackwardSm100:
         topk: Int32,
         load_mma_K_pipeline,
         mTopkLength: Optional[cute.Tensor],
+        sTopkMask: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, batch_idx = cute.arch.block_idx()
@@ -1551,11 +1561,20 @@ class FlashAttentionDSABackwardSm100:
 
             for row_batch in cutlass.range_constexpr(row_batches):
                 row = local_warp_idx * rows_per_warp + row_batch * 4 + subgroup
+                idx = tile_index * self.block_tile + row
+                topk_idx = rTopkIdx[row_batch]
+                if cutlass.const_expr(self.pair_mask_encoded):
+                    member = Int32(0)
+                    if idx < topk and topk_idx >= 0:
+                        member = (topk_idx >> 29) & Int32(3)
+                        topk_idx = topk_idx & Int32(0x1FFFFFFF)
+                    if lane_in_subwarp == 0:
+                        sTopkMask[row] = member
                 if full_tiles:
                     self._load_kv_rows(
                         mKV,
                         sK_slice,
-                        rTopkIdx[row_batch],
+                        topk_idx,
                         tile_index,
                         topk,
                         mTopkLength,
@@ -1569,7 +1588,7 @@ class FlashAttentionDSABackwardSm100:
                     self._load_kv_rows(
                         mKV,
                         sK_slice,
-                        rTopkIdx[row_batch],
+                        topk_idx,
                         tile_index,
                         topk,
                         mTopkLength,
@@ -2004,6 +2023,7 @@ class FlashAttentionDSABackwardSm100:
         sdS_store: cute.Tensor,
         sdQ: cute.Tensor,
         sdQ4: Optional[cute.Tensor],
+        sTopkMask: cute.Tensor,
         scale_softmax: Float32,
         tile_count: Int32,
         pipelines,
@@ -2109,6 +2129,19 @@ class FlashAttentionDSABackwardSm100:
                 )
                 tTR_rS[i] = cute.math.exp2(tTR_rS[i], fastmath=True)
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
+
+                if cutlass.const_expr(self.pair_mask_encoded):
+                    head0 = cute.get(tTR_cS[i], mode=[0])
+                    row0 = cute.get(tTR_cS[i], mode=[1])
+                    required0 = Int32(1) if head0 < self.block_tile // 2 else Int32(2)
+                    if (sTopkMask[row0] & required0) == 0:
+                        tTR_rS[i] = Float32(0.0)
+
+                    head1 = cute.get(tTR_cS[i + 1], mode=[0])
+                    row1 = cute.get(tTR_cS[i + 1], mode=[1])
+                    required1 = Int32(1) if head1 < self.block_tile // 2 else Int32(2)
+                    if (sTopkMask[row1] & required1) == 0:
+                        tTR_rS[i + 1] = Float32(0.0)
 
             tTR_rS_f16 = self.quantize(tTR_rS, 4)
 
@@ -2413,10 +2446,14 @@ class FlashAttentionDSABackwardSm100:
                 global_row_idx = tile_index * self.block_tile + local_row_idx
                 if full_tiles:
                     topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                    if cutlass.const_expr(self.pair_mask_encoded):
+                        topk_idx = topk_idx & Int32(0x1FFFFFFF)
                     rTopkIdx[i] = topk_idx + shard_row_offset if topk_idx >= 0 else Int32(-1)
                 else:
                     if global_row_idx < topk:
                         topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
+                        if cutlass.const_expr(self.pair_mask_encoded):
+                            topk_idx = topk_idx & Int32(0x1FFFFFFF)
                         rTopkIdx[i] = topk_idx + shard_row_offset if topk_idx >= 0 else Int32(-1)
                     else:
                         rTopkIdx[i] = Int32(-1)
