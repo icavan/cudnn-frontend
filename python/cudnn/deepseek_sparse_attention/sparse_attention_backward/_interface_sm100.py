@@ -143,7 +143,11 @@ def flash_attn_bwd_sm100(
     batch_size = 1
 
     current_stream = resolve_stream(current_stream)
-    paired_h32 = num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and 0 < topk_idxs.shape[1] <= 2048 and total_S_kv <= 32768
+    # The pair path pays for a union build and computes a full H64 tile. It is
+    # profitable for the dense sparse-prefill target (topk=2048 in at most 4K
+    # KV), where random pair overlap is already 50%. Keep lower-density and
+    # smaller-topk shapes on the tuned one-query H32 kernel.
+    paired_h32 = num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 4096
     original_q_shape = q.shape
 
     # Normalize inputs and allocate outputs/workspaces on the execution stream:
