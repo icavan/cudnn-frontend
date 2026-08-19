@@ -584,6 +584,83 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         compute_tmastore_dQ_pipeline.producer_tail()
 
     @cute.jit
+    def store_dQ(
+        self,
+        tma_atom_dQ: cute.CopyAtom,
+        sdQ: cute.Tensor,
+        tdQsdQ: cute.Tensor,
+        tdQgdQ_mkl: cute.Tensor,
+        tdQtdQ: cute.Tensor,
+        dp_idx: Int32,
+        warp_idx: Int32,
+    ):
+        """Store one M128xN32 main dQ accumulator."""
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)),
+            self.acc_dtype,
+        )
+        cdQ = cute.make_identity_tensor(cute.select(self.KdS_mma_tiler, mode=[0, 1]))
+        tiled_t2r_dQ = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
+        thr_t2r_dQ = tiled_t2r_dQ.get_slice(dp_idx)
+        tTR_cdQ = thr_t2r_dQ.partition_D(cdQ)
+        tTR_rdQ = cute.make_rmem_tensor(tTR_cdQ.shape, self.acc_dtype)
+        tTR_tdQ = thr_t2r_dQ.partition_S(tdQtdQ)
+
+        cute.copy(tiled_t2r_dQ, tTR_tdQ, tTR_rdQ)
+        tTR_rdQ_f16 = self.quantize(tTR_rdQ, 1)
+        cute.arch.fence_view_async_tmem_load()
+
+        for i in cutlass.range_constexpr(cute.size(tTR_rdQ_f16)):
+            row = cute.get(tTR_cdQ[i], mode=[0])
+            col = cute.get(tTR_cdQ[i], mode=[1])
+            sdQ[row, col] = tTR_rdQ_f16[i]
+
+        self.compute_sync_barrier.arrive_and_wait()
+        cute.arch.fence_proxy("async.shared", space="cta")
+        self.compute_sync_barrier.arrive_and_wait()
+        if warp_idx == self.compute_warp_id[0]:
+            cute.copy(tma_atom_dQ, tdQsdQ, tdQgdQ_mkl)
+
+    @cute.jit
+    def store_dQ_64(
+        self,
+        tma_atom_dQ: cute.CopyAtom,
+        sdQ: cute.Tensor,
+        tdQsdQ: cute.Tensor,
+        tdQgdQ_mkl: cute.Tensor,
+        tdQtdQ: cute.Tensor,
+        dp_idx: Int32,
+        wg_idx: Int32,
+        warp_idx: Int32,
+    ):
+        """Store the M64xN32 dQ tail accumulator."""
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
+            self.acc_dtype,
+        )
+        cdQ = cute.make_identity_tensor(cute.select(self.dQ4_mma_tiler, mode=[0, 1]))
+        tiled_t2r_dQ = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
+        thr_t2r_dQ = tiled_t2r_dQ.get_slice(dp_idx)
+        tTR_cdQ = thr_t2r_dQ.partition_D(cdQ)
+        tTR_rdQ = cute.make_rmem_tensor(tTR_cdQ.shape, self.acc_dtype)
+        tTR_tdQ = thr_t2r_dQ.partition_S(tdQtdQ)
+
+        cute.copy(tiled_t2r_dQ, tTR_tdQ, tTR_rdQ)
+        tTR_rdQ_f16 = self.quantize(tTR_rdQ, 1)
+        cute.arch.fence_view_async_tmem_load()
+
+        for i in cutlass.range_constexpr(cute.size(tTR_rdQ_f16)):
+            row = cute.get(tTR_cdQ[i], mode=[0])
+            col = cute.get(tTR_cdQ[i], mode=[1])
+            sdQ[row, col] = tTR_rdQ_f16[i]
+
+        self.compute_sync_barrier.arrive_and_wait()
+        cute.arch.fence_proxy("async.shared", space="cta")
+        self.compute_sync_barrier.arrive_and_wait()
+        if warp_idx == self.compute_warp_id[0]:
+            cute.copy(tma_atom_dQ, tdQsdQ, tdQgdQ_mkl)
+
+    @cute.jit
     def _t2r_dKV_main(self, tdKVtdKV: cute.Tensor):
         """Load one M128xN64 dKV fragment into reducer registers."""
         tidx, _, _ = cute.arch.thread_idx()
