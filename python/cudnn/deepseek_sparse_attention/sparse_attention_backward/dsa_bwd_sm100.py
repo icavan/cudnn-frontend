@@ -29,6 +29,7 @@ class FlashAttentionDSABackwardSm100:
         num_dkv_shards: int | None = None,
         num_load_kv_warps: int = 16,
         pair_mask_encoded: bool = False,
+        pair_split_heads: int | None = None,
     ):
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
@@ -37,6 +38,9 @@ class FlashAttentionDSABackwardSm100:
         self.max_topk = max_topk
         self.lse_includes_sink = lse_includes_sink
         self.pair_mask_encoded = pair_mask_encoded
+        self.pair_split_heads = pair_split_heads
+        if pair_mask_encoded != (pair_split_heads is not None):
+            raise ValueError("pair_mask_encoded and pair_split_heads must be configured together")
         # Keep one FP32 accumulation buffer by default. Callers can still
         # request multiple shards to trade workspace for lower atomic
         # contention; all shards are reduced in FP32 before BF16 conversion.
@@ -2133,13 +2137,15 @@ class FlashAttentionDSABackwardSm100:
                 if cutlass.const_expr(self.pair_mask_encoded):
                     head0 = cute.get(tTR_cS[i], mode=[0])
                     row0 = cute.get(tTR_cS[i], mode=[1])
-                    required0 = Int32(1) if head0 < self.block_tile // 2 else Int32(2)
+                    global_head0 = head_block_idx * self.block_tile + head0
+                    required0 = Int32(1) if global_head0 < self.pair_split_heads else Int32(2)
                     if (sTopkMask[row0] & required0) == 0:
                         tTR_rS[i] = Float32(0.0)
 
                     head1 = cute.get(tTR_cS[i + 1], mode=[0])
                     row1 = cute.get(tTR_cS[i + 1], mode=[1])
-                    required1 = Int32(1) if head1 < self.block_tile // 2 else Int32(2)
+                    global_head1 = head_block_idx * self.block_tile + head1
+                    required1 = Int32(1) if global_head1 < self.pair_split_heads else Int32(2)
                     if (sTopkMask[row1] & required1) == 0:
                         tTR_rS[i + 1] = Float32(0.0)
 

@@ -35,6 +35,7 @@ class SparseAttentionBackward(APIBase):
         sample_topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         block_tile: int = 64,
+        pair_queries: bool = False,
     ):
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -47,6 +48,7 @@ class SparseAttentionBackward(APIBase):
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
         self.block_tile = int(block_tile)
         self.softmax_scale = softmax_scale
+        self.pair_queries = bool(pair_queries)
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -115,6 +117,16 @@ class SparseAttentionBackward(APIBase):
             f"head_dim must be 512 or 576, got {head_dim}",
         )
         head_dim_v = 512 if head_dim == 576 else head_dim
+        if self.pair_queries:
+            self._value_error_if(
+                major != 10
+                or num_heads != 96
+                or head_dim != 576
+                or total_s_q % 2 != 0
+                or self.topk_idxs_desc.shape[1] != 2048
+                or self.kv_desc.shape[0] > 16384,
+                "pair_queries requires SM100, H96/D576, even total_S_q, topk_max=2048, and total_S_kv<=16384",
+            )
         expected_o_shape = (total_s_q, num_heads, head_dim_v)
         self._value_error_if(
             self.kv_desc.shape[1] != head_dim,
@@ -202,6 +214,7 @@ class SparseAttentionBackward(APIBase):
             topk_length=topk_length,
             dq=dq,
             dkv=dkv,
+            pair_queries=self.pair_queries,
             current_stream=current_stream,
         )
 
@@ -223,11 +236,14 @@ def sparse_attention_backward_wrapper(
     dkv: Optional[torch.Tensor] = None,
     block_tile: int = 64,
     stream: Optional[cuda.CUstream] = None,
+    pair_queries: bool = False,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
 
     Dispatches to SM90 or SM100 based on the active CUDA device. The returned
-    ``d_sink`` is computed from ``attn_sink`` and ``dout``.
+    ``d_sink`` is computed from ``attn_sink`` and ``dout``. ``pair_queries``
+    explicitly enables the high-overlap SM100 H96 adjacent-query backend; it
+    is off by default because low-overlap unions are slower.
     """
     key = (
         q.dtype,
@@ -241,6 +257,7 @@ def sparse_attention_backward_wrapper(
         topk_length is not None,
         int(block_tile),
         softmax_scale,
+        bool(pair_queries),
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -255,6 +272,7 @@ def sparse_attention_backward_wrapper(
             sample_topk_length=topk_length,
             softmax_scale=softmax_scale,
             block_tile=block_tile,
+            pair_queries=pair_queries,
         )
         assert obj.check_support()
         obj.compile()

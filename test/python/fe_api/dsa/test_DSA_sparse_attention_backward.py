@@ -76,6 +76,27 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
     assert _select_sm100_backend(num_heads, head_dim) == (expected_backend, expected_block_tile)
 
 
+@pytest.mark.parametrize(
+    "backend,head_dim,num_heads,expected",
+    [
+        ("generic_m64", 576, 96, 4),
+        ("generic_m64", 576, 192, 4),
+        ("generic_m64", 576, 64, 16),
+        ("generic_m64", 512, 96, 16),
+        ("h16_m128", 576, 16, 16),
+        ("h32_m128_m64", 576, 32, 16),
+    ],
+)
+@pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_loader_warps(backend, head_dim, num_heads, expected):
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_num_load_kv_warps
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    assert _select_sm100_num_load_kv_warps(backend, head_dim, num_heads) == expected
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_dsa_sparse_attention_backward_params
@@ -309,6 +330,77 @@ def test_DSA_sparse_attention_backward_sm100_h32_pair_membership(has_topk_length
         result["d_sink"],
         softmax_scale=softmax_scale,
         topk_length=topk_length,
+        atol=5e-2,
+        rtol=5e-2,
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=419)
+def test_DSA_sparse_attention_backward_sm100_h96_explicit_pair_membership():
+    """The explicit H96 pair path must map all three virtual H64 CTAs."""
+    if not torch.cuda.is_available():
+        pytest.skip("SM100 GPU required")
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 100:
+        pytest.skip("paired H96 regression test targets the SM100 kernel")
+
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    s_q, s_kv, topk = 2, 4096, 2048
+    num_heads, head_dim = 96, 576
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(s_q, num_heads, head_dim, dtype=torch.bfloat16, device=device) / 10
+    kv = torch.randn(s_kv, head_dim, dtype=torch.bfloat16, device=device) / 10
+    attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
+    # Exercise first-only, second-only, and common rows.  H96 is important:
+    # virtual heads 128:191 reside in the third H64 CTA and must still select
+    # the second query's membership bit.
+    topk_idxs = torch.stack(
+        (
+            torch.arange(0, 2048, device=device),
+            torch.arange(1024, 3072, device=device),
+        )
+    ).to(torch.int32)
+
+    out, lse = ref_sparse_attention_forward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+    )
+    dout = torch.randn_like(out)
+    result = DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        dout,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        pair_queries=True,
+    )
+    torch.cuda.synchronize()
+
+    check_ref_dsa_sparse_attention_backward(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        out,
+        dout,
+        lse,
+        result["dq"],
+        result["dkv"],
+        result["d_sink"],
+        softmax_scale=softmax_scale,
         atol=5e-2,
         rtol=5e-2,
     )

@@ -69,6 +69,13 @@ def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
     return "generic_m64", 64
 
 
+def _select_sm100_num_load_kv_warps(backend: str, head_dim: int, num_heads: int) -> int:
+    """Use four gather warps only for the tuned H96 specializations."""
+    if backend == "generic_m64" and head_dim == 576 and num_heads in (96, 192):
+        return 4
+    return 16
+
+
 def flash_attn_bwd_sm100(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -82,6 +89,7 @@ def flash_attn_bwd_sm100(
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
     current_stream=None,
+    pair_queries: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -100,6 +108,8 @@ def flash_attn_bwd_sm100(
         topk_length: (total_S_q,) int32, per-query valid count, optional
         dq: pre-allocated (total_S_q, nheads, headdim), optional
         dkv: pre-allocated (total_S_kv, headdim), optional
+        pair_queries: opt in to adjacent-query union for the high-overlap
+            SM100 H96/D576, topk=2048, <=16K-KV specialization
 
     Returns:
         (dq, dkv, d_sink) -- flat layout gradients
@@ -136,6 +146,10 @@ def flash_attn_bwd_sm100(
     if topk_length is not None:
         assert topk_length.dtype == torch.int32, f"topk_length dtype mismatch: expected torch.int32, got {topk_length.dtype}"
         assert topk_length.shape == (total_S_q,), f"topk_length shape mismatch: expected {(total_S_q,)}, got {tuple(topk_length.shape)}"
+    if pair_queries:
+        assert (
+            num_head == 96 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 16384
+        ), "pair_queries requires H96/D576, even total_S_q, topk_max=2048, and total_S_kv<=16384"
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -147,8 +161,11 @@ def flash_attn_bwd_sm100(
     # profitable for the dense sparse-prefill target (topk=2048 in at most 4K
     # KV), where random pair overlap is already 50%. Keep lower-density and
     # smaller-topk shapes on the tuned one-query H32 kernel.
-    paired_h32 = num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 4096
+    paired_h32 = (num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 4096) or (
+        pair_queries and num_head == 96 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 16384
+    )
     original_q_shape = q.shape
+    pair_split_heads = num_head if paired_h32 else None
 
     # Normalize inputs and allocate outputs/workspaces on the execution stream:
     # the kernel below launches on `current_stream`, so the semantically
@@ -201,7 +218,7 @@ def flash_attn_bwd_sm100(
                 current_stream,
             )
             total_S_q //= 2
-            num_head = 64
+            num_head *= 2
             q = q.view(total_S_q, num_head, head_dim)
             out = out.view(total_S_q, num_head, head_dim_v)
             dout = dout.view(total_S_q, num_head, head_dim_v)
@@ -238,13 +255,24 @@ def flash_attn_bwd_sm100(
         )
 
     backend, block_tile = _select_sm100_backend(num_head, head_dim)
+    num_load_kv_warps = _select_sm100_num_load_kv_warps(backend, head_dim, num_head)
     problem_shape = (total_S_q, total_S_kv, head_dim, (num_head, batch_size))
 
     dtype = torch2cute_dtype_map[q.dtype]
 
     has_topk_length = topk_length is not None
     max_topk = topk_idxs.shape[1]
-    compile_key = (dtype, head_dim, head_dim_v, num_head, block_tile, max_topk, has_topk_length, paired_h32)
+    compile_key = (
+        dtype,
+        head_dim,
+        head_dim_v,
+        num_head,
+        block_tile,
+        max_topk,
+        has_topk_length,
+        paired_h32,
+        num_load_kv_warps,
+    )
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
@@ -291,7 +319,9 @@ def flash_attn_bwd_sm100(
                 head_dim_v=head_dim_v,
                 block_tile=block_tile,
                 max_topk=max_topk,
+                num_load_kv_warps=num_load_kv_warps,
                 pair_mask_encoded=paired_h32,
+                pair_split_heads=pair_split_heads,
             )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):
@@ -339,8 +369,8 @@ def flash_attn_bwd_sm100(
     if paired_h32:
         # The virtual head halves correspond to even and odd original query
         # tokens. Fold their independently accumulated sink gradients back to
-        # the original H32 contract.
-        d_sink = d_sink[:32] + d_sink[32:]
+        # the original per-query head count.
+        d_sink = d_sink[:pair_split_heads] + d_sink[pair_split_heads:]
         return dq_return.view(original_q_shape), dkv, d_sink
     return dq, dkv, d_sink
 
