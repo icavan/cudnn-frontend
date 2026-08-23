@@ -65,14 +65,14 @@ def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
     if num_heads == 16 and head_dim == 576:
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
-        return "h32_m128_m64", 128
+        return "h32_m128_m64", 64
     return "generic_m64", 64
 
 
 def _select_sm100_num_load_kv_warps(backend: str, head_dim: int, num_heads: int) -> int:
-    """Use four gather warps only for the tuned H96 specializations."""
-    if backend == "generic_m64" and head_dim == 576 and num_heads in (96, 192):
-        return 4
+    """Use eight gather warps for the tuned H96 specializations."""
+    if backend == "generic_m64" and head_dim == 576 and num_heads in (64, 96, 192):
+        return 8
     return 16
 
 
@@ -90,6 +90,18 @@ def flash_attn_bwd_sm100(
     dkv: Optional[torch.Tensor] = None,
     current_stream=None,
     pair_queries: bool = False,
+    _split_h96: bool = True,
+    _allow_strided_heads: bool = False,
+    _workspace_lse_odo: Optional[torch.Tensor] = None,
+    _workspace_dkv: Optional[torch.Tensor] = None,
+    _accumulate_dkv: bool = False,
+    _d_sink: Optional[torch.Tensor] = None,
+    _logical_num_head: Optional[int] = None,
+    _head_offset: int = 0,
+    _workspace_num_heads: Optional[int] = None,
+    _preprocess_num_heads: Optional[int] = None,
+    _skip_preprocess: bool = False,
+    _skip_convert: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """FlashAttention (DSA) Backward Pass for Blackwell (SM100), with K=V.
 
@@ -151,6 +163,12 @@ def flash_attn_bwd_sm100(
             num_head == 96 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 16384
         ), "pair_queries requires H96/D576, even total_S_q, topk_max=2048, and total_S_kv<=16384"
 
+    storage_num_head = num_head
+    if _logical_num_head is not None:
+        assert 0 <= _head_offset < storage_num_head
+        assert _head_offset + _logical_num_head <= storage_num_head
+        num_head = _logical_num_head
+
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
 
@@ -161,9 +179,9 @@ def flash_attn_bwd_sm100(
     # profitable for the dense sparse-prefill target (topk=2048 in at most 4K
     # KV), where random pair overlap is already 50%. Keep lower-density and
     # smaller-topk shapes on the tuned one-query H32 kernel.
-    paired_h32 = (num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 4096) or (
-        pair_queries and num_head == 96 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 16384
-    )
+    paired_h32 = (
+        _logical_num_head is None and num_head == 32 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 4096
+    ) or (pair_queries and num_head == 96 and head_dim == 576 and total_S_q % 2 == 0 and topk_idxs.shape[1] == 2048 and total_S_kv <= 16384)
     original_q_shape = q.shape
     pair_split_heads = num_head if paired_h32 else None
 
@@ -173,9 +191,14 @@ def flash_attn_bwd_sm100(
     # contiguity copies) must be stream-ordered with it, not with the ambient
     # torch stream the caller happens to be on.
     with torch_stream_context(current_stream):
-        # Ensure contiguous
-        q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
-        lse = lse.contiguous()
+        # The internal H96 decomposition uses head slices with the original
+        # H96 row stride.  Their CuTe tensors preserve those explicit strides;
+        # public calls still normalize arbitrary inputs to contiguous storage.
+        if not _allow_strided_heads:
+            q, kv, out, dout = [t.contiguous() for t in (q, kv, out, dout)]
+            lse = lse.contiguous()
+        else:
+            kv = kv.contiguous()
         attn_sink = attn_sink.contiguous()
         topk_idxs = topk_idxs.contiguous()
         if topk_length is not None:
@@ -192,17 +215,83 @@ def flash_attn_bwd_sm100(
             # provided output must match the contiguous layout the kernel was
             # compiled for (it is not copied: that would break out-parameter
             # identity).
-            assert dq.is_contiguous(), "dq must be contiguous"
+            assert dq.is_contiguous() or _allow_strided_heads, "dq must be contiguous"
         if dkv is None:
-            dkv = torch.zeros(total_S_kv, head_dim, dtype=kv.dtype, device=device)
+            dkv = torch.empty(total_S_kv, head_dim, dtype=kv.dtype, device=device)
         else:
             expected_dkv_shape = (total_S_kv, head_dim)
             assert dkv.shape == expected_dkv_shape, f"dkv shape mismatch: expected {expected_dkv_shape}, got {dkv.shape}"
             assert dkv.dtype == kv.dtype, f"dkv dtype mismatch: expected {kv.dtype}, got {dkv.dtype}"
             assert dkv.device == device, f"dkv device mismatch: expected {device}, got {dkv.device}"
             assert dkv.is_contiguous(), "dkv must be contiguous"
-            dkv.fill_(0)
-        d_sink = torch.zeros_like(attn_sink)
+        d_sink = torch.zeros_like(attn_sink) if _d_sink is None else _d_sink
+
+        # H96 contains one full H64 head tile plus one H32 tail.  Launch the
+        # tuned kernels on strided head views while sharing one FP32 dKV
+        # workspace, so the tail no longer pays for a padded second H64 CTA.
+        if _split_h96 and not pair_queries and num_head == 96 and head_dim == 576 and topk_idxs.shape[1] == 2048:
+            ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
+                total_S_kv,
+                head_dim,
+                batch_size,
+                cutlass.Float32,
+            )
+            shared_workspace_dkv = torch.zeros(*ws_dkv_shape, dtype=torch.uint8, device=device)
+            ws_lse_odo_shape = FlashAttentionDSABackwardSm100._get_workspace_size_LSE_OdO(
+                total_S_q,
+                head_dim,
+                num_head,
+                batch_size,
+                cutlass.Float32,
+            )
+            shared_workspace_lse_odo = torch.empty(*ws_lse_odo_shape, dtype=torch.uint8, device=device)
+            flash_attn_bwd_sm100(
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=softmax_scale,
+                topk_length=topk_length,
+                dq=dq,
+                dkv=dkv,
+                current_stream=current_stream,
+                _split_h96=False,
+                _workspace_lse_odo=shared_workspace_lse_odo,
+                _workspace_dkv=shared_workspace_dkv,
+                _accumulate_dkv=True,
+                _d_sink=d_sink,
+                _logical_num_head=64,
+                _workspace_num_heads=96,
+                _preprocess_num_heads=96,
+                _skip_convert=True,
+            )
+            flash_attn_bwd_sm100(
+                q,
+                kv,
+                out,
+                dout,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=softmax_scale,
+                topk_length=topk_length,
+                dq=dq,
+                dkv=dkv,
+                current_stream=current_stream,
+                _split_h96=False,
+                _workspace_lse_odo=shared_workspace_lse_odo,
+                _workspace_dkv=shared_workspace_dkv,
+                _accumulate_dkv=True,
+                _d_sink=d_sink,
+                _logical_num_head=32,
+                _head_offset=64,
+                _workspace_num_heads=96,
+                _skip_preprocess=True,
+            )
+            return dq, dkv, d_sink
 
         # Pair adjacent H32 query tokens into one virtual H64 query. The
         # union kernel encodes per-token membership in the index high bits;
@@ -236,11 +325,7 @@ def flash_attn_bwd_sm100(
             batch_size,
             acc_dtype,
         )
-        workspace_LSE_OdO = torch.zeros(
-            *ws_lse_odo_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
+        workspace_LSE_OdO = torch.empty(*ws_lse_odo_shape, dtype=torch.uint8, device=device) if _workspace_lse_odo is None else _workspace_lse_odo
 
         ws_dkv_shape = FlashAttentionDSABackwardSm100._get_workspace_size_dKV(
             total_S_kv,
@@ -248,11 +333,7 @@ def flash_attn_bwd_sm100(
             batch_size,
             acc_dtype,
         )
-        workspace_dKV = torch.zeros(
-            *ws_dkv_shape,
-            dtype=torch.uint8,
-            device=device,
-        )
+        workspace_dKV = torch.zeros(*ws_dkv_shape, dtype=torch.uint8, device=device) if _workspace_dkv is None else _workspace_dkv
 
     backend, block_tile = _select_sm100_backend(num_head, head_dim)
     num_load_kv_warps = _select_sm100_num_load_kv_warps(backend, head_dim, num_head)
@@ -272,18 +353,27 @@ def flash_attn_bwd_sm100(
         has_topk_length,
         paired_h32,
         num_load_kv_warps,
+        tuple(q.stride()),
+        tuple(out.stride()),
+        tuple(lse.stride()),
+        tuple(dq.stride()),
+        _head_offset,
+        _workspace_num_heads,
+        _preprocess_num_heads,
+        _skip_preprocess,
+        _skip_convert,
     )
 
     if compile_key not in flash_attn_bwd_sm100.compile_cache:
-        q_tensor = to_cute_tensor(q, divisibility=head_dim)
+        q_tensor = to_cute_tensor(q, divisibility=None if _allow_strided_heads else head_dim)
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
-        out_tensor = to_cute_tensor(out, divisibility=head_dim_v)
-        dout_tensor = to_cute_tensor(dout, divisibility=head_dim_v)
+        out_tensor = to_cute_tensor(out, divisibility=None if _allow_strided_heads else head_dim_v)
+        dout_tensor = to_cute_tensor(dout, divisibility=None if _allow_strided_heads else head_dim_v)
         lse_tensor = to_cute_tensor(lse, assumed_align=4)
         attn_sink_tensor = to_cute_tensor(attn_sink)
         topk_idxs_tensor = to_cute_tensor(topk_idxs)
         topk_length_tensor = to_cute_tensor(topk_length) if has_topk_length else None
-        dq_tensor = to_cute_tensor(dq, divisibility=head_dim)
+        dq_tensor = to_cute_tensor(dq, divisibility=None if _allow_strided_heads else head_dim)
         dkv_tensor = to_cute_tensor(dkv, divisibility=head_dim)
         d_sink_tensor = to_cute_tensor(d_sink)
         workspace_LSE_OdO_tensor = to_cute_tensor(workspace_LSE_OdO)
@@ -308,6 +398,9 @@ def flash_attn_bwd_sm100(
                 head_dim_v=head_dim_v,
                 block_tile=block_tile,
                 max_topk=max_topk,
+                head_offset=_head_offset,
+                workspace_num_heads=_workspace_num_heads,
+                skip_preprocess=_skip_preprocess,
             )
         else:
             # Keep this constructor and class byte-for-byte on the tuned H64
@@ -322,6 +415,10 @@ def flash_attn_bwd_sm100(
                 num_load_kv_warps=num_load_kv_warps,
                 pair_mask_encoded=paired_h32,
                 pair_split_heads=pair_split_heads,
+                workspace_num_heads=_workspace_num_heads,
+                workspace_head_offset=_head_offset,
+                preprocess_num_heads=_preprocess_num_heads,
+                skip_convert=_skip_convert,
             )
 
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_compile"):

@@ -30,6 +30,10 @@ class FlashAttentionDSABackwardSm100:
         num_load_kv_warps: int = 16,
         pair_mask_encoded: bool = False,
         pair_split_heads: int | None = None,
+        workspace_num_heads: int | None = None,
+        workspace_head_offset: int = 0,
+        preprocess_num_heads: int | None = None,
+        skip_convert: bool = False,
     ):
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
@@ -39,6 +43,10 @@ class FlashAttentionDSABackwardSm100:
         self.lse_includes_sink = lse_includes_sink
         self.pair_mask_encoded = pair_mask_encoded
         self.pair_split_heads = pair_split_heads
+        self.workspace_num_heads = workspace_num_heads
+        self.workspace_head_offset = workspace_head_offset
+        self.preprocess_num_heads = preprocess_num_heads
+        self.skip_convert = skip_convert
         if pair_mask_encoded != (pair_split_heads is not None):
             raise ValueError("pair_mask_encoded and pair_split_heads must be configured together")
         # Keep one FP32 accumulation buffer by default. Callers can still
@@ -193,7 +201,11 @@ class FlashAttentionDSABackwardSm100:
         self.compute_mma_dS_stage = 1
         self.mma_reduce_dKV_stage = 2
         self.reduce_store_dKV_stage = 1
-        self.compute_tmastore_dQ_stage = 1
+        # dQ owns four 128x64 main fragments plus one 64x64 tail for Dq=576.
+        # Once the reverse mainloop releases K, those five fragments fit exactly
+        # in the dead 72 KiB sK allocation.  Keep their TMA stores in flight so
+        # T2R/transpose/staging of fragment n+1 overlaps store n.
+        self.compute_tmastore_dQ_stage = 5 if not self.same_hdim_kv else 4
 
     @staticmethod
     def _get_workspace_size_LSE_OdO(q: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
@@ -239,15 +251,17 @@ class FlashAttentionDSABackwardSm100:
             problem_shape[3],
         )
         H, B = cute.size(problem_shape[3][0]), cute.size(problem_shape[3][1])
+        workspace_H = H if self.workspace_num_heads is None else self.workspace_num_heads
+        workspace_head_stride = cute.assume(H, divby=64) if self.workspace_num_heads is None else self.workspace_num_heads
 
         D = cute.round_up(D, 8)
         total_seqlen_Q = cute.round_up(total_seqlen_Q, 8)
 
         acc_bytes = acc_dtype.width // 8
-        sum_OdO_bytes = cute.assume(H * total_seqlen_Q * acc_bytes, divby=acc_bytes * 64)
+        sum_OdO_bytes = cute.assume(workspace_H * total_seqlen_Q * acc_bytes, divby=acc_bytes * 32)
 
-        sum_OdO_iter = workspace_LSE_OdO.iterator
-        scaled_lse_iter = sum_OdO_iter + sum_OdO_bytes
+        sum_OdO_iter = workspace_LSE_OdO.iterator + self.workspace_head_offset * acc_bytes
+        scaled_lse_iter = workspace_LSE_OdO.iterator + sum_OdO_bytes + self.workspace_head_offset * acc_bytes
         dKV_acc_iter = workspace_dKV.iterator
 
         sum_OdO_iter = cute.recast_ptr(sum_OdO_iter, dtype=self.acc_dtype)
@@ -256,11 +270,11 @@ class FlashAttentionDSABackwardSm100:
 
         sum_OdO = cute.make_tensor(
             sum_OdO_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (workspace_head_stride, 0))),
         )
         scaled_lse = cute.make_tensor(
             scaled_lse_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (workspace_head_stride, 0))),
         )
         dKV_acc = cute.make_tensor(
             dKV_acc_iter,
@@ -466,7 +480,10 @@ class FlashAttentionDSABackwardSm100:
         )
 
         dQ_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.from_tensor(mdQ), (self.KdS_mma_tiler[0], self.KdS_mma_tiler[1]), self.mma_compute_dQ_stage
+            self.element_dtype,
+            utils.LayoutEnum.from_tensor(mdQ),
+            (self.KdS_mma_tiler[0], self.KdS_mma_tiler[1]),
+            self.head_dim_main // self.KdS_mma_tiler[0],
         )
 
         dKV_smem_layout_staged = sm100_utils.make_smem_layout_epi(
@@ -586,17 +603,35 @@ class FlashAttentionDSABackwardSm100:
         sum_OdO_scale = Float32(-1.0)
         LSE_scale = Float32(-math.log2(math.e))
 
-        sum_OdO_grid = self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q)
+        preprocess_problem_shape = problem_shape
+        preprocess_sum_OdO = sum_OdO
+        preprocess_scaled_LSE = scaled_LSE
+        if cutlass.const_expr(self.preprocess_num_heads is not None):
+            preprocess_problem_shape = (
+                problem_shape[0],
+                problem_shape[1],
+                problem_shape[2],
+                (self.preprocess_num_heads, problem_shape[3][1]),
+            )
+            preprocess_sum_OdO, preprocess_scaled_LSE, _ = self.get_workspace_tensor(
+                preprocess_problem_shape,
+                workspace_LSE_OdO,
+                workspace_dKV,
+                mQ.shape[2][0],
+                mKV.shape[0],
+                self.acc_dtype,
+            )
+        sum_OdO_grid = self._compute_sum_OdO_grid(preprocess_problem_shape, self.sum_OdO_block_q)
         self.sum_OdO(
             mOut,
             mdO,
-            sum_OdO,
+            preprocess_sum_OdO,
             mLSE,
             mAttnSink,
-            scaled_LSE,
+            preprocess_scaled_LSE,
             sum_OdO_scale,
             LSE_scale,
-            problem_shape,
+            preprocess_problem_shape,
         ).launch(
             grid=sum_OdO_grid,
             block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
@@ -686,15 +721,16 @@ class FlashAttentionDSABackwardSm100:
             1,
         ]
         convert_block = [self.num_threads_D_convert, self.num_threads_seq, 1]
-        self.convert(
-            mdKV_acc,
-            mdKV,
-            mKV.shape[0],
-        ).launch(
-            grid=convert_grid,
-            block=convert_block,
-            stream=stream,
-        )
+        if cutlass.const_expr(not self.skip_convert):
+            self.convert(
+                mdKV_acc,
+                mdKV,
+                mKV.shape[0],
+            ).launch(
+                grid=convert_grid,
+                block=convert_block,
+                stream=stream,
+            )
 
         dSink_grid = (
             cute.ceil_div(problem_shape[0], self.dSink_block_q),
@@ -1047,8 +1083,13 @@ class FlashAttentionDSABackwardSm100:
             sQT_tail_full = cute.make_tensor(sQT_tail_ptr, QT_tail_smem_layout_staged.outer)
             sQT_tail = sQT_tail_full[None, 0, None, None]
 
-            # sdQ4: reuse sK for the 64×64 dQ4 epilogue
-            sdQ4_ptr = cute.recast_ptr(sK.iterator, dQ4_smem_layout_staged.inner)
+            # Main dQ fragments occupy sK[0:64 KiB].  Place the 8 KiB tail
+            # directly after them so every in-flight TMA store has a disjoint
+            # source until producer_tail() observes completion.
+            sdQ4_ptr = cute.recast_ptr(
+                sK.iterator + self.head_dim_main * self.block_tile,
+                dQ4_smem_layout_staged.inner,
+            )
             sdQ4 = cute.make_tensor(sdQ4_ptr, dQ4_smem_layout_staged.outer)
 
         pipeline.pipeline_init_wait()
@@ -2240,35 +2281,38 @@ class FlashAttentionDSABackwardSm100:
         gdQ3 = gdQ[None, None, 3, head_block_idx]
 
         # sdQ: ((64,2),(8,8),(1,1))
-        sdQ_slice = sdQ[None, None, mma_compute_dQ_consumer_state.index]
+        sdQ_slice0 = sdQ[None, None, 0]
+        sdQ_slice1 = sdQ[None, None, 1]
+        sdQ_slice2 = sdQ[None, None, 2]
+        sdQ_slice3 = sdQ[None, None, 3]
 
         # ((64,2),(8,8),(1,1))
         tdQsdQ0, tdQgdQ0_mkl = cpasync.tma_partition(
             tma_atom_dQ,
             0,
             cute.make_layout(1),
-            cute.group_modes(sdQ_slice, 0, 2),
+            cute.group_modes(sdQ_slice0, 0, 2),
             cute.group_modes(gdQ0, 0, 2),
         )
         tdQsdQ1, tdQgdQ1_mkl = cpasync.tma_partition(
             tma_atom_dQ,
             0,
             cute.make_layout(1),
-            cute.group_modes(sdQ_slice, 0, 2),
+            cute.group_modes(sdQ_slice1, 0, 2),
             cute.group_modes(gdQ1, 0, 2),
         )
         tdQsdQ2, tdQgdQ2_mkl = cpasync.tma_partition(
             tma_atom_dQ,
             0,
             cute.make_layout(1),
-            cute.group_modes(sdQ_slice, 0, 2),
+            cute.group_modes(sdQ_slice2, 0, 2),
             cute.group_modes(gdQ2, 0, 2),
         )
         tdQsdQ3, tdQgdQ3_mkl = cpasync.tma_partition(
             tma_atom_dQ,
             0,
             cute.make_layout(1),
-            cute.group_modes(sdQ_slice, 0, 2),
+            cute.group_modes(sdQ_slice3, 0, 2),
             cute.group_modes(gdQ3, 0, 2),
         )
 
@@ -2299,7 +2343,7 @@ class FlashAttentionDSABackwardSm100:
 
         self.store_dQ(
             tma_atom_dQ,
-            sdQ_slice,
+            sdQ_slice0,
             tdQsdQ0,
             tdQgdQ0_mkl,
             tdQtdQ0,
@@ -2319,7 +2363,7 @@ class FlashAttentionDSABackwardSm100:
 
         self.store_dQ(
             tma_atom_dQ,
-            sdQ_slice,
+            sdQ_slice1,
             tdQsdQ1,
             tdQgdQ1_mkl,
             tdQtdQ1,
@@ -2339,7 +2383,7 @@ class FlashAttentionDSABackwardSm100:
 
         self.store_dQ(
             tma_atom_dQ,
-            sdQ_slice,
+            sdQ_slice2,
             tdQsdQ2,
             tdQgdQ2_mkl,
             tdQtdQ2,
@@ -2359,7 +2403,7 @@ class FlashAttentionDSABackwardSm100:
 
         self.store_dQ(
             tma_atom_dQ,
-            sdQ_slice,
+            sdQ_slice3,
             tdQsdQ3,
             tdQgdQ3_mkl,
             tdQtdQ3,

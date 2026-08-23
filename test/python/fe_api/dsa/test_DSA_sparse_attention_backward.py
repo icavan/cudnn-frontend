@@ -57,7 +57,7 @@ def _allocate(cfg, has_topk_length: bool):
     [
         (16, 576, "h16_m128", 128),
         (16, 512, "generic_m64", 64),
-        (32, 576, "h32_m128_m64", 128),
+        (32, 576, "h32_m128_m64", 64),
         (64, 576, "generic_m64", 64),
     ],
 )
@@ -79,9 +79,9 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 @pytest.mark.parametrize(
     "backend,head_dim,num_heads,expected",
     [
-        ("generic_m64", 576, 96, 4),
-        ("generic_m64", 576, 192, 4),
-        ("generic_m64", 576, 64, 16),
+        ("generic_m64", 576, 96, 8),
+        ("generic_m64", 576, 192, 8),
+        ("generic_m64", 576, 64, 8),
         ("generic_m64", 512, 96, 16),
         ("h16_m128", 576, 16, 16),
         ("h32_m128_m64", 576, 32, 16),
@@ -337,8 +337,9 @@ def test_DSA_sparse_attention_backward_sm100_h32_pair_membership(has_topk_length
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=419)
-def test_DSA_sparse_attention_backward_sm100_h96_explicit_pair_membership():
-    """The explicit H96 pair path must map all three virtual H64 CTAs."""
+@pytest.mark.parametrize("pair_queries", [False, True], ids=["split-h64-h32", "paired-queries"])
+def test_DSA_sparse_attention_backward_sm100_h96_paths(pair_queries):
+    """Cover the default H64+H32 decomposition and explicit paired-query path."""
     if not torch.cuda.is_available():
         pytest.skip("SM100 GPU required")
     major, minor = torch.cuda.get_device_capability()
@@ -385,7 +386,7 @@ def test_DSA_sparse_attention_backward_sm100_h96_explicit_pair_membership():
         attn_sink,
         topk_idxs,
         softmax_scale=softmax_scale,
-        pair_queries=True,
+        pair_queries=pair_queries,
     )
     torch.cuda.synchronize()
 

@@ -27,12 +27,18 @@ class FlashAttentionDSABackwardSm100H16:
         head_dim_v: int,
         block_tile: int,
         max_topk: int = 0,
+        head_offset: int = 0,
+        workspace_num_heads: int | None = None,
+        skip_preprocess: bool = False,
     ):
         if head_dim != 576 or head_dim_v != 512 or block_tile != 128:
             raise ValueError("H16 M128 requires head_dim=576, head_dim_v=512, and block_tile=128")
         self.head_dim = head_dim
         self.block_tile = block_tile
         self.max_topk = max_topk
+        self.head_offset = head_offset
+        self.workspace_num_heads = workspace_num_heads
+        self.skip_preprocess = skip_preprocess
         # The 128-row sparse KV tile occupies M and the 16 heads occupy N.
         self.QK_mma_tiler = (block_tile, 16, head_dim)
         # The physical P/dS operands match the full score tile for H16.  Keep
@@ -211,15 +217,17 @@ class FlashAttentionDSABackwardSm100H16:
             problem_shape[3],
         )
         H, B = cute.size(problem_shape[3][0]), cute.size(problem_shape[3][1])
+        workspace_H = H if self.workspace_num_heads is None else self.workspace_num_heads
+        workspace_head_stride = cute.assume(H, divby=16) if self.workspace_num_heads is None else self.workspace_num_heads
 
         D = cute.round_up(D, 8)
         total_seqlen_Q = cute.round_up(total_seqlen_Q, 8)
 
         acc_bytes = acc_dtype.width // 8
-        sum_OdO_bytes = cute.assume(H * total_seqlen_Q * acc_bytes, divby=acc_bytes * 64)
+        sum_OdO_bytes = cute.assume(workspace_H * total_seqlen_Q * acc_bytes, divby=acc_bytes * 32)
 
-        sum_OdO_iter = workspace_LSE_OdO.iterator
-        scaled_lse_iter = sum_OdO_iter + sum_OdO_bytes
+        sum_OdO_iter = workspace_LSE_OdO.iterator + self.head_offset * acc_bytes
+        scaled_lse_iter = workspace_LSE_OdO.iterator + sum_OdO_bytes + self.head_offset * acc_bytes
         dKV_acc_iter = workspace_dKV.iterator
 
         sum_OdO_iter = cute.recast_ptr(sum_OdO_iter, dtype=self.acc_dtype)
@@ -228,11 +236,11 @@ class FlashAttentionDSABackwardSm100H16:
 
         sum_OdO = cute.make_tensor(
             sum_OdO_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (workspace_head_stride, 0))),
         )
         scaled_lse = cute.make_tensor(
             scaled_lse_iter,
-            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (cute.assume(H, divby=64), 0))),
+            cute.make_layout((H, (total_seqlen_Q, 1)), stride=(1, (workspace_head_stride, 0))),
         )
         dKV_acc = cute.make_tensor(
             dKV_acc_iter,
@@ -277,9 +285,12 @@ class FlashAttentionDSABackwardSm100H16:
         Forward pass for DeepSeek Sparse Attention.
         """
 
+        logical_heads = problem_shape[3][0]
+
         # [M, H, D] -> [H, D, (M, 1)]
         mQ = cute.make_tensor(
-            mQ.iterator, cute.make_layout((mQ.shape[1], mQ.shape[2], (mQ.shape[0], 1)), stride=(mQ.stride[1], mQ.stride[2], (mQ.stride[0], 0)))
+            mQ.iterator + self.head_offset * mQ.stride[1],
+            cute.make_layout((logical_heads, mQ.shape[2], (mQ.shape[0], 1)), stride=(mQ.stride[1], mQ.stride[2], (mQ.stride[0], 0))),
         )
 
         # [N, D] -> [N, D, (1, 1)]
@@ -287,26 +298,35 @@ class FlashAttentionDSABackwardSm100H16:
 
         # [M, H, Dv] -> [H, Dv, (M, 1)]
         mOut = cute.make_tensor(
-            mOut.iterator, cute.make_layout((mOut.shape[1], mOut.shape[2], (mOut.shape[0], 1)), stride=(mOut.stride[1], mOut.stride[2], (mOut.stride[0], 0)))
+            mOut.iterator + self.head_offset * mOut.stride[1],
+            cute.make_layout((logical_heads, mOut.shape[2], (mOut.shape[0], 1)), stride=(mOut.stride[1], mOut.stride[2], (mOut.stride[0], 0))),
         )
 
         # [M, H, Dv] -> [H, Dv, (M, 1)]
         mdO = cute.make_tensor(
-            mdO.iterator, cute.make_layout((mdO.shape[1], mdO.shape[2], (mdO.shape[0], 1)), stride=(mdO.stride[1], mdO.stride[2], (mdO.stride[0], 0)))
+            mdO.iterator + self.head_offset * mdO.stride[1],
+            cute.make_layout((logical_heads, mdO.shape[2], (mdO.shape[0], 1)), stride=(mdO.stride[1], mdO.stride[2], (mdO.stride[0], 0))),
         )
         # [M, H, D] -> [D, H, (M, 1)]
         mdQ = cute.make_tensor(
-            mdQ.iterator, cute.make_layout((mdQ.shape[2], mdQ.shape[1], (mdQ.shape[0], 1)), stride=(mdQ.stride[2], mdQ.stride[1], (mdQ.stride[0], 0)))
+            mdQ.iterator + self.head_offset * mdQ.stride[1],
+            cute.make_layout((mdQ.shape[2], logical_heads, (mdQ.shape[0], 1)), stride=(mdQ.stride[2], mdQ.stride[1], (mdQ.stride[0], 0))),
         )
         # [N, D] -> [D, N, (1, 1)]
         mdKV = cute.make_tensor(mdKV.iterator, cute.make_layout((mdKV.shape[1], mdKV.shape[0], (1, 1)), stride=(mdKV.stride[1], mdKV.stride[0], (0, 0))))
 
         # [M, H] -> [H, (M, 1)]
-        mLSE = cute.make_tensor(mLSE.iterator, cute.make_layout((mLSE.shape[1], (mLSE.shape[0], 1)), stride=(mLSE.stride[1], (mLSE.stride[0], 0))))
+        mLSE = cute.make_tensor(
+            mLSE.iterator + self.head_offset * mLSE.stride[1],
+            cute.make_layout((logical_heads, (mLSE.shape[0], 1)), stride=(mLSE.stride[1], (mLSE.stride[0], 0))),
+        )
 
         # [H] -> [H, (1, 1)]
-        mdSink = cute.make_tensor(mdSink.iterator, cute.make_layout((mdSink.shape[0], (1, 1)), stride=(1, (0, 0))))
-        mAttnSink = cute.make_tensor(mAttnSink.iterator, mdSink.layout)
+        mdSink = cute.make_tensor(
+            mdSink.iterator + self.head_offset,
+            cute.make_layout((logical_heads, (1, 1)), stride=(1, (0, 0))),
+        )
+        mAttnSink = cute.make_tensor(mAttnSink.iterator + self.head_offset, mdSink.layout)
 
         # [M, TopK] -> [TopK, (M, 1)]
         mTopkIdxs = cute.make_tensor(
@@ -476,25 +496,26 @@ class FlashAttentionDSABackwardSm100H16:
         sum_OdO_scale = Float32(-1.0)
         LSE_scale = Float32(-math.log2(math.e))
 
-        sum_OdO_grid = self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q)
+        if cutlass.const_expr(not self.skip_preprocess):
+            sum_OdO_grid = self._compute_sum_OdO_grid(problem_shape, self.sum_OdO_block_q)
 
-        self.sum_OdO(
-            mOut,
-            mdO,
-            sum_OdO,
-            mLSE,
-            mAttnSink,
-            scaled_LSE,
-            sum_OdO_scale,
-            LSE_scale,
-            problem_shape,
-        ).launch(
-            grid=sum_OdO_grid,
-            block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
-            cluster=[1, 1, 1],
-            stream=stream,
-            min_blocks_per_mp=1,
-        )
+            self.sum_OdO(
+                mOut,
+                mdO,
+                sum_OdO,
+                mLSE,
+                mAttnSink,
+                scaled_LSE,
+                sum_OdO_scale,
+                LSE_scale,
+                problem_shape,
+            ).launch(
+                grid=sum_OdO_grid,
+                block=[self.sum_OdO_num_threads_d, self.sum_OdO_num_threads_q, 1],
+                cluster=[1, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
 
         num_head_blocks = cute.ceil_div(problem_shape[3][0], self.block_tile)
         bwd_grid = (problem_shape[0], num_head_blocks, problem_shape[3][1])

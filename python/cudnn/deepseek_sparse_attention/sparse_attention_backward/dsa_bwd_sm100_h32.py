@@ -14,12 +14,12 @@ from .dsa_bwd_sm100_h16 import FlashAttentionDSABackwardSm100H16
 
 
 class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
-    """H32/D576 specialization with an M128 score and M64 downstream tiles.
+    """H32/D576 specialization with selectable M64/M128 sparse-row tiles.
 
-    The sparse K/V gather and score/dP recomputation operate on 128 selected
-    rows.  P and dS are streamed through one 64-row shared-memory buffer, and
-    dQ/dKV consume the two halves in sequence.  Keeping the class separate
-    prevents H32 scheduling changes from perturbing the tuned H16 codegen.
+    The H96 tail dispatch uses one M64 tile; the standalone fallback can retain
+    M128.  P and dS are streamed through one 64-row shared-memory shuttle.
+    Keeping the class separate prevents H32 scheduling changes from perturbing
+    the tuned H16 codegen.
     """
 
     def __init__(
@@ -29,17 +29,34 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         head_dim_v: int,
         block_tile: int,
         max_topk: int = 0,
+        head_offset: int = 0,
+        workspace_num_heads: int | None = None,
+        skip_preprocess: bool = False,
     ):
-        super().__init__(element_dtype, head_dim, head_dim_v, block_tile, max_topk)
-        if head_dim != 576 or head_dim_v != 512 or block_tile != 128:
-            raise ValueError("H32 M128/M64 requires head_dim=576, head_dim_v=512, and block_tile=128")
+        # Initialize the shared H16 machinery with its native K128 shape;
+        # every shape-dependent tensor below is then rebuilt for this class.
+        super().__init__(
+            element_dtype,
+            head_dim,
+            head_dim_v,
+            128,
+            max_topk,
+            head_offset=head_offset,
+            workspace_num_heads=workspace_num_heads,
+            skip_preprocess=skip_preprocess,
+        )
+        if head_dim != 576 or head_dim_v != 512 or block_tile not in (64, 128):
+            raise ValueError("H32 requires head_dim=576, head_dim_v=512, and block_tile in {64, 128}")
+
+        self.block_tile = block_tile
 
         self.h_tile = 32
         self.kv_subtile = 64
-        self.num_kv_subtiles = 2
+        self.num_kv_subtiles = block_tile // self.kv_subtile
+        self.reduce_rows_per_thread = self.kv_subtile // self.num_reduce_warps
 
-        # Full-lane M128 score/dP.  The later GEMMs consume one 64-row sparse
-        # half at a time so P/dS only occupy 4 KiB each in shared memory.
+        # Score/dP follow the selected sparse-row tile.  The later GEMMs consume
+        # one 64-row sparse half at a time, so P/dS remain 4 KiB each.
         self.QK_mma_tiler = (block_tile, self.h_tile, head_dim)
         self.dOV_mma_tiler = (block_tile, self.h_tile, head_dim_v)
         self.dOP_mma_tiler = (128, self.kv_subtile, self.h_tile)
@@ -54,8 +71,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.dKV4_mma_tiler = (64, self.kv_subtile, self.h_tile)
         self.P_store_tiler = (self.kv_subtile, self.h_tile)
         self.dS_store_tiler = (self.kv_subtile, self.h_tile)
-
-        self.reduce_rows_per_thread = self.kv_subtile // self.num_reduce_warps
 
         # S/dP remain live while both sparse-row halves are consumed.  dKV4
         # therefore gets a disjoint region instead of aliasing their columns.
@@ -72,10 +87,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        # The inherited 1024-thread CTA already sits near the SM register
-        # budget.  Keep compute at 128 registers; setmaxnreg.inc(192) cannot
-        # be satisfied with 16 loaders and eight reducers resident.
-        self.num_regs_compute = 128
+        self.num_regs_load_KV = 32
+        self.num_regs_compute = 160
 
     def _setup_attributes(self):
         super()._setup_attributes()
@@ -112,7 +125,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         sdS: cute.Tensor,
         pipelines,
     ):
-        """One K128 load/score followed by two M64 downstream generations."""
+        """One sparse-row load/score followed by its M64 generations."""
         (
             load_mma_QdO_pipeline,
             load_mma_K_pipeline,
@@ -419,7 +432,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tidx_in_wg = tidx - self.compute_warp_id[0] * self.threads_per_warp
         token_idx, head_block_idx, batch_idx = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
         mma_compute_S_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_S_stage)
         mma_compute_dP_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_dP_stage)
         mma_compute_dQ_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_compute_dQ_stage)
@@ -429,10 +441,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         load_compute_sum_OdO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_compute_sum_OdO_stage)
         compute_tmastore_dQ_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.compute_tmastore_dQ_stage)
 
-        # N32 requires four 256-bit repetitions.  Keep the native M128 TMEM
-        # lane mapping: rows 0:63 belong to the first two compute warps and
-        # rows 64:127 to the last two.  Reinterpreting this accumulator as an
-        # M64 TMEM tensor gives the upper warps invalid P/dS coordinates.
+        # N32 requires four 256-bit repetitions.  Keep the native TMEM lane
+        # mapping for the selected M{128,64} score tile.
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
             self.acc_dtype,
@@ -465,9 +475,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
             mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
 
-            # Materialize the full M128xN32 score and dP fragments once.  The
-            # two physical M64 SMEM stages below only select which rows are
-            # published; they do not repeat TMEM loads or BF16 conversion.
             cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
             for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
                 lse = (
@@ -503,6 +510,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
+
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
                 for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
@@ -749,20 +757,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         topk: Int32,
         mma_reduce_dKV_pipeline,
     ):
-        """Consume three reducer generations for each of two M64 halves."""
-        if cutlass.const_expr(self.num_kv_subtiles == 1):
-            # Temporary isolation: prove the producer/consumer phase schedule
-            # independently of the new M128xN64 T2R layout.
-            consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
-            tile_index = tile_count - 1
-            while tile_index >= 0:
-                for _ in cutlass.range_constexpr(3):
-                    mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                    consumer_state.advance()
-                tile_index -= 1
-            return
-
+        """Consume three reducer generations for each M64 half."""
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
         tdKVtdKV0 = tdKVtdKV0[(None, None), 0, 0]
         tdKVtdKV1 = tdKVtdKV1[(None, None), 0, 0]
@@ -828,14 +823,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
-
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
                 cute.arch.fence_view_async_tmem_load()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
-
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
                 cute.arch.fence_view_async_tmem_load()
