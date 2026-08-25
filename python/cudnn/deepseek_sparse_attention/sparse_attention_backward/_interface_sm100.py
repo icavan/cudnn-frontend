@@ -65,7 +65,7 @@ def _select_sm100_backend(num_heads: int, head_dim: int) -> Tuple[str, int]:
     if num_heads == 16 and head_dim == 576:
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
-        return "h32_m128_m64", 64
+        return "h32_m128_m64", 128
     return "generic_m64", 64
 
 

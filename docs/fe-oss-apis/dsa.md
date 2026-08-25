@@ -126,8 +126,10 @@ Backward pass for DeepSeek Sparse Attention. Expects the forward outputs
 
 On SM100, the public backward entry point automatically selects the tuned
 kernel from `q.shape[1:3]`: H16 with `head_dim=576` uses the dedicated M128
-sparse-row pipeline, while `head_dim=512`, H32/H64, and other supported shapes
-use the generic M64 pipeline. No backend or tile-size argument is required.
+sparse-row pipeline; H32 with `head_dim=576` gathers an M128 sparse tile and
+streams its P/dS and dKV work as two M64 subtiles. `head_dim=512`, H64, and
+other supported shapes use the generic M64 pipeline. No backend or tile-size
+argument is required.
 SM90 continues to use its Hopper-specific implementation.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
