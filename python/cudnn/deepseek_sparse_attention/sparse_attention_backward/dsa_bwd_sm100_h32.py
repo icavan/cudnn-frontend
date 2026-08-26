@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from typing import Tuple
 
 import cutlass
@@ -87,8 +88,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
 
-        self.num_regs_load_KV = 32
-        self.num_regs_compute = 160
+        # Profiling-only tuning hooks.  Production behavior is unchanged when
+        # the variables are unset; each value is captured at JIT construction.
+        self.num_regs_load_KV = int(os.environ.get("CUDNN_DSA_H32_LOAD_REGS", "32"))
+        self.num_regs_compute = int(os.environ.get("CUDNN_DSA_H32_COMPUTE_REGS", "160"))
+        self.num_regs_reduce = int(os.environ.get("CUDNN_DSA_H32_REDUCE_REGS", str(self.num_regs_reduce)))
 
     def _setup_attributes(self):
         super()._setup_attributes()
