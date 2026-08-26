@@ -3,7 +3,7 @@
 
 import math
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -99,6 +99,105 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.mma_reduce_dKV_stage = 2
 
     @cute.jit
+    def load_KV(
+        self,
+        mKV: cute.Tensor,
+        mTopkIdxs: cute.Tensor,
+        sK: cute.Tensor,
+        tile_count: Int32,
+        topk: Int32,
+        load_mma_K_pipelines,
+        mTopkLength: Optional[cute.Tensor],
+    ):
+        """Gather one K64 half whenever its independent slot is released."""
+        iket_load_kv = cute.experimental.iket.range_start("h32_split_k_load_kv")
+        tidx, _, _ = cute.arch.thread_idx()
+        token_idx, _, batch_idx = cute.arch.block_idx()
+        local_tidx = tidx % self.threads_per_warp
+        local_warp_idx = tidx // self.threads_per_warp
+        subgroup = local_tidx // 8
+        lane_in_subwarp = local_tidx % 8
+
+        async_copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            self.element_dtype,
+            num_bits_per_copy=128,
+        )
+        thr_layout = cute.make_layout((8,))
+        val_layout = cute.make_layout((8,))
+        async_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, thr_layout, val_layout)
+        async_thr_copy = async_tiled_copy.get_slice(lane_in_subwarp)
+
+        producer_states = (
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_K_stage),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.load_mma_K_stage),
+        )
+        tile_index = tile_count - 1
+        full_tiles = (topk % self.block_tile) == 0
+
+        while tile_index >= 0:
+            # Match the MMA consumer's descending half order.  On subsequent
+            # tiles, the high-half acquire can complete while low-half dQ is
+            # still consuming the other physical half.
+            for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
+                kv_half = self.num_kv_subtiles - 1 - half_iter
+                iket_wait_slot = cute.experimental.iket.range_start("h32_split_k_wait_slot", kv_half)
+                load_mma_K_pipelines[kv_half].producer_acquire(producer_states[kv_half])
+                cute.experimental.iket.range_end(iket_wait_slot, kv_half)
+                iket_gather = cute.experimental.iket.range_start("h32_split_k_gather", kv_half)
+
+                sK_slice = sK[(None, None), 0, (None, None), producer_states[kv_half].index]
+                sK_slice = cute.composition(sK_slice, cute.make_layout((self.block_tile, self.head_dim)))
+                row_offset = kv_half * self.kv_subtile
+                row = local_warp_idx * 4 + subgroup + row_offset
+                idx = tile_index * self.block_tile + row
+                topk_idx = Int32(-1)
+                if lane_in_subwarp == 0:
+                    if idx < self.max_topk:
+                        topk_idx = mTopkIdxs[idx, (token_idx, batch_idx)]
+                topk_idx = cute.arch.shuffle_sync(topk_idx, subgroup * 8)
+
+                if full_tiles:
+                    self._load_kv_rows(
+                        mKV,
+                        sK_slice,
+                        topk_idx,
+                        tile_index,
+                        topk,
+                        mTopkLength,
+                        is_first=False,
+                        local_tidx=local_tidx,
+                        local_warp_idx=local_warp_idx,
+                        row_offset=row_offset,
+                        async_copy_atom=async_copy_atom,
+                        async_thr_copy=async_thr_copy,
+                    )
+                else:
+                    self._load_kv_rows(
+                        mKV,
+                        sK_slice,
+                        topk_idx,
+                        tile_index,
+                        topk,
+                        mTopkLength,
+                        is_first=True,
+                        local_tidx=local_tidx,
+                        local_warp_idx=local_warp_idx,
+                        row_offset=row_offset,
+                        async_copy_atom=async_copy_atom,
+                        async_thr_copy=async_thr_copy,
+                    )
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.fence_view_async_shared()
+                self.load_KV_sync_barrier.arrive_and_wait()
+                load_mma_K_pipelines[kv_half].producer_commit(producer_states[kv_half])
+                producer_states[kv_half].advance()
+                cute.experimental.iket.range_end(iket_gather, kv_half)
+            tile_index -= 1
+        cute.experimental.iket.range_end(iket_load_kv)
+
+    @cute.jit
     def mma(
         self,
         QK_tiled_mma: cute.TiledMma,
@@ -133,7 +232,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         iket_mainloop = cute.experimental.iket.range_start("h32_mma_mainloop")
         (
             load_mma_QdO_pipeline,
-            load_mma_K_pipeline,
+            load_mma_K_pipelines,
             mma_compute_S_pipeline,
             mma_compute_dP_pipeline,
             mma_compute_dQ_pipeline,
@@ -145,7 +244,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tdQtdQ0, tdQtdQ1, tdQtdQ2, tdQtdQ3, tdQtdQ4 = tdQtdQ
 
         load_mma_QdO_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_QdO_stage)
-        load_mma_K_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage)
+        load_mma_K_consumer_states = (
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.load_mma_K_stage),
+        )
+        # Both half-pipelines are single-stage and address the same physical
+        # K128 tensor.  Existing fragment expressions can use either stage
+        # index; ownership is tracked independently below.
+        load_mma_K_consumer_state = load_mma_K_consumer_states[0]
         mma_compute_S_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_S_stage)
         mma_compute_dP_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_dP_stage)
         mma_compute_dQ_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.mma_compute_dQ_stage)
@@ -160,7 +266,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         is_first_dkv_half = True
         while tile_index >= 0:
             iket_wait_k = cute.experimental.iket.range_start("h32_mma_wait_k", tile_index)
-            load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
+            for kv_half in cutlass.range_constexpr(self.num_kv_subtiles):
+                load_mma_K_pipelines[kv_half].consumer_wait(load_mma_K_consumer_states[kv_half])
             cute.experimental.iket.range_end(iket_wait_k, tile_index)
 
             iket_score_dp = cute.experimental.iket.range_start("h32_mma_score_dp", tile_index)
@@ -331,14 +438,15 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 cute.experimental.iket.range_end(iket_dq, kv_half)
 
-                # The second M64 half is the final consumer of this K128
-                # gather.  Release the single-stage K buffer before dKV2/3,
-                # which only consume Q/dO and P/dS, so the loaders can gather
-                # the next sparse tile under the remaining MMA and atomics.
-                if half_iter == self.num_kv_subtiles - 1:
-                    load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
-                    load_mma_K_consumer_state.advance()
+                # This K64 half is dead after its dQ update.  Release it
+                # independently so loaders can gather the matching half of the
+                # next K128 tile while the other half remains in use.
+                load_mma_K_pipelines[kv_half].consumer_release(load_mma_K_consumer_states[kv_half])
+                load_mma_K_consumer_states[kv_half].advance()
 
+                # On the final half, defer the K-independent dKV tail until
+                # after dQ.  K ownership has already been released above.
+                if half_iter == self.num_kv_subtiles - 1:
                     mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                     dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):

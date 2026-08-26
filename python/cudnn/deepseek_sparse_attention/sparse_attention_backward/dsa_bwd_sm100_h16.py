@@ -457,6 +457,7 @@ class FlashAttentionDSABackwardSm100H16:
         class SharedStorage:
             load_mma_QdO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_QdO_stage * 2]
             load_mma_K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_K_stage * 2]
+            load_mma_K_aux_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_mma_K_stage * 2]
             load_compute_LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_compute_LSE_stage * 2]
             load_compute_sum_OdO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_compute_sum_OdO_stage * 2]
             mma_compute_S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_compute_S_stage * 2]
@@ -832,6 +833,11 @@ class FlashAttentionDSABackwardSm100H16:
         load_mma_K_pipeline = self.make_and_init_load_mma_K_pipeline(
             storage.load_mma_K_mbar_ptr.data_ptr(),
         )
+        if cutlass.const_expr(self.h_tile == 32):
+            load_mma_K_pipeline = (
+                load_mma_K_pipeline,
+                self.make_and_init_load_mma_K_pipeline(storage.load_mma_K_aux_mbar_ptr.data_ptr()),
+            )
         load_compute_LSE_pipeline = self.make_and_init_load_compute_LSE_pipeline(
             storage.load_compute_LSE_mbar_ptr.data_ptr(),
         )
