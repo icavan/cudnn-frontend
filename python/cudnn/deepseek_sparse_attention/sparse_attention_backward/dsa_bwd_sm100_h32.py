@@ -493,10 +493,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         while tile_index >= 0:
             iket_wait_score_dp = cute.experimental.iket.range_start("h32_compute_wait_score_dp", tile_index)
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
-            mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
             cute.experimental.iket.range_end(iket_wait_score_dp, tile_index)
 
-            iket_t2r_alu = cute.experimental.iket.range_start("h32_compute_t2r_alu", tile_index)
+            iket_t2r_alu = cute.experimental.iket.range_start("h32_compute_t2r_p", tile_index)
             cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
             for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
                 lse = (
@@ -512,6 +511,32 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 tTR_rS[i + 1] = cute.math.exp2(tTR_rS[i + 1], fastmath=True)
             tTR_rS_f16 = self.quantize(tTR_rS, 2)
 
+            cute.arch.fence_view_async_tmem_load()
+            self.compute_sync_barrier.arrive_and_wait()
+            cute.experimental.iket.range_end(iket_t2r_alu, tile_index)
+
+            # Publish the first (descending) K64 probability tile immediately.
+            # The MMA warp can start dO^T @ P while compute reads dP and forms
+            # dS.  This changes only producer/consumer timing, not arithmetic.
+            first_kv_half = self.num_kv_subtiles - 1
+            iket_publish_p = cute.experimental.iket.range_start("h32_compute_publish_p", first_kv_half)
+            compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
+            p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
+            for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
+                global_row = cute.get(tTR_cS[i], mode=[0])
+                if global_row // self.kv_subtile == first_kv_half:
+                    row = global_row - first_kv_half * self.kv_subtile
+                    col = cute.get(tTR_cS[i], mode=[1])
+                    sP[(row, col), 0, 0, p_stage] = tTR_rS_f16[i]
+            cute.arch.fence_proxy("async.shared", space="cta")
+            compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
+            compute_mma_P_producer_state.advance()
+            cute.experimental.iket.range_end(iket_publish_p, first_kv_half)
+
+            iket_wait_dp = cute.experimental.iket.range_start("h32_compute_wait_dp", tile_index)
+            mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
+            cute.experimental.iket.range_end(iket_wait_dp, tile_index)
+            iket_t2r_ds = cute.experimental.iket.range_start("h32_compute_t2r_ds", tile_index)
             cute.copy(tiled_t2r_dP, tTR_tdP, tTR_rdP)
             for i in cutlass.range(0, cute.size(tTR_rdP), 2, unroll_full=True):
                 tTR_rdP[i], tTR_rdP[i + 1] = cute.arch.add_packed_f32x2(
@@ -529,9 +554,26 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
             cute.arch.fence_view_async_tmem_load()
             self.compute_sync_barrier.arrive_and_wait()
-            cute.experimental.iket.range_end(iket_t2r_alu, tile_index)
+            cute.experimental.iket.range_end(iket_t2r_ds, tile_index)
 
-            for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
+            # dS for the first half follows its already-published P tile.
+            iket_publish_ds = cute.experimental.iket.range_start("h32_compute_publish_ds", first_kv_half)
+            compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
+            ds_stage = 0 if self.compute_mma_dS_stage == 1 else compute_mma_dS_producer_state.index
+            for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
+                global_row = cute.get(tTR_cdP[i], mode=[0])
+                if global_row // self.kv_subtile == first_kv_half:
+                    row = global_row - first_kv_half * self.kv_subtile
+                    col = cute.get(tTR_cdP[i], mode=[1])
+                    sdS[(row, col), 0, 0, ds_stage] = tTR_rdP_f16[i]
+            cute.arch.fence_proxy("async.shared", space="cta")
+            compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
+            compute_mma_dS_producer_state.advance()
+            cute.experimental.iket.range_end(iket_publish_ds, first_kv_half)
+
+            # Any remaining half reuses the same P/dS shuttle after the MMA
+            # consumer releases the first half.
+            for half_iter in cutlass.range_constexpr(1, self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 iket_publish_half = cute.experimental.iket.range_start("h32_compute_publish_half", kv_half)
 
