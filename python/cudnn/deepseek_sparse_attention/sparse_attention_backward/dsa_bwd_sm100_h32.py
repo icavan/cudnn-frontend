@@ -582,7 +582,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 iket_publish_half = cute.experimental.iket.range_start("h32_compute_publish_half", kv_half)
 
+                iket_acquire_p_tail = cute.experimental.iket.range_start("h32_compute_acquire_p_tail", kv_half)
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
+                cute.experimental.iket.range_end(iket_acquire_p_tail, kv_half)
+                iket_store_p_tail = cute.experimental.iket.range_start("h32_compute_store_p_tail", kv_half)
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
                 for i in cutlass.range_constexpr(cute.size(tTR_rS_f16)):
                     global_row = cute.get(tTR_cS[i], mode=[0])
@@ -593,8 +596,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_P_pipeline.producer_commit(compute_mma_P_producer_state)
                 compute_mma_P_producer_state.advance()
+                cute.experimental.iket.range_end(iket_store_p_tail, kv_half)
 
+                iket_acquire_ds_tail = cute.experimental.iket.range_start("h32_compute_acquire_ds_tail", kv_half)
                 compute_mma_dS_pipeline.producer_acquire(compute_mma_dS_producer_state)
+                cute.experimental.iket.range_end(iket_acquire_ds_tail, kv_half)
+                iket_store_ds_tail = cute.experimental.iket.range_start("h32_compute_store_ds_tail", kv_half)
                 ds_stage = 0 if self.compute_mma_dS_stage == 1 else compute_mma_dS_producer_state.index
                 for i in cutlass.range_constexpr(cute.size(tTR_rdP_f16)):
                     global_row = cute.get(tTR_cdP[i], mode=[0])
@@ -605,6 +612,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
                 compute_mma_dS_producer_state.advance()
+                cute.experimental.iket.range_end(iket_store_ds_tail, kv_half)
                 cute.experimental.iket.range_end(iket_publish_half, kv_half)
 
             mma_compute_S_pipeline.consumer_release(mma_compute_S_consumer_state)
