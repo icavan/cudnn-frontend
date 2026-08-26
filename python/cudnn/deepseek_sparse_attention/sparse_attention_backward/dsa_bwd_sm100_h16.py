@@ -1323,6 +1323,7 @@ class FlashAttentionDSABackwardSm100H16:
         load_mma_K_pipeline,
         mTopkLength: Optional[cute.Tensor],
     ):
+        iket_load_kv = cute.experimental.iket.range_start("h16_h32_load_kv")
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, batch_idx = cute.arch.block_idx()
         local_tidx = tidx % self.threads_per_warp
@@ -1346,7 +1347,10 @@ class FlashAttentionDSABackwardSm100H16:
         full_tiles = (topk % self.block_tile) == 0
 
         while tile_index >= 0:
+            iket_wait_slot = cute.experimental.iket.range_start("h16_h32_load_wait_slot", tile_index)
             load_mma_K_pipeline.producer_acquire(load_mma_K_producer_state)
+            cute.experimental.iket.range_end(iket_wait_slot, tile_index)
+            iket_gather = cute.experimental.iket.range_start("h16_h32_load_gather", tile_index)
             sK_slice = sK[(None, None), 0, (None, None), load_mma_K_producer_state.index]
             sK_slice = cute.composition(sK_slice, cute.make_layout((self.block_tile, self.head_dim)))
 
@@ -1400,8 +1404,10 @@ class FlashAttentionDSABackwardSm100H16:
             cute.arch.fence_view_async_shared()
             self.load_KV_sync_barrier.arrive_and_wait()
             load_mma_K_pipeline.producer_commit(load_mma_K_producer_state)
+            cute.experimental.iket.range_end(iket_gather, tile_index)
             load_mma_K_producer_state.advance()
             tile_index -= 1
+        cute.experimental.iket.range_end(iket_load_kv)
 
     @cute.jit
     def mma(
