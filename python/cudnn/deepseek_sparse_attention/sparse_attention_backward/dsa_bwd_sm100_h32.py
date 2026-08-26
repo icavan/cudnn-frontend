@@ -51,11 +51,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         self.block_tile = block_tile
 
-        # M128 emits two M64 probability generations.  Keep both generations
-        # resident so publishing the second half does not wait for the MMA
-        # warp to finish the first half's late dKV2/3 consumers.
-        self.compute_mma_P_stage = 2 if block_tile == 128 else 1
-
         self.h_tile = 32
         self.kv_subtile = 64
         self.num_kv_subtiles = block_tile // self.kv_subtile
@@ -101,6 +96,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
     def _setup_attributes(self):
         super()._setup_attributes()
+        # M128 emits two M64 probability generations. Keep both resident so
+        # publishing the second half does not wait for the MMA warp to finish
+        # the first half's late dKV2/3 consumers. This must be set here because
+        # the JIT entry calls _setup_attributes after construction.
+        self.compute_mma_P_stage = 2 if self.block_tile == 128 else 1
         self.mma_reduce_dKV_stage = 2
 
     @cute.jit
