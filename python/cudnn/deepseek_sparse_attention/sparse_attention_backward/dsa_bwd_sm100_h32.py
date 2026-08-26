@@ -51,6 +51,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         self.block_tile = block_tile
 
+        # M128 emits two M64 probability generations.  Keep both generations
+        # resident so publishing the second half does not wait for the MMA
+        # warp to finish the first half's late dKV2/3 consumers.
+        self.compute_mma_P_stage = 2 if block_tile == 128 else 1
+
         self.h_tile = 32
         self.kv_subtile = 64
         self.num_kv_subtiles = block_tile // self.kv_subtile
