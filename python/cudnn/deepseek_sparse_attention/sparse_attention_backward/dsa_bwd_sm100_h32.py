@@ -79,8 +79,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dP_offset = 32
         self.tmem_dKV0_offset = 64
         self.tmem_dKV1_offset = 128
-        self.tmem_dKV2_offset = self.tmem_dKV0_offset
-        self.tmem_dKV3_offset = self.tmem_dKV1_offset
+        # S/dP have been copied to registers before dKV2/3 are issued. Reuse
+        # those 64 columns and the otherwise-idle tail of TMEM so dKV2/3 no
+        # longer wait for the reducer to drain dKV0/1.
+        self.tmem_dKV2_offset = 0
+        self.tmem_dKV3_offset = 416
         self.tmem_dQ0_offset = 192
         self.tmem_dQ1_offset = 224
         self.tmem_dQ2_offset = 256
@@ -96,12 +99,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
     def _setup_attributes(self):
         super()._setup_attributes()
-        # M128 emits two M64 probability generations. Keep both resident so
-        # publishing the second half does not wait for the MMA warp to finish
-        # the first half's late dKV2/3 consumers. This must be set here because
-        # the JIT entry calls _setup_attributes after construction.
-        self.compute_mma_P_stage = 2 if self.block_tile == 128 else 1
-        self.mma_reduce_dKV_stage = 2
+        # Disjoint dKV2/3 lets P remain single-stage; dS stays live through dQ,
+        # so M128 needs two dS stages to publish its next M64 half concurrently.
+        # Set this here because the JIT entry resets stages after construction.
+        self.compute_mma_P_stage = 1
+        self.compute_mma_dS_stage = 2 if self.block_tile == 128 else 1
+        self.mma_reduce_dKV_stage = 3
 
     @cute.jit
     def mma(
@@ -164,6 +167,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         is_first_generation = True
         is_first_dkv_half = True
         while tile_index >= 0:
+            # dKV2 reuses the preceding tile's S/dP columns. The reducer
+            # publishes this lifetime boundary after T2R of dKV2/3.
+            if not is_first_generation:
+                self.t2r_dKV23_done_barrier.arrive_and_wait()
             iket_wait_k = cute.experimental.iket.range_start("h32_mma_wait_k", tile_index)
             load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
             cute.experimental.iket.range_end(iket_wait_k, tile_index)
@@ -209,10 +216,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
                 cute.experimental.iket.range_end(iket_wait_p, kv_half)
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                if not is_first_dkv_half:
-                    # dKV2/3 alias dKV0/1.  A two-stage ring otherwise waits
-                    # on the intervening tail generation instead of the
-                    # aliased TMEM columns from the preceding half.
+                if half_iter != 0:
+                    # The two halves reuse the same disjoint dKV2/3 regions.
                     self.t2r_dKV23_done_barrier.arrive_and_wait()
 
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -258,23 +263,65 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
                 mma_reduce_dKV_producer_state.advance()
 
-                # Keep the first half's original reducer overlap.  On the
-                # final half, defer the K-independent dKV tail until after dQ
-                # so the K buffer can be released one MMA group earlier.
-                if half_iter != self.num_kv_subtiles - 1:
-                    mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
-                        cute.gemm(
-                            dKV4_tiled_mma,
-                            tdKVtdKV4,
-                            tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
-                            tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
-                            tdKVtdKV4,
-                        )
-                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
-                    mma_reduce_dKV_producer_state.advance()
+                # Keep the reducer generation order identical for both halves:
+                # dKV0/1, tail, then dKV2/3.
+                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
+                    cute.gemm(
+                        dKV4_tiled_mma,
+                        tdKVtdKV4,
+                        tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
+                        tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
+                        tdKVtdKV4,
+                    )
+                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
+                mma_reduce_dKV_producer_state.advance()
+
+                # dKV2/3 occupy disjoint TMEM, so they can be completed before
+                # dQ and release both P and dS for the next M64 half.
+                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
+                    cute.gemm(
+                        dOP_tiled_mma,
+                        tdKVtdKV2,
+                        tdKVrdOT[None, None, 2, k_block, load_mma_QdO_consumer_state.index],
+                        tdKVrP[None, None, k_block, compute_mma_P_consumer_state.index],
+                        tdKVtdKV2,
+                    )
+                    dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
+                    cute.gemm(
+                        dOP_tiled_mma,
+                        tdKVtdKV3,
+                        tdKVrdOT[None, None, 3, k_block, load_mma_QdO_consumer_state.index],
+                        tdKVrP[None, None, k_block, compute_mma_P_consumer_state.index],
+                        tdKVtdKV3,
+                    )
+                    dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                compute_mma_P_pipeline.consumer_release(compute_mma_P_consumer_state)
+                compute_mma_P_consumer_state.advance()
+
+                for k_block in cutlass.range(0, cute.size(tdKVrdS, mode=[2]), unroll=2):
+                    cute.gemm(
+                        QdS_tiled_mma,
+                        tdKVtdKV2,
+                        tdKVrQT[None, None, 2, k_block, load_mma_QdO_consumer_state.index],
+                        tdKVrdS[None, None, k_block, compute_mma_dS_consumer_state.index],
+                        tdKVtdKV2,
+                    )
+                    cute.gemm(
+                        QdS_tiled_mma,
+                        tdKVtdKV3,
+                        tdKVrQT[None, None, 3, k_block, load_mma_QdO_consumer_state.index],
+                        tdKVrdS[None, None, k_block, compute_mma_dS_consumer_state.index],
+                        tdKVtdKV3,
+                    )
+                mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
+                mma_reduce_dKV_producer_state.advance()
 
                 iket_dq = cute.experimental.iket.range_start("h32_mma_dq", kv_half)
                 accumulate_dq = not is_first_generation
@@ -335,72 +382,15 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     )
                     dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 cute.experimental.iket.range_end(iket_dq, kv_half)
+                compute_mma_dS_pipeline.consumer_release(compute_mma_dS_consumer_state)
+                compute_mma_dS_consumer_state.advance()
 
                 # The second M64 half is the final consumer of this K128
-                # gather.  Release the single-stage K buffer before dKV2/3,
-                # which only consume Q/dO and P/dS, so the loaders can gather
-                # the next sparse tile under the remaining MMA and atomics.
+                # gather. Release it immediately after the final dQ issue.
                 if half_iter == self.num_kv_subtiles - 1:
                     load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
                     load_mma_K_consumer_state.advance()
 
-                    mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
-                        cute.gemm(
-                            dKV4_tiled_mma,
-                            tdKVtdKV4,
-                            tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
-                            tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
-                            tdKVtdKV4,
-                        )
-                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
-                    mma_reduce_dKV_producer_state.advance()
-
-                mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
-                    cute.gemm(
-                        dOP_tiled_mma,
-                        tdKVtdKV2,
-                        tdKVrdOT[None, None, 2, k_block, load_mma_QdO_consumer_state.index],
-                        tdKVrP[None, None, k_block, compute_mma_P_consumer_state.index],
-                        tdKVtdKV2,
-                    )
-                    dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
-                    cute.gemm(
-                        dOP_tiled_mma,
-                        tdKVtdKV3,
-                        tdKVrdOT[None, None, 3, k_block, load_mma_QdO_consumer_state.index],
-                        tdKVrP[None, None, k_block, compute_mma_P_consumer_state.index],
-                        tdKVtdKV3,
-                    )
-                    dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                compute_mma_P_pipeline.consumer_release(compute_mma_P_consumer_state)
-                compute_mma_P_consumer_state.advance()
-
-                for k_block in cutlass.range(0, cute.size(tdKVrdS, mode=[2]), unroll=2):
-                    cute.gemm(
-                        QdS_tiled_mma,
-                        tdKVtdKV2,
-                        tdKVrQT[None, None, 2, k_block, load_mma_QdO_consumer_state.index],
-                        tdKVrdS[None, None, k_block, compute_mma_dS_consumer_state.index],
-                        tdKVtdKV2,
-                    )
-                    cute.gemm(
-                        QdS_tiled_mma,
-                        tdKVtdKV3,
-                        tdKVrQT[None, None, 3, k_block, load_mma_QdO_consumer_state.index],
-                        tdKVrdS[None, None, k_block, compute_mma_dS_consumer_state.index],
-                        tdKVtdKV3,
-                    )
-                mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
-                mma_reduce_dKV_producer_state.advance()
-                compute_mma_dS_pipeline.consumer_release(compute_mma_dS_consumer_state)
-                compute_mma_dS_consumer_state.advance()
                 is_first_generation = False
                 is_first_dkv_half = False
                 cute.experimental.iket.range_end(iket_half, kv_half)
