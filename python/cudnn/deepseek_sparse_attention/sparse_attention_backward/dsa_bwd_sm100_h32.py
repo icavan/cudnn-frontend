@@ -126,6 +126,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         pipelines,
     ):
         """One sparse-row load/score followed by its M64 generations."""
+        iket_mainloop = cute.experimental.iket.range_start("h32_mma_mainloop")
         (
             load_mma_QdO_pipeline,
             load_mma_K_pipeline,
@@ -154,8 +155,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         is_first_generation = True
         is_first_dkv_half = True
         while tile_index >= 0:
+            iket_wait_k = cute.experimental.iket.range_start("h32_mma_wait_k", tile_index)
             load_mma_K_pipeline.consumer_wait(load_mma_K_consumer_state)
+            cute.experimental.iket.range_end(iket_wait_k, tile_index)
 
+            iket_score_dp = cute.experimental.iket.range_start("h32_mma_score_dp", tile_index)
             mma_compute_S_pipeline.producer_acquire(mma_compute_S_producer_state)
             QK_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tSrQ, mode=[2]), unroll=4):
@@ -183,6 +187,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 dOV_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
             mma_compute_dP_pipeline.producer_commit(mma_compute_dP_producer_state)
             mma_compute_dP_producer_state.advance()
+            cute.experimental.iket.range_end(iket_score_dp, tile_index)
 
             k_blocks_per_half = cute.size(tdQrdST, mode=[2])
             # Preserve the generic M64 kernel's descending sparse-tile order
@@ -190,7 +195,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             # reordered by the optimization.
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
+                iket_half = cute.experimental.iket.range_start("h32_mma_half", kv_half)
+                iket_wait_p = cute.experimental.iket.range_start("h32_mma_wait_p", kv_half)
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
+                cute.experimental.iket.range_end(iket_wait_p, kv_half)
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 if not is_first_dkv_half:
                     # dKV2/3 alias dKV0/1.  A two-stage ring otherwise waits
@@ -219,7 +227,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     )
                     dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
+                iket_wait_ds = cute.experimental.iket.range_start("h32_mma_wait_ds", kv_half)
                 compute_mma_dS_pipeline.consumer_wait(compute_mma_dS_consumer_state)
+                cute.experimental.iket.range_end(iket_wait_ds, kv_half)
                 QdS_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 for k_block in cutlass.range(0, cute.size(tdKVrdS, mode=[2]), unroll=2):
                     cute.gemm(
@@ -257,6 +267,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
                     mma_reduce_dKV_producer_state.advance()
 
+                iket_dq = cute.experimental.iket.range_start("h32_mma_dq", kv_half)
                 accumulate_dq = not is_first_generation
                 KdS_tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate_dq)
                 for k_block in cutlass.range(0, k_blocks_per_half, unroll=2):
@@ -314,6 +325,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         tdQtdQ4,
                     )
                     dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                cute.experimental.iket.range_end(iket_dq, kv_half)
 
                 # The second M64 half is the final consumer of this K128
                 # gather.  Release the single-stage K buffer before dKV2/3,
@@ -382,6 +394,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 compute_mma_dS_consumer_state.advance()
                 is_first_generation = False
                 is_first_dkv_half = False
+                cute.experimental.iket.range_end(iket_half, kv_half)
 
             tile_index -= 1
 
@@ -391,6 +404,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         mma_compute_dQ_producer_state.advance()
         load_mma_QdO_pipeline.consumer_release(load_mma_QdO_consumer_state)
         load_mma_QdO_consumer_state.advance()
+        cute.experimental.iket.range_end(iket_mainloop)
 
     @cute.jit
     def compute(
@@ -416,6 +430,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         pipelines,
     ):
         """Stream each M128 score/dP result through one physical M64 slot."""
+        iket_compute = cute.experimental.iket.range_start("h32_compute")
         (
             mma_compute_S_pipeline,
             mma_compute_dP_pipeline,
@@ -472,9 +487,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         tile_index = tile_count - 1
         while tile_index >= 0:
+            iket_wait_score_dp = cute.experimental.iket.range_start("h32_compute_wait_score_dp", tile_index)
             mma_compute_S_pipeline.consumer_wait(mma_compute_S_consumer_state)
             mma_compute_dP_pipeline.consumer_wait(mma_compute_dP_consumer_state)
+            cute.experimental.iket.range_end(iket_wait_score_dp, tile_index)
 
+            iket_t2r_alu = cute.experimental.iket.range_start("h32_compute_t2r_alu", tile_index)
             cute.copy(tiled_t2r_S, tTR_tS, tTR_rS)
             for i in cutlass.range(0, cute.size(tTR_rS), 2, unroll_full=True):
                 lse = (
@@ -507,9 +525,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
             cute.arch.fence_view_async_tmem_load()
             self.compute_sync_barrier.arrive_and_wait()
+            cute.experimental.iket.range_end(iket_t2r_alu, tile_index)
 
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
+                iket_publish_half = cute.experimental.iket.range_start("h32_compute_publish_half", kv_half)
 
                 compute_mma_P_pipeline.producer_acquire(compute_mma_P_producer_state)
                 p_stage = 0 if self.compute_mma_P_stage == 1 else compute_mma_P_producer_state.index
@@ -534,6 +554,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 cute.arch.fence_proxy("async.shared", space="cta")
                 compute_mma_dS_pipeline.producer_commit(compute_mma_dS_producer_state)
                 compute_mma_dS_producer_state.advance()
+                cute.experimental.iket.range_end(iket_publish_half, kv_half)
 
             mma_compute_S_pipeline.consumer_release(mma_compute_S_consumer_state)
             mma_compute_S_consumer_state.advance()
@@ -544,6 +565,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         load_compute_LSE_pipeline.consumer_release(load_compute_LSE_consumer_state)
         load_compute_sum_OdO_pipeline.consumer_release(load_compute_sum_OdO_consumer_state)
 
+        iket_dq_epilogue = cute.experimental.iket.range_start("h32_compute_dq_epilogue")
         # Persistent dQ epilogue; identical ordering to H16, but every tile is
         # M{128,64} x N32 and therefore occupies 32 TMEM columns.
         tdQtdQ0 = tdQtdQ0[(None, None), 0, 0]
@@ -618,6 +640,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         mma_compute_dQ_pipeline.consumer_release(mma_compute_dQ_consumer_state)
         mma_compute_dQ_consumer_state.advance()
+        cute.experimental.iket.range_end(iket_dq_epilogue)
+        cute.experimental.iket.range_end(iket_compute)
         compute_tmastore_dQ_pipeline.producer_tail()
 
     @cute.jit
@@ -758,6 +782,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         mma_reduce_dKV_pipeline,
     ):
         """Consume three reducer generations for each M64 half."""
+        iket_reduce = cute.experimental.iket.range_start("h32_reduce_dkv")
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
         tdKVtdKV0 = tdKVtdKV0[(None, None), 0, 0]
         tdKVtdKV1 = tdKVtdKV1[(None, None), 0, 0]
@@ -792,6 +817,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         while tile_index >= 0:
             for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
+                iket_reduce_half = cute.experimental.iket.range_start("h32_reduce_half", kv_half)
                 row_base = tile_index * self.block_tile + kv_half * self.kv_subtile
                 for i in cutlass.range_constexpr(self.reduce_rows_per_thread):
                     coord_base = i * 2 - i % 2
@@ -814,7 +840,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         else:
                             rTopkIdx_64[i] = Int32(-1)
 
+                iket_wait_01 = cute.experimental.iket.range_start("h32_reduce_wait_01", kv_half)
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                cute.experimental.iket.range_end(iket_wait_01, kv_half)
+                iket_atomic_01 = cute.experimental.iket.range_start("h32_reduce_atomic_01", kv_half)
                 rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
                 cute.arch.fence_view_async_tmem_load()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
@@ -823,13 +852,21 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                cute.experimental.iket.range_end(iket_atomic_01, kv_half)
+                iket_wait_tail = cute.experimental.iket.range_start("h32_reduce_wait_tail", kv_half)
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                cute.experimental.iket.range_end(iket_wait_tail, kv_half)
+                iket_atomic_tail = cute.experimental.iket.range_start("h32_reduce_atomic_tail", kv_half)
                 rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
                 cute.arch.fence_view_async_tmem_load()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
+                cute.experimental.iket.range_end(iket_atomic_tail, kv_half)
+                iket_wait_23 = cute.experimental.iket.range_start("h32_reduce_wait_23", kv_half)
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                cute.experimental.iket.range_end(iket_wait_23, kv_half)
+                iket_atomic_23 = cute.experimental.iket.range_start("h32_reduce_atomic_23", kv_half)
                 rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
                 cute.arch.fence_view_async_tmem_load()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
@@ -842,4 +879,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                cute.experimental.iket.range_end(iket_atomic_23, kv_half)
+                cute.experimental.iket.range_end(iket_reduce_half, kv_half)
             tile_index -= 1
+        cute.experimental.iket.range_end(iket_reduce)
