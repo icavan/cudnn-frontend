@@ -101,6 +101,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         # the first half's late dKV2/3 consumers. This must be set here because
         # the JIT entry calls _setup_attributes after construction.
         self.compute_mma_P_stage = 2 if self.block_tile == 128 else 1
+        self.compute_mma_dS_stage = 2 if self.block_tile == 128 else 1
         self.mma_reduce_dKV_stage = 2
 
     @cute.jit
