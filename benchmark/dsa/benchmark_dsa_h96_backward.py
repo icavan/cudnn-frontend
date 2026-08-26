@@ -51,10 +51,11 @@ def make_inputs(
         shift = int(round(topk * (1.0 - pair_overlap)))
         offsets = (pair_ids * 4099 + within_pair * shift) % seqlen_kv
     topk_idxs = (columns.unsqueeze(0) + offsets.unsqueeze(1)) % seqlen_kv
+    topk_length = torch.full((seqlen_q,), topk, device=device, dtype=torch.int32)
 
     dq = torch.empty_like(q)
     dkv = torch.empty_like(kv)
-    return q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv
+    return q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length, dq, dkv
 
 
 def main():
@@ -70,9 +71,10 @@ def main():
     parser.add_argument("--pair-overlap", type=float, default=None)
     parser.add_argument("--check-pair", action="store_true")
     parser.add_argument("--pair-h96", action="store_true")
+    parser.add_argument("--with-topk-length", action="store_true")
     args = parser.parse_args()
 
-    q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv = make_inputs(
+    q, kv, out, dout, lse, attn_sink, topk_idxs, topk_length, dq, dkv = make_inputs(
         args.seqlen_q,
         args.seqlen_kv,
         args.topk,
@@ -97,7 +99,7 @@ def main():
                 attn_sink,
                 topk_idxs,
                 softmax_scale=softmax_scale,
-                topk_length=None,
+                topk_length=topk_length if args.with_topk_length else None,
                 dq=dq_check,
                 dkv=dkv_check,
                 **pair_kwargs,
@@ -128,7 +130,7 @@ def main():
             attn_sink,
             topk_idxs,
             softmax_scale=softmax_scale,
-            topk_length=None,
+            topk_length=topk_length if args.with_topk_length else None,
             dq=dq,
             dkv=dkv,
             **pair_kwargs,
