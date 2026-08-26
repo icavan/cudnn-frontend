@@ -55,8 +55,9 @@ def _allocate(cfg, has_topk_length: bool):
     "num_heads,head_dim,expected_backend,expected_block_tile",
     [
         (16, 576, "h16_m128", 128),
-        (16, 512, "generic_m64", 64),
+        (16, 512, "h16_m128", 128),
         (32, 576, "h32_m64", 64),
+        (32, 512, "h32_m64", 64),
         (64, 576, "generic_m64", 64),
     ],
 )
@@ -730,6 +731,8 @@ def test_DSA_sparse_attention_backward_sm100_576_includes_sink_in_normalization(
         pytest.param(512, 64, (-3, 0, 1, 63, 64, 65, 128), id="d512-mixed"),
         pytest.param(512, 128, (-3, 0, 1, 63, 64, 65, 128), id="d512-h128-two-cta"),
         pytest.param(576, 32, (0, 1, 64, 65, 128, 0), id="d576-mixed"),
+        pytest.param(512, 16, (0, 1, 127, 128, 129, 255, 256), id="d512-h16-m128-boundaries"),
+        pytest.param(512, 32, (0, 1, 63, 64, 65, 127, 128), id="d512-h32-m64-boundaries"),
         pytest.param(576, 16, (0, 1, 127, 128, 129, 511, 512, 513), id="d576-h16-m128-boundaries"),
         pytest.param(576, 32, (0, 1, 63, 64, 65, 127, 128), id="d576-h32-m64-boundaries"),
     ],
@@ -751,7 +754,7 @@ def test_DSA_sparse_attention_backward_zero_topk_length(head_dim, num_heads, top
 
     device = torch.device("cuda")
     s_q = len(topk_length_values) if topk_length_values is not None else 2
-    is_h16 = head_dim == 576 and num_heads == 16
+    is_h16 = num_heads == 16
     s_kv, topk = (640, 513) if is_h16 else (256, 128)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 

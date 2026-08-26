@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -38,8 +39,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
             128,
             max_topk,
         )
-        if head_dim != 576 or head_dim_v != 512 or block_tile != 64:
-            raise ValueError("H32 M64 requires head_dim=576, head_dim_v=512, and block_tile=64")
+        if head_dim not in (512, 576) or head_dim_v != 512 or block_tile != 64:
+            raise ValueError("H32 M64 requires head_dim in {512, 576}, head_dim_v=512, and block_tile=64")
 
         self.block_tile = block_tile
 
@@ -69,14 +70,21 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dP_offset = 32
         self.tmem_dKV0_offset = 64
         self.tmem_dKV1_offset = 128
-        self.tmem_dKV2_offset = self.tmem_dKV0_offset
-        self.tmem_dKV3_offset = self.tmem_dKV1_offset
         self.tmem_dQ0_offset = 192
         self.tmem_dQ1_offset = 224
         self.tmem_dQ2_offset = 256
         self.tmem_dQ3_offset = 288
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
+        if self.same_hdim_kv:
+            # Match the generic D512 ring: dKV2 occupies the dead dQ4 area,
+            # while dKV3 aliases dKV1. Keeping the oldest dKV0 generation
+            # disjoint is required for the reducer's asynchronous T2R path.
+            self.tmem_dKV2_offset = self.tmem_dQ4_offset
+            self.tmem_dKV3_offset = self.tmem_dKV1_offset
+        else:
+            self.tmem_dKV2_offset = self.tmem_dKV0_offset
+            self.tmem_dKV3_offset = self.tmem_dKV1_offset
 
         self.num_regs_load_KV = 32
         self.num_regs_compute = 160
@@ -89,8 +97,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         dOP_tiled_mma: cute.TiledMma,
         QdS_tiled_mma: cute.TiledMma,
         KdS_tiled_mma: cute.TiledMma,
-        dKV4_tiled_mma: cute.TiledMma,
-        dQ4_tiled_mma: cute.TiledMma,
+        dKV4_tiled_mma: Optional[cute.TiledMma],
+        dQ4_tiled_mma: Optional[cute.TiledMma],
         tSrQ: cute.Tensor,
         tSrK: cute.Tensor,
         tdPrdO: cute.Tensor,
@@ -101,9 +109,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tdQrdST: cute.Tensor,
         tdKVrQT: cute.Tensor,
         tdKVrdS: cute.Tensor,
-        tdQrK_tail: cute.Tensor,
-        tdKVrQT_tail: cute.Tensor,
-        tdKVrdS_4: cute.Tensor,
+        tdQrK_tail: Optional[cute.Tensor],
+        tdKVrQT_tail: Optional[cute.Tensor],
+        tdKVrdS_4: Optional[cute.Tensor],
         tStS: cute.Tensor,
         tdPtdP: cute.Tensor,
         tdKVtdKV: tuple,
@@ -180,9 +188,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 if not is_first_dkv_half:
-                    # dKV2/3 alias dKV0/1.  A two-stage ring otherwise waits
-                    # on the intervening tail generation instead of the
-                    # aliased TMEM columns from the preceding half.
                     self.t2r_dKV23_done_barrier.arrive_and_wait()
 
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -229,20 +234,21 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 # On a non-final subtile, retain the original reducer overlap.
                 # On the final subtile, defer the K-independent dKV tail until after dQ
                 # so the K buffer can be released one MMA group earlier.
-                if half_iter != self.num_kv_subtiles - 1:
-                    mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
-                        cute.gemm(
-                            dKV4_tiled_mma,
-                            tdKVtdKV4,
-                            tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
-                            tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
-                            tdKVtdKV4,
-                        )
-                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
-                    mma_reduce_dKV_producer_state.advance()
+                if cutlass.const_expr(not self.same_hdim_kv):
+                    if cutlass.const_expr(half_iter != self.num_kv_subtiles - 1):
+                        mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
+                            cute.gemm(
+                                dKV4_tiled_mma,
+                                tdKVtdKV4,
+                                tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
+                                tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
+                                tdKVtdKV4,
+                            )
+                            dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
+                        mma_reduce_dKV_producer_state.advance()
 
                 accumulate_dq = not is_first_generation
                 KdS_tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate_dq)
@@ -290,17 +296,18 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     )
                     KdS_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate_dq)
-                for k_block in cutlass.range(0, k_blocks_per_half, unroll=2):
-                    k_half_block = kv_half * k_blocks_per_half + k_block
-                    cute.gemm(
-                        dQ4_tiled_mma,
-                        tdQtdQ4,
-                        tdQrK_tail[None, None, 0, k_half_block, load_mma_K_consumer_state.index],
-                        tdQrdST[None, None, k_block, compute_mma_dS_consumer_state.index],
-                        tdQtdQ4,
-                    )
-                    dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if cutlass.const_expr(not self.same_hdim_kv):
+                    dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate_dq)
+                    for k_block in cutlass.range(0, k_blocks_per_half, unroll=2):
+                        k_half_block = kv_half * k_blocks_per_half + k_block
+                        cute.gemm(
+                            dQ4_tiled_mma,
+                            tdQtdQ4,
+                            tdQrK_tail[None, None, 0, k_half_block, load_mma_K_consumer_state.index],
+                            tdQrdST[None, None, k_block, compute_mma_dS_consumer_state.index],
+                            tdQtdQ4,
+                        )
+                        dQ4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                 # The final M64 subtile is the last consumer of this K gather.
                 # Release the single-stage K buffer before dKV2/3,
@@ -310,20 +317,23 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                     load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
                     load_mma_K_consumer_state.advance()
 
-                    mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                    dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
-                        cute.gemm(
-                            dKV4_tiled_mma,
-                            tdKVtdKV4,
-                            tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
-                            tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
-                            tdKVtdKV4,
-                        )
-                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
-                    mma_reduce_dKV_producer_state.advance()
+                    if cutlass.const_expr(not self.same_hdim_kv):
+                        mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
+                        dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        for k_block in cutlass.range(0, cute.size(tdKVrdS_4, mode=[2]), unroll=2):
+                            cute.gemm(
+                                dKV4_tiled_mma,
+                                tdKVtdKV4,
+                                tdKVrQT_tail[None, None, 0, k_block, load_mma_QdO_consumer_state.index],
+                                tdKVrdS_4[None, None, k_block, compute_mma_dS_consumer_state.index],
+                                tdKVtdKV4,
+                            )
+                            dKV4_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
+                        mma_reduce_dKV_producer_state.advance()
 
+                if cutlass.const_expr(self.same_hdim_kv):
+                    self.t2r_dKV4_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
@@ -384,9 +394,9 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self,
         tma_atom_dQ: cute.CopyAtom,
         tma_tensor_dQ: cute.Tensor,
-        tma_atom_dQ_64: cute.CopyAtom,
-        tma_tensor_dQ_64: cute.Tensor,
-        dQ4_tiled_mma: cute.TiledMma,
+        tma_atom_dQ_64: Optional[cute.CopyAtom],
+        tma_tensor_dQ_64: Optional[cute.Tensor],
+        dQ4_tiled_mma: Optional[cute.TiledMma],
         tStS: cute.Tensor,
         tdPtdP: cute.Tensor,
         tdQtdQ: tuple,
@@ -397,7 +407,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         sdS: cute.Tensor,
         sdS_store: cute.Tensor,
         sdQ: cute.Tensor,
-        sdQ4: cute.Tensor,
+        sdQ4: Optional[cute.Tensor],
         sValid: cute.Tensor,
         scale_softmax: Float32,
         tile_count: Int32,
@@ -552,11 +562,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         tdQsdQ2, tdQgdQ2_mkl = cpasync.tma_partition(tma_atom_dQ, 0, cute.make_layout(1), cute.group_modes(sdQ_slice, 0, 2), cute.group_modes(gdQ2, 0, 2))
         tdQsdQ3, tdQgdQ3_mkl = cpasync.tma_partition(tma_atom_dQ, 0, cute.make_layout(1), cute.group_modes(sdQ_slice, 0, 2), cute.group_modes(gdQ3, 0, 2))
 
-        tdQtdQ4 = tdQtdQ4[(None, None), 0, 0]
-        gdQ4 = cute.local_tile(tma_tensor_dQ_64, cute.select(self.dQ4_mma_tiler, mode=[0, 1]), (None, None, (token_idx, batch_idx)))
-        gdQ4 = gdQ4[None, None, 8, head_block_idx]
-        sdQ4_slice = sdQ4[None, None, mma_compute_dQ_consumer_state.index]
-        tdQsdQ4, tdQgdQ4_mkl = cpasync.tma_partition(tma_atom_dQ_64, 0, cute.make_layout(1), cute.group_modes(sdQ4_slice, 0, 2), cute.group_modes(gdQ4, 0, 2))
+        if cutlass.const_expr(not self.same_hdim_kv):
+            tdQtdQ4 = tdQtdQ4[(None, None), 0, 0]
+            gdQ4 = cute.local_tile(tma_tensor_dQ_64, cute.select(self.dQ4_mma_tiler, mode=[0, 1]), (None, None, (token_idx, batch_idx)))
+            gdQ4 = gdQ4[None, None, 8, head_block_idx]
+            sdQ4_slice = sdQ4[None, None, mma_compute_dQ_consumer_state.index]
+            tdQsdQ4, tdQgdQ4_mkl = cpasync.tma_partition(
+                tma_atom_dQ_64, 0, cute.make_layout(1), cute.group_modes(sdQ4_slice, 0, 2), cute.group_modes(gdQ4, 0, 2)
+            )
 
         dp_idx = tidx % 128
         wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
@@ -598,14 +611,15 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.compute_sync_barrier.arrive_and_wait()
         compute_tmastore_dQ_producer_state.advance()
 
-        if warp_idx == self.compute_warp_id[0]:
-            compute_tmastore_dQ_pipeline.producer_acquire()
-        self.compute_sync_barrier.arrive_and_wait()
-        self.store_dQ_64(tma_atom_dQ_64, sdQ4_slice, tdQsdQ4, tdQgdQ4_mkl, tdQtdQ4, dp_idx, wg_idx, warp_idx)
-        if warp_idx == self.compute_warp_id[0]:
-            compute_tmastore_dQ_pipeline.producer_commit()
-        self.compute_sync_barrier.arrive_and_wait()
-        compute_tmastore_dQ_producer_state.advance()
+        if cutlass.const_expr(not self.same_hdim_kv):
+            if warp_idx == self.compute_warp_id[0]:
+                compute_tmastore_dQ_pipeline.producer_acquire()
+            self.compute_sync_barrier.arrive_and_wait()
+            self.store_dQ_64(tma_atom_dQ_64, sdQ4_slice, tdQsdQ4, tdQgdQ4_mkl, tdQtdQ4, dp_idx, wg_idx, warp_idx)
+            if warp_idx == self.compute_warp_id[0]:
+                compute_tmastore_dQ_pipeline.producer_commit()
+            self.compute_sync_barrier.arrive_and_wait()
+            compute_tmastore_dQ_producer_state.advance()
 
         mma_compute_dQ_pipeline.consumer_release(mma_compute_dQ_consumer_state)
         mma_compute_dQ_consumer_state.advance()
@@ -749,13 +763,14 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         topk: Int32,
         mma_reduce_dKV_pipeline,
     ):
-        """Consume three reducer generations for each M64 tile."""
+        """Consume two D512 or three D576 reducer generations per M64 tile."""
         tdKVtdKV0, tdKVtdKV1, tdKVtdKV2, tdKVtdKV3, tdKVtdKV4 = tdKVtdKV
         tdKVtdKV0 = tdKVtdKV0[(None, None), 0, 0]
         tdKVtdKV1 = tdKVtdKV1[(None, None), 0, 0]
         tdKVtdKV2 = tdKVtdKV2[(None, None), 0, 0]
         tdKVtdKV3 = tdKVtdKV3[(None, None), 0, 0]
-        tdKVtdKV4 = tdKVtdKV4[(None, None), 0, 0]
+        if cutlass.const_expr(not self.same_hdim_kv):
+            tdKVtdKV4 = tdKVtdKV4[(None, None), 0, 0]
 
         tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, batch_idx = cute.arch.block_idx()
@@ -771,13 +786,15 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         cdKV = cute.make_identity_tensor((self.dOP_mma_tiler[0], self.dOP_mma_tiler[1]))
         thr_main = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV0).get_slice(dp_idx)
         tTR_cdKV = self.split_wg(thr_main.partition_D(cdKV), num_warp_groups, wg_idx)
-        cdKV_64 = cute.make_identity_tensor((self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1]))
-        thr_tail = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV4).get_slice(dp_idx)
-        tTR_cdKV_64 = self.split_wg(thr_tail.partition_D(cdKV_64), num_warp_groups, wg_idx)
+        if cutlass.const_expr(not self.same_hdim_kv):
+            cdKV_64 = cute.make_identity_tensor((self.dKV4_mma_tiler[0], self.dKV4_mma_tiler[1]))
+            thr_tail = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV4).get_slice(dp_idx)
+            tTR_cdKV_64 = self.split_wg(thr_tail.partition_D(cdKV_64), num_warp_groups, wg_idx)
 
         consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.mma_reduce_dKV_stage)
         rTopkIdx = cute.make_rmem_tensor((self.reduce_rows_per_thread,), cutlass.Int32)
-        rTopkIdx_64 = cute.make_rmem_tensor((self.reduce_rows_per_thread,), cutlass.Int32)
+        if cutlass.const_expr(not self.same_hdim_kv):
+            rTopkIdx_64 = cute.make_rmem_tensor((self.reduce_rows_per_thread,), cutlass.Int32)
         full_tiles = (topk % self.block_tile) == 0
 
         tile_index = tile_count - 1
@@ -798,33 +815,46 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                             rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                         else:
                             rTopkIdx[i] = Int32(-1)
-                    local_row_idx_64 = cute.get(tTR_cdKV_64[coord_base], mode=[1])
-                    global_row_idx_64 = row_base + local_row_idx_64
-                    if full_tiles:
-                        topk_idx = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
-                        rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
-                    else:
-                        if global_row_idx_64 < topk:
+                    if cutlass.const_expr(not self.same_hdim_kv):
+                        local_row_idx_64 = cute.get(tTR_cdKV_64[coord_base], mode=[1])
+                        global_row_idx_64 = row_base + local_row_idx_64
+                        if full_tiles:
                             topk_idx = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
                             rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                         else:
-                            rTopkIdx_64[i] = Int32(-1)
+                            if global_row_idx_64 < topk:
+                                topk_idx = mTopkIdxs[global_row_idx_64, (token_idx, batch_idx)]
+                                rTopkIdx_64[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
+                            else:
+                                rTopkIdx_64[i] = Int32(-1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
-                cute.arch.fence_view_async_tmem_load()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
-                cute.arch.fence_view_async_tmem_load()
+                if cutlass.const_expr(self.same_hdim_kv):
+                    # Match the generic D512 lifetime: detach both aliased
+                    # fragments from TMEM before allowing the second producer
+                    # generation to start, then overlap their atomics.
+                    rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
+                    rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
+                    cute.arch.fence_view_async_tmem_load()
+                    self.t2r_dKV4_done_barrier.arrive_and_wait()
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                else:
+                    rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
+                    cute.arch.fence_view_async_tmem_load()
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+                    rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
+                    cute.arch.fence_view_async_tmem_load()
+                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
-                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
-                mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
-                cute.arch.fence_view_async_tmem_load()
-                mma_reduce_dKV_pipeline.consumer_release(consumer_state)
-                consumer_state.advance()
-                self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
+                if cutlass.const_expr(not self.same_hdim_kv):
+                    mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
+                    rdKV4 = self.t2r_dKV_64(tdKVtdKV4)
+                    cute.arch.fence_view_async_tmem_load()
+                    mma_reduce_dKV_pipeline.consumer_release(consumer_state)
+                    consumer_state.advance()
+                    self.reduce_dKV_64_from_reg(mdKV_acc, rdKV4, rTopkIdx_64)
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
                 rdKV2 = self._t2r_dKV_main(tdKVtdKV2)
                 cute.arch.fence_view_async_tmem_load()

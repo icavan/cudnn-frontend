@@ -24,7 +24,6 @@ _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
-
 def _align_workspace_bytes(num_bytes: int) -> int:
     """Round a workspace segment size up to the shared alignment boundary."""
     return -(-int(num_bytes) // _WORKSPACE_ALIGNMENT) * _WORKSPACE_ALIGNMENT
@@ -138,11 +137,11 @@ def _select_sm100_backend(
         and max_topk in (128, 512, 1024, 1152, 2048)
     ):
         return "h128_2cta_m64", 64
-    if num_heads == 16 and head_dim == 576:
+    if num_heads == 16 and head_dim in (512, 576):
         # The H16 KV-major specialization can use the full M128 UMMA tile,
         # halving the top-k loop count while keeping one CTA per query token.
         return "h16_m128", 128
-    if num_heads == 32 and head_dim == 576:
+    if num_heads == 32 and head_dim in (512, 576):
         return "h32_m64", 64
     return "generic_m64", 64
 

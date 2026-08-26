@@ -42,6 +42,7 @@ DSA_SPARSE_ATTENTION_BACKWARD_PARAM_MARKS = [
         "head_dim,head_dim_v,num_heads",
         [
             (512, 512, 16),
+            (512, 512, 32),
             (512, 512, 64),
             (576, 512, 16),
             # Regression for a packed-M tile crossing query boundaries. This
