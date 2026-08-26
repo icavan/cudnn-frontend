@@ -266,7 +266,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         is_first_dkv_half = True
         while tile_index >= 0:
             iket_wait_k = cute.experimental.iket.range_start("h32_mma_wait_k", tile_index)
-            for kv_half in cutlass.range_constexpr(self.num_kv_subtiles):
+            for half_iter in cutlass.range_constexpr(self.num_kv_subtiles):
+                kv_half = self.num_kv_subtiles - 1 - half_iter
                 load_mma_K_pipelines[kv_half].consumer_wait(load_mma_K_consumer_states[kv_half])
             cute.experimental.iket.range_end(iket_wait_k, tile_index)
 
