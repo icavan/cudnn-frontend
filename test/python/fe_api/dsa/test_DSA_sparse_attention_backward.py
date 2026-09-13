@@ -552,6 +552,7 @@ def _run_DSA_sparse_attention_backward_wrapper(
     allow_unsupported=True,
     s_q_default=1024,
 ):
+    """Run wrapper backward against reference gradients, optionally skipping unsupported cases."""
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -642,6 +643,7 @@ def test_DSA_sparse_attention_backward_wrapper(
     has_topk_length,
     request,
 ):
+    """Check wrapper gradients against the reference over the shared DSA parameter set."""
     _run_DSA_sparse_attention_backward_wrapper(
         dtype=dtype,
         acc_dtype=acc_dtype,

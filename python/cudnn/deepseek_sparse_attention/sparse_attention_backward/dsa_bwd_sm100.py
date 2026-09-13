@@ -31,6 +31,7 @@ class FlashAttentionDSABackwardSm100:
         block_tile: int,
         max_topk: int = 0,
     ):
+        """Configure SM100 backward tiling, warp roles, registers, and TMEM regions."""
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
         self.same_hdim_kv = head_dim == head_dim_v
@@ -169,6 +170,7 @@ class FlashAttentionDSABackwardSm100:
         self.non_tma_align_bytes = 128
 
     def _setup_attributes(self):
+        """Set operand pipeline depths and disjoint dQ TMA-store staging slots."""
         self.load_mma_QdO_stage = 1
         self.load_mma_K_stage = 1
         # self.load_mma_dO_stage = 1
@@ -193,6 +195,7 @@ class FlashAttentionDSABackwardSm100:
 
     @staticmethod
     def _get_workspace_size_LSE_OdO(q: int, d: int, h: int, b: int, acc_dtype: Type[cutlass.Numeric]):
+        """Return the byte-oriented workspace shape for paired LSE and OdO vectors."""
         # q is total seqlen, b=1
         d = (d + 7) // 8 * 8  # round up to 8
         q = (q + 7) // 8 * 8  # round up to 8
@@ -1328,6 +1331,7 @@ class FlashAttentionDSABackwardSm100:
         async_copy_atom: cute.CopyAtom,
         async_thr_copy: cute.TiledCopy,
     ):
+        """Issue predicated global-to-shared copies for one indexed KV row."""
         gK_row = mKV[topk_idx, None, (0, batch_idx)]
         tile_gK = cute.composition(gK_row, cute.make_layout(tile_sK.shape))
         pred_sK = tile_sK[None, local_tidx // 8]
@@ -1597,6 +1601,7 @@ class FlashAttentionDSABackwardSm100:
         sdS: cute.Tensor,
         pipelines,
     ):
+        """Issue backward GEMMs and order TMEM reuse while traversing KV tiles in reverse."""
         (
             load_mma_QdO_pipeline,
             load_mma_K_pipeline,
@@ -2768,6 +2773,7 @@ class FlashAttentionDSABackwardSm100:
         )
 
     def make_and_init_load_mma_K_pipeline(self, load_mma_K_mbar_ptr):
+        """Create the KV-loader-to-UMMA pipeline with deferred initialization synchronization."""
         load_mma_K_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads_per_warp * self.num_load_KV_warps)
         load_mma_K_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len([self.mma_warp_id]))
         return pipeline.PipelineAsyncUmma.create(
@@ -2779,6 +2785,7 @@ class FlashAttentionDSABackwardSm100:
         )
 
     def make_and_init_load_compute_LSE_pipeline(self, load_compute_lse_mbar_ptr):
+        """Create the asynchronous LSE-copy pipeline from the loader warp to compute warps."""
         return pipeline.PipelineCpAsync.create(
             barrier_storage=load_compute_lse_mbar_ptr,
             num_stages=self.load_compute_LSE_stage,
@@ -2788,6 +2795,7 @@ class FlashAttentionDSABackwardSm100:
         )
 
     def make_and_init_load_compute_sum_OdO_pipeline(self, load_compute_sum_OdO_mbar_ptr):
+        """Create the asynchronous OdO-sum-copy pipeline from the loader warp to compute warps."""
         return pipeline.PipelineCpAsync.create(
             barrier_storage=load_compute_sum_OdO_mbar_ptr,
             num_stages=self.load_compute_sum_OdO_stage,
