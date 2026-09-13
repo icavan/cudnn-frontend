@@ -194,8 +194,11 @@ def run_benchmark_suite(args):
 def run_profile(args):
     """Single warmed-up backward call under cudaProfilerStart/Stop for ncu/nsys."""
     seqlen_q = args.seqlens[0]
+    seqlen_kv = args.profile_seqlen_kv if args.profile_seqlen_kv is not None else seqlen_q
     topk = args.topks[-1]
-    run = setup_case(seqlen_q, seqlen_q, topk, args)
+    if topk > seqlen_kv:
+        raise ValueError(f"profile topk ({topk}) must not exceed seqlen_kv ({seqlen_kv})")
+    run = setup_case(seqlen_q, seqlen_kv, topk, args)
 
     # warmup (also triggers compile) outside the profiled range
     run()
@@ -206,7 +209,10 @@ def run_profile(args):
         run()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
-    print(f"Profile run done: seqlen_q={seqlen_q}, topk={topk}, nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}")
+    print(
+        f"Profile run done: seqlen_q={seqlen_q}, seqlen_kv={seqlen_kv}, topk={topk}, "
+        f"nheads={args.nheads}, d_qk={args.head_dim}, d_v={args.head_dim_v}, dtype={args.dtype}"
+    )
 
 
 def comma_separated_ints(s):
@@ -233,6 +239,12 @@ def parse_args():
         type=comma_separated_ints,
         default=[128, 512, 1024, 2048],
         help="comma-separated top-k values (default: 128,512,1024,2048)",
+    )
+    p.add_argument(
+        "--profile-seqlen-kv",
+        type=int,
+        default=None,
+        help="KV sequence length in profile mode (default: the selected query sequence length)",
     )
     p.add_argument("--nheads", type=int, default=64, help="number of query heads (default: 64)")
     p.add_argument(

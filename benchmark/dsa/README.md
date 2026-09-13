@@ -146,3 +146,11 @@ nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=st
 ncu --profile-from-start off -o dsa_bwd \
   python benchmark_dsa_sparse_attention_backward.py profile --seqlens 8192 --topks 2048
 ```
+
+For a single-CTA IKET or NCU trace, keep one query while retaining the full
+sparse-row loop by setting the profile-only KV sequence length independently:
+
+```bash
+python benchmark_dsa_sparse_attention_backward.py profile \
+  --seqlens 1 --profile-seqlen-kv 2048 --topks 2048 --nheads 16
+```
