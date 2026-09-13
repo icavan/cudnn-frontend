@@ -109,10 +109,10 @@ class FlashAttentionDSABackwardSm100H16:
             barrier_id=9,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
         )
-        # Orders the reduce warps dKV2/dKV3 T2R reads before the MMA warp
-        # overwrites those TMEM columns with the next iteration dKV0/dKV1
-        # (dKV2 aliases dKV0, dKV3 aliases dKV1). barrier_id 9 is taken by
-        # tmem_dealloc_barrier above, so this uses the next free slot.
+        # Orders the reduce warps' dKV2/dKV3 T2R reads before the next
+        # iteration overwrites aliased TMEM columns. D576 aliases both pairs;
+        # D512 only aliases dKV3 with dKV1. Barrier id 9 is taken by the TMEM
+        # deallocation barrier above, so this uses the next free slot.
         self.t2r_dKV23_done_barrier = pipeline.NamedBarrier(
             barrier_id=10,
             num_threads=(self.num_reduce_warps + 1) * self.threads_per_warp,
@@ -125,7 +125,10 @@ class FlashAttentionDSABackwardSm100H16:
         self.tmem_dP_offset = h_tile
         self.tmem_dKV0_offset = block_tile
         self.tmem_dKV1_offset = self.tmem_dKV0_offset + block_tile
-        self.tmem_dKV2_offset = self.tmem_dKV0_offset
+        # D512 has no 64-wide tail, so the S/dP columns are dead by the time
+        # dKV2 is issued. Reusing them makes dKV2 disjoint from dKV0 and lets
+        # both same-tile and loop-carried alias waits overlap one M128 MMA.
+        self.tmem_dKV2_offset = self.tmem_S_offset if self.same_hdim_kv else self.tmem_dKV0_offset
         self.tmem_dKV3_offset = self.tmem_dKV1_offset
         self.tmem_dQ0_offset = self.tmem_dKV3_offset + block_tile
         # dQ is M{128,64} x N16, so each persistent accumulator needs 16
@@ -1540,13 +1543,10 @@ class FlashAttentionDSABackwardSm100H16:
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
 
             # dKV0
-            # Wait for the reduce warps to finish the T2R of dKV2/dKV3 from
-            # the previous iteration before overwriting their TMEM columns:
-            # dKV0 aliases dKV2 and dKV1 aliases dKV3, and the producer_acquire
-            # above only orders against the consumer_release from two
-            # generations back (the dKV4 generation), not against the dKV2/dKV3
-            # reads of the previous generation.
-            if not is_first_mma:
+            # D576 aliases both dKV0/1 with dKV2/3, so it must wait before
+            # dKV0. D512's dKV2 is disjoint and delays the same wait until
+            # dKV1, overlapping it with the dKV0 MMA.
+            if cutlass.const_expr(not self.same_hdim_kv) and not is_first_mma:
                 self.t2r_dKV23_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
@@ -1560,6 +1560,8 @@ class FlashAttentionDSABackwardSm100H16:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV1
+            if cutlass.const_expr(self.same_hdim_kv) and not is_first_mma:
+                self.t2r_dKV23_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
@@ -1679,10 +1681,6 @@ class FlashAttentionDSABackwardSm100H16:
             load_mma_K_pipeline.consumer_release(load_mma_K_consumer_state)
             load_mma_K_consumer_state.advance()
 
-            # D512 has no disjoint tail generation: dKV2/3 overwrite the
-            # dKV0/1 ring immediately, so wait until reducers finish T2R.
-            if cutlass.const_expr(self.same_hdim_kv):
-                self.t2r_dKV4_done_barrier.arrive_and_wait()
             mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
             # dKV2
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1697,6 +1695,11 @@ class FlashAttentionDSABackwardSm100H16:
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
             # dKV3
+            # D512's dKV2 lives in the dead S/dP region, while dKV3 still
+            # aliases dKV1. Let dKV2 run before waiting for the reducers to
+            # finish the dKV0/1 T2R reads.
+            if cutlass.const_expr(self.same_hdim_kv):
+                self.t2r_dKV4_done_barrier.arrive_and_wait()
             dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
             for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
                 cute.gemm(
