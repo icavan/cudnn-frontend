@@ -77,11 +77,13 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
         self.tmem_dQ4_offset = 320
         self.tmem_dKV4_offset = 352
         if self.same_hdim_kv:
-            # Match the generic D512 ring: dKV2 occupies the dead dQ4 area,
-            # while dKV3 aliases dKV1. Keeping the oldest dKV0 generation
-            # disjoint is required for the reducer's asynchronous T2R path.
+            # D512 has no dQ4/dKV4 tail. Place both second-generation dKV
+            # fragments in that dead tail region so all four fragments are
+            # disjoint: [64, 128), [128, 192), [320, 384), [384, 448).
+            # This removes both the same-tile dKV1/dKV3 hand-off and the
+            # loop-carried dKV2/3-to-dKV0/1 alias barrier.
             self.tmem_dKV2_offset = self.tmem_dQ4_offset
-            self.tmem_dKV3_offset = self.tmem_dKV1_offset
+            self.tmem_dKV3_offset = self.tmem_dQ4_offset + self.kv_subtile
         else:
             self.tmem_dKV2_offset = self.tmem_dKV0_offset
             self.tmem_dKV3_offset = self.tmem_dKV1_offset
@@ -187,7 +189,7 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 kv_half = self.num_kv_subtiles - 1 - half_iter
                 compute_mma_P_pipeline.consumer_wait(compute_mma_P_consumer_state)
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
-                if not is_first_dkv_half:
+                if cutlass.const_expr(not self.same_hdim_kv) and not is_first_dkv_half:
                     self.t2r_dKV23_done_barrier.arrive_and_wait()
 
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -332,8 +334,6 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                         mma_reduce_dKV_pipeline.producer_commit(mma_reduce_dKV_producer_state)
                         mma_reduce_dKV_producer_state.advance()
 
-                if cutlass.const_expr(self.same_hdim_kv):
-                    self.t2r_dKV4_done_barrier.arrive_and_wait()
                 mma_reduce_dKV_pipeline.producer_acquire(mma_reduce_dKV_producer_state)
                 dOP_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 for k_block in cutlass.range(0, cute.size(tdKVrP, mode=[2]), unroll=2):
@@ -382,8 +382,10 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
             tile_index -= 1
 
-        # Balance the reducer's final one-way dKV2/3 T2R notification.
-        self.t2r_dKV23_done_barrier.arrive_and_wait()
+        # D576 aliases dKV2/3 with dKV0/1 and therefore has one final
+        # reducer-to-MMA notification to balance. D512 uses disjoint TMEM.
+        if cutlass.const_expr(not self.same_hdim_kv):
+            self.t2r_dKV23_done_barrier.arrive_and_wait()
         mma_compute_dQ_pipeline.producer_commit(mma_compute_dQ_producer_state)
         mma_compute_dQ_producer_state.advance()
         load_mma_QdO_pipeline.consumer_release(load_mma_QdO_consumer_state)
@@ -829,23 +831,12 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                                 rTopkIdx_64[i] = Int32(-1)
 
                 mma_reduce_dKV_pipeline.consumer_wait(consumer_state)
-                if cutlass.const_expr(self.same_hdim_kv):
-                    # Match the generic D512 lifetime: detach both aliased
-                    # fragments from TMEM before allowing the second producer
-                    # generation to start, then overlap their atomics.
-                    rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
-                    rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
-                    cute.arch.fence_view_async_tmem_load()
-                    self.t2r_dKV4_done_barrier.arrive_and_wait()
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
-                else:
-                    rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
-                    cute.arch.fence_view_async_tmem_load()
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                    rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
-                    cute.arch.fence_view_async_tmem_load()
-                    self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                rdKV0 = self._t2r_dKV_main(tdKVtdKV0)
+                cute.arch.fence_view_async_tmem_load()
+                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
+                rdKV1 = self._t2r_dKV_main(tdKVtdKV1)
+                cute.arch.fence_view_async_tmem_load()
+                self._reduce_dKV_main_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 if cutlass.const_expr(not self.same_hdim_kv):
@@ -861,10 +852,11 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
                 rdKV3 = self._t2r_dKV_main(tdKVtdKV3)
                 cute.arch.fence_view_async_tmem_load()
-                # T2R has detached dKV2/3 from TMEM.  Publish the lifetime
-                # boundary without waiting for the MMA warp, so rdKV3 global
-                # atomics overlap the next tile's dKV0/1 production.
-                self.t2r_dKV23_done_barrier.arrive()
+                if cutlass.const_expr(not self.same_hdim_kv):
+                    # D576 reuses these columns for the next tile's dKV0/1.
+                    # Publish the T2R lifetime boundary without waiting so
+                    # rdKV3 atomics overlap the next tile's MMA generation.
+                    self.t2r_dKV23_done_barrier.arrive()
                 mma_reduce_dKV_pipeline.consumer_release(consumer_state)
                 consumer_state.advance()
                 self._reduce_dKV_main_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)

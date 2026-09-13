@@ -24,6 +24,7 @@ _BLACKWELL_CAPABILITIES = ((10, 0), (10, 3))
 _WORKSPACE_ALIGNMENT = 128
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 
+
 def _align_workspace_bytes(num_bytes: int) -> int:
     """Round a workspace segment size up to the shared alignment boundary."""
     return -(-int(num_bytes) // _WORKSPACE_ALIGNMENT) * _WORKSPACE_ALIGNMENT

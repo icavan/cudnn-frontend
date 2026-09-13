@@ -77,6 +77,30 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_h32_d512_uses_disjoint_dkv_tmem():
+    try:
+        import cutlass
+
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward.dsa_bwd_sm100_h32 import (
+            FlashAttentionDSABackwardSm100H32,
+        )
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    kernel = FlashAttentionDSABackwardSm100H32(cutlass.BFloat16, 512, 512, 64)
+    regions = (
+        (kernel.tmem_dKV0_offset, kernel.tmem_dKV0_offset + kernel.kv_subtile),
+        (kernel.tmem_dKV1_offset, kernel.tmem_dKV1_offset + kernel.kv_subtile),
+        (kernel.tmem_dKV2_offset, kernel.tmem_dKV2_offset + kernel.kv_subtile),
+        (kernel.tmem_dKV3_offset, kernel.tmem_dKV3_offset + kernel.kv_subtile),
+    )
+
+    assert regions == ((64, 128), (128, 192), (320, 384), (384, 448))
+    assert all(lhs[1] <= rhs[0] or rhs[1] <= lhs[0] for i, lhs in enumerate(regions) for rhs in regions[i + 1 :])
+    assert max(end for _, end in regions) <= kernel.num_tmem_alloc_cols
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     """Keep deterministic scheduling policy separate from ordinary tuning."""
     try:
