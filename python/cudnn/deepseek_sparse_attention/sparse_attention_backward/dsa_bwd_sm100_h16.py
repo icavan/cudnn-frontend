@@ -66,9 +66,12 @@ class FlashAttentionDSABackwardSm100H16:
         self.dSink_num_threads = 32
 
         # =============== Bwd ====================
-        self.num_load_KV_warps = 16
+        # D512 has no 64-wide tail. Spend the four warp-groups evenly on
+        # gather and reduction so the reducers can drain one complete M32
+        # dKV slice per warp-group. D576 keeps the established 16/8 split.
+        self.num_load_KV_warps = 8 if self.same_hdim_kv else 16
         self.num_compute_warps = 4
-        self.num_reduce_warps = 8
+        self.num_reduce_warps = 16 if self.same_hdim_kv else 8
         self.reduce_rows_per_thread = block_tile // self.num_reduce_warps
 
         self.load_KV_warp_id = tuple(range(self.num_load_KV_warps))
@@ -148,7 +151,9 @@ class FlashAttentionDSABackwardSm100H16:
         # register-budget neutral across 16 loader and 8 reducer warps.
         self.num_regs_load_KV = 40
         self.num_regs_compute = 128
-        self.num_regs_reduce = 88
+        # Four D512 reducer warp-groups keep the CTA register allocation
+        # within 64 Ki registers while each group owns one M32 slice.
+        self.num_regs_reduce = 64 if self.same_hdim_kv else 88
         self.num_regs_mma = 40
         self.num_regs_empty = 40
         self.num_regs_load = 40
@@ -2235,19 +2240,24 @@ class FlashAttentionDSABackwardSm100H16:
             rdKV0 = self.t2r_dKV_half(tdKVtdKV0, 0)
             cute.arch.fence_view_async_tmem_load()
             self.reduce_dKV_half_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0, 0)
-            rdKV0 = self.t2r_dKV_half(tdKVtdKV0, 1)
-            cute.arch.fence_view_async_tmem_load()
-            self.reduce_dKV_half_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0, 8)
+            if cutlass.const_expr(self.reduce_rows_per_thread > 8):
+                rdKV0 = self.t2r_dKV_half(tdKVtdKV0, 1)
+                cute.arch.fence_view_async_tmem_load()
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0, 8)
             rdKV1 = self.t2r_dKV_half(tdKVtdKV1, 0)
             cute.arch.fence_view_async_tmem_load()
-            self.reduce_dKV_half_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1, 0)
-            rdKV1 = self.t2r_dKV_half(tdKVtdKV1, 1)
-            cute.arch.fence_view_async_tmem_load()
+            if cutlass.const_expr(self.reduce_rows_per_thread > 8):
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1, 0)
+                rdKV1 = self.t2r_dKV_half(tdKVtdKV1, 1)
+                cute.arch.fence_view_async_tmem_load()
             if cutlass.const_expr(self.same_hdim_kv):
                 self.t2r_dKV4_done_barrier.arrive_and_wait()
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
-            self.reduce_dKV_half_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1, 8)
+            if cutlass.const_expr(self.reduce_rows_per_thread > 8):
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1, 8)
+            else:
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1, 0)
 
             if cutlass.const_expr(not self.same_hdim_kv):
                 mma_reduce_dKV_pipeline.consumer_wait(mma_reduce_dKV_consumer_state)
@@ -2269,18 +2279,23 @@ class FlashAttentionDSABackwardSm100H16:
             rdKV2 = self.t2r_dKV_half(tdKVtdKV2, 0)
             cute.arch.fence_view_async_tmem_load()
             self.reduce_dKV_half_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2, 0)
-            rdKV2 = self.t2r_dKV_half(tdKVtdKV2, 1)
-            cute.arch.fence_view_async_tmem_load()
-            self.reduce_dKV_half_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2, 8)
+            if cutlass.const_expr(self.reduce_rows_per_thread > 8):
+                rdKV2 = self.t2r_dKV_half(tdKVtdKV2, 1)
+                cute.arch.fence_view_async_tmem_load()
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2, 8)
             rdKV3 = self.t2r_dKV_half(tdKVtdKV3, 0)
             cute.arch.fence_view_async_tmem_load()
-            self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 0)
-            rdKV3 = self.t2r_dKV_half(tdKVtdKV3, 1)
-            cute.arch.fence_view_async_tmem_load()
+            if cutlass.const_expr(self.reduce_rows_per_thread > 8):
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 0)
+                rdKV3 = self.t2r_dKV_half(tdKVtdKV3, 1)
+                cute.arch.fence_view_async_tmem_load()
             self.t2r_dKV23_done_barrier.arrive_and_wait()
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
             mma_reduce_dKV_consumer_state.advance()
-            self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 8)
+            if cutlass.const_expr(self.reduce_rows_per_thread > 8):
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 8)
+            else:
+                self.reduce_dKV_half_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3, 0)
 
             tile_index -= 1
 
@@ -2302,10 +2317,12 @@ class FlashAttentionDSABackwardSm100H16:
 
         cdKV = cute.make_identity_tensor((self.dOP_mma_tiler[0], self.dOP_mma_tiler[1]))
         tTR_cdKV = self.split_wg(thr_t2r_dKV.partition_D(cdKV), num_warp_groups, wg_idx)
-        tTR_cdKV = tTR_cdKV[None, None, row_half]
+        if cutlass.const_expr(num_warp_groups == 2):
+            tTR_cdKV = tTR_cdKV[None, None, row_half]
         tTR_rdKV = cute.make_rmem_tensor(tTR_cdKV.shape, self.acc_dtype)
         tTR_tdKV = self.split_wg(thr_t2r_dKV.partition_S(tdKVtdKV), num_warp_groups, wg_idx)
-        tTR_tdKV = tTR_tdKV[None, None, row_half]
+        if cutlass.const_expr(num_warp_groups == 2):
+            tTR_tdKV = tTR_tdKV[None, None, row_half]
 
         cute.copy(tiled_t2r_dKV, tTR_tdKV, tTR_rdKV)
         return tTR_rdKV

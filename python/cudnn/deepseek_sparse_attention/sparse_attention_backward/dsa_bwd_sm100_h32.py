@@ -90,6 +90,8 @@ class FlashAttentionDSABackwardSm100H32(FlashAttentionDSABackwardSm100H16):
 
         self.num_regs_load_KV = 32
         self.num_regs_compute = 160
+        if self.same_hdim_kv:
+            self.num_regs_reduce = 56
 
     @cute.jit
     def mma(
