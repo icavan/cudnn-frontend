@@ -1545,6 +1545,20 @@ def tmaldg_warp(
             chunk_idx = compute_end - cutlass.Int32(1) - rev_idx
             chunk_start = chunk_idx * cfg.b_t
 
+            # ---- entering state ------------------------------------------------------
+            # This is the largest per-chunk load and feeds the first tcgen05 MMA.
+            # Prioritize it ahead of the raw tensor loads so their preprocessing can
+            # overlap the checkpoint transaction instead of queuing it behind them.
+            if chunk_idx >= FIRST_STATE_CHUNK:
+                state_idx = state_index.idx
+                bars.mb_state_cg0_done[state_idx].wait(state_index.phase)
+                bars.mb_state_done[state_idx].wait(state_index.phase)
+                state_index = advance(state_index, cfg.smem_state_stages)
+                if elect_one:
+                    bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
+                state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
+                tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
+
             # ---- Q / K / Gate / V loads: one transaction barrier per stage -----------
             bars.mb_raw_done[raw_index.idx].wait(raw_index.phase)
             if elect_one:
@@ -1565,17 +1579,6 @@ def tmaldg_warp(
                 bars.mb_do_ready[raw_index.idx].arrive(n_bytes=cfg.tma_do_bytes)
             do_slice = tma_slice_runtime_desc(desc_do_slot, cutlass.Int32(0), head_o, chunk_start)
             tma_load_tile(sDo_tma[raw_index.idx], do_slice, bars.mb_do_ready[raw_index.idx].smem_ptr, acquire=False)
-
-            # ---- entering state ------------------------------------------------------
-            if chunk_idx >= FIRST_STATE_CHUNK:
-                state_idx = state_index.idx
-                bars.mb_state_cg0_done[state_idx].wait(state_index.phase)
-                bars.mb_state_done[state_idx].wait(state_index.phase)
-                state_index = advance(state_index, cfg.smem_state_stages)
-                if elect_one:
-                    bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
-                state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
-                tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
         tile_idx = next_tile
