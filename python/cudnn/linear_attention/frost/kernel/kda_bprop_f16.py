@@ -133,6 +133,9 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 
 USE_PDL = True
+# Keep a conservative worker pool for device-generated split items while
+# right-sizing the physical grid for the target small-batch pretraining shapes.
+BPROP_GRID_FLOOR = 96
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
@@ -3408,7 +3411,12 @@ def host(
 
     # ---- launch ----------------------------------------------------------------------
     n_desc = num_sequences
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    work_items_without_splits = cutlass.Int32(num_sequences) * cutlass.Int32(beta.shape[1])
+    grid_clusters = cutlass.min(
+        cutlass.Int32(cfg.max_active_clusters),
+        cutlass.max(cutlass.Int32(BPROP_GRID_FLOOR), work_items_without_splits),
+    )
+    grid_shape = (grid_clusters, 1, 1)
     frost_kda_bprop(
         cfg,
         q_ratio,
