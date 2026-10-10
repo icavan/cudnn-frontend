@@ -78,9 +78,9 @@ def resolve_stream(
     """Return an explicit driver stream without constructing a torch Stream.
 
     ``device`` identifies the operand device when it may differ from torch's
-    current device.  The raw-current fast path avoids a roughly 1.5 us Python
-    wrapper construction on every frontend launch.  An implicit PTDS sentinel
-    is rejected because it is not a process-wide allocator identity.
+    current device.  The raw-current fast path avoids constructing a torch
+    Stream wrapper on every frontend launch.  An implicit PTDS sentinel is
+    rejected because it is not a process-wide allocator identity.
     """
     if current_stream is not None:
         return current_stream

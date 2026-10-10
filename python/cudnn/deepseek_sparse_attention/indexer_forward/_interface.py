@@ -432,7 +432,11 @@ def _indexer_fwd_bound(
     _out_validated: bool = False,
 ) -> torch.Tensor:
     """Strict dense entry (what ``IndexerForward.execute`` calls): binds a validated padded-stride ``out``
-    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``."""
+    directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``.
+
+    ``_out_validated`` is internal-only and may be set only by the convenience
+    path after it has validated the same live output view.
+    """
     current_stream = resolve_stream(current_stream)
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):

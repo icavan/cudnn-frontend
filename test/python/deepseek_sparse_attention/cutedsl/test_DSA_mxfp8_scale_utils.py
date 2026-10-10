@@ -226,6 +226,11 @@ def test_minimal_padded_token_capacity_host_only(total_tokens, num_sequences, al
     assert mxfp8_scale_utils.minimal_padded_token_capacity(total_tokens, num_sequences, alignment) == expected
 
 
+def test_minimal_padded_token_capacity_rejects_tokens_without_sequences_host_only():
+    with pytest.raises(ValueError, match="num_sequences must be positive"):
+        mxfp8_scale_utils.minimal_padded_token_capacity(1, 0, 128)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
     device = torch.device("cuda")
@@ -387,6 +392,34 @@ def test_mxfp8_scale_pack_cuda_honors_explicit_stream():
     torch.cuda.current_stream().wait_stream(side)
 
     assert torch.equal(out.cpu(), reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_reference_fallback_honors_explicit_stream():
+    cuda = pytest.importorskip("cuda.bindings.driver")
+    storage = torch.arange(129 * 64 * 5 * 2, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 10)
+    q = storage[..., ::2]
+    assert not q.is_contiguous()
+    reference = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu().contiguous(), 64)
+    out = torch.empty(reference.shape, dtype=torch.uint8, device="cuda")
+    out.fill_(0xA5)
+    side = torch.cuda.Stream()
+    verifier = torch.cuda.Stream()
+    observed = torch.empty_like(reference, pin_memory=True)
+    mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=torch.empty_like(out))
+    torch.cuda.synchronize()
+
+    # Delay the ambient stream. A fallback that ignores the explicit stream
+    # leaves ``out`` poisoned when the verifier consumes it after ``side``.
+    torch.cuda._sleep(50_000_000)
+    mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=out, stream=cuda.CUstream(side.cuda_stream))
+    verifier.wait_stream(side)
+    with torch.cuda.stream(verifier):
+        observed.copy_(out, non_blocking=True)
+    verifier.synchronize()
+
+    assert torch.equal(observed, reference)
+    torch.cuda.synchronize()
 
 
 def test_mxfp8_scale_pack_thd_custom_256_padding_host_only():

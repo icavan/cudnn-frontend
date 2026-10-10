@@ -15,7 +15,7 @@ import math
 import torch
 
 from cudnn._torch_stream import device_context, record_streams
-from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div as _ceil_div, resolve_stream
+from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div as _ceil_div, resolve_stream, torch_stream_context
 
 _ATOM_MN = 128
 _ATOM_K = 4
@@ -89,6 +89,8 @@ def minimal_padded_token_capacity(
         raise ValueError("total_tokens must be nonnegative")
     if num_sequences < 0:
         raise ValueError("num_sequences must be nonnegative")
+    if num_sequences == 0 and total_tokens != 0:
+        raise ValueError("num_sequences must be positive when total_tokens is nonzero")
     if token_alignment <= 0:
         raise ValueError("token_alignment must be positive")
     return ((int(total_tokens) + (int(token_alignment) - 1) * int(num_sequences)) // int(token_alignment)) * int(token_alignment)
@@ -347,10 +349,12 @@ def pack_blockscaled_scale_mkl(
             source_layout="mkl",
             stream=stream,
         )
-    packed.zero_()
-    idx = _blockscaled_indices(mn, sf_groups, l_size, device=scale_mkl.device)
-    packed.reshape(-1)[idx.reshape(-1)] = scale_mkl.permute(2, 0, 1).reshape(-1)
-    return packed.contiguous()
+    with torch_stream_context(stream, scale_mkl.device):
+        record_streams((scale_mkl, packed), stream, scale_mkl.device)
+        packed.zero_()
+        idx = _blockscaled_indices(mn, sf_groups, l_size, device=scale_mkl.device)
+        packed.reshape(-1)[idx.reshape(-1)] = scale_mkl.permute(2, 0, 1).reshape(-1)
+        return packed.contiguous()
 
 
 def unpack_blockscaled_scale_mkl(
@@ -525,7 +529,9 @@ def pack_q_scale_bshd(
             n_heads_kv=n_heads_kv,
             qhead_per_kv_head=qhead_per_kv_head,
         )
-    return pack_blockscaled_scale_mkl(logical_q_scale_to_mkl(q_scale, qhead_per_kv_head), out=packed, stream=stream)
+    with torch_stream_context(stream, q_scale.device):
+        record_streams((q_scale, packed), stream, q_scale.device)
+        return pack_blockscaled_scale_mkl(logical_q_scale_to_mkl(q_scale, qhead_per_kv_head), out=packed, stream=stream)
 
 
 def pack_k_scale_bshd(
@@ -563,7 +569,9 @@ def pack_k_scale_bshd(
             seq_len=seqlen_k,
             n_heads_kv=n_heads_kv,
         )
-    return pack_blockscaled_scale_mkl(logical_k_scale_to_mkl(k_scale), out=packed, stream=stream)
+    with torch_stream_context(stream, k_scale.device):
+        record_streams((k_scale, packed), stream, k_scale.device)
+        return pack_blockscaled_scale_mkl(logical_k_scale_to_mkl(k_scale), out=packed, stream=stream)
 
 
 def pack_qk_scale_bshd(
@@ -670,7 +678,12 @@ def pack_q_scale_thd(
     ``stream`` is an optional CUDA driver stream and otherwise means PyTorch's
     current stream on the input device.  The caller-owned path records all
     buffer lifetimes on that stream and is CUDA-graph capturable after the
-    first JIT compile.
+    first JIT compile.  Both prefix tensors are contiguous CUDA int32 arrays of
+    length ``B+1`` on the input device.  ``cu_seqlens_q`` starts at zero, ends
+    at ``total_q``, and is nondecreasing; the padded prefix starts at zero, is
+    nondecreasing, and each span covers its logical sequence with the required
+    Q-token alignment.  Those device values are a caller contract and are not
+    read back for host validation on the asynchronous path.
     """
     if q_scale.ndim != 3:
         raise ValueError(f"q_scale must have shape (total_q, H_q, sf_groups), got {tuple(q_scale.shape)}")
@@ -698,16 +711,18 @@ def pack_q_scale_thd(
             cu_seqlens=cu_seqlens_q,
             cu_seqlens_scale_padded=cu_seqlens_q_scale_padded,
         )
-    return pack_blockscaled_scale_mkl(
-        logical_q_scale_to_mkl_thd(
-            q_scale,
-            cu_seqlens_q,
-            cu_seqlens_q_scale_padded,
-            qhead_per_kv_head,
-        ),
-        out=out,
-        stream=stream,
-    )
+    with torch_stream_context(stream, q_scale.device):
+        record_streams((q_scale, out, cu_seqlens_q, cu_seqlens_q_scale_padded), stream, q_scale.device)
+        return pack_blockscaled_scale_mkl(
+            logical_q_scale_to_mkl_thd(
+                q_scale,
+                cu_seqlens_q,
+                cu_seqlens_q_scale_padded,
+                qhead_per_kv_head,
+            ),
+            out=out,
+            stream=stream,
+        )
 
 
 def pack_k_scale_thd(
@@ -730,7 +745,12 @@ def pack_k_scale_thd(
     ``stream`` is an optional CUDA driver stream and otherwise means PyTorch's
     current stream on the input device.  The caller-owned path records all
     buffer lifetimes on that stream and is CUDA-graph capturable after the
-    first JIT compile.
+    first JIT compile.  Both prefix tensors are contiguous CUDA int32 arrays of
+    length ``B+1`` on the input device.  ``cu_seqlens_k`` starts at zero, ends
+    at ``total_k``, and is nondecreasing; the padded prefix starts at zero, is
+    nondecreasing, and each span covers its logical sequence with 128-token
+    alignment.  Those device values are a caller contract and are not read
+    back for host validation on the asynchronous path.
     """
     if k_scale.ndim != 3:
         raise ValueError(f"k_scale must have shape (total_k, H_kv, sf_groups), got {tuple(k_scale.shape)}")
@@ -752,12 +772,14 @@ def pack_k_scale_thd(
             cu_seqlens=cu_seqlens_k,
             cu_seqlens_scale_padded=cu_seqlens_k_scale_padded,
         )
-    return pack_blockscaled_scale_mkl(
-        logical_k_scale_to_mkl_thd(
-            k_scale,
-            cu_seqlens_k,
-            cu_seqlens_k_scale_padded,
-        ),
-        out=out,
-        stream=stream,
-    )
+    with torch_stream_context(stream, k_scale.device):
+        record_streams((k_scale, out, cu_seqlens_k, cu_seqlens_k_scale_padded), stream, k_scale.device)
+        return pack_blockscaled_scale_mkl(
+            logical_k_scale_to_mkl_thd(
+                k_scale,
+                cu_seqlens_k,
+                cu_seqlens_k_scale_padded,
+            ),
+            out=out,
+            stream=stream,
+        )

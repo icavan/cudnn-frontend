@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -24,7 +23,6 @@ from .compactify import compactify as _compactify
 _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
-@lru_cache(maxsize=1)
 def _kernel_module():
     from . import indexer_top_k_decode_varlen
 
