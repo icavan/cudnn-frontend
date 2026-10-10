@@ -8,7 +8,7 @@ from typing import Optional
 
 import torch
 
-from cudnn._torch_stream import record_streams, stream_context
+from cudnn._torch_stream import _raw_current_stream, _reject_per_thread_stream, record_streams, stream_context
 import cuda.bindings.driver as cuda
 
 
@@ -29,8 +29,9 @@ def device_capability(device=None) -> tuple[int, int]:
     return _device_capability(index)
 
 
-def device_major() -> int:
-    return device_capability()[0]
+def device_major(device=None) -> int:
+    """Return the CUDA compute-capability major for ``device`` or the current device."""
+    return device_capability(device)[0]
 
 
 def maybe_contiguous(
@@ -70,10 +71,24 @@ def validate_q_causal_offsets(
         return q_causal_offsets.contiguous()
 
 
-def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstream:
+def resolve_stream(
+    current_stream: Optional[cuda.CUstream] = None,
+    device=None,
+) -> cuda.CUstream:
+    """Return an explicit driver stream without constructing a torch Stream.
+
+    ``device`` identifies the operand device when it may differ from torch's
+    current device.  The raw-current fast path avoids a roughly 1.5 us Python
+    wrapper construction on every frontend launch.  An implicit PTDS sentinel
+    is rejected because it is not a process-wide allocator identity.
+    """
     if current_stream is not None:
         return current_stream
-    return cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
+    raw = _raw_current_stream(torch, device)
+    if raw is not None:
+        _reject_per_thread_stream(raw)
+        return cuda.CUstream(raw)
+    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
 def torch_stream_context(current_stream: Optional[cuda.CUstream] = None, device=None):

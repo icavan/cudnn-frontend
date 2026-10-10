@@ -44,6 +44,35 @@ def test_implicit_per_thread_current_stream_is_rejected(monkeypatch):
         launch_stream(None, 0)
 
 
+@pytest.mark.parametrize("raw", [0, 1])
+def test_implicit_legacy_launch_stream_uses_default_stream_directly(monkeypatch, raw):
+    expected = object()
+    monkeypatch.setattr("cudnn._torch_stream._raw_current_stream", lambda *args: raw)
+    monkeypatch.setattr(torch.cuda, "default_stream", lambda device: expected)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *args: (_ for _ in ()).throw(AssertionError("legacy current stream should use default_stream directly")),
+    )
+
+    assert launch_stream(None, 0) is expected
+
+
+@pytest.mark.parametrize("requested", [0, 1, cuda.CUstream(0), cuda.CUstream(1)])
+@pytest.mark.parametrize("current", [0, 1])
+def test_legacy_stream_context_is_noop_when_legacy_stream_is_current(monkeypatch, requested, current):
+    monkeypatch.setattr("cudnn._torch_stream._raw_current_stream", lambda *args: current)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("an already-current legacy stream must not build a torch stream context")
+
+    for name in ("default_stream", "current_stream", "ExternalStream", "stream"):
+        monkeypatch.setattr(torch.cuda, name, refuse)
+
+    with stream_context(requested, 0):
+        pass
+
+
 def test_implicit_stream_records_source_lifetime(monkeypatch):
     from cudnn._torch_stream import record_streams
 

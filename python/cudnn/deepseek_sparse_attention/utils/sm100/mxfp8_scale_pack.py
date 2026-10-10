@@ -8,6 +8,7 @@ F8_128x4 layout.  This module copies those bytes directly from the caller's
 logical BSHD, THD, or MKL tensor into the packed layout.  Padding bytes are
 written as ``0x00`` by the same launch, so callers do not need an index tensor,
 an intermediate permuted tensor, or a separate zero-fill launch.
+The paired BSHD entry packs Q and K into separate outputs with one launch.
 
 All extents are runtime scalars.  Compiled artifacts are keyed only by source
 layout and Q-head packing, not by batch size or sequence length.
@@ -131,6 +132,85 @@ def _pack_kernel(
 _pack_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+@cute.kernel
+def _pack_qk_bshd_kernel(
+    q_src,
+    k_src,
+    q_dst,
+    k_dst,
+    q_mn,
+    k_mn,
+    sf_groups,
+    l_size,
+    q_seq_len,
+    k_seq_len,
+    n_heads_kv,
+    qhead_per_kv_head: cutlass.Constexpr,
+):
+    """Pack BSHD Q and K scales in one launch, one 16-byte line per thread."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    line_idx = cutlass.Int64(bidx) * _THREADS + cutlass.Int64(tidx)
+
+    sf_tiles = (sf_groups + _ATOM_COLS - 1) // _ATOM_COLS
+    q_lines_per_l = ((q_mn + _ATOM_ROWS - 1) // _ATOM_ROWS) * sf_tiles * _LINES_PER_ATOM
+    k_lines_per_l = ((k_mn + _ATOM_ROWS - 1) // _ATOM_ROWS) * sf_tiles * _LINES_PER_ATOM
+    q_total_lines = l_size * q_lines_per_l
+    total_lines = q_total_lines + l_size * k_lines_per_l
+
+    q_source = cutlass.make_array_view(cute.make_tensor(q_src, cute.make_layout((q_mn * sf_groups * l_size,), stride=(1,))))
+    k_source = cutlass.make_array_view(cute.make_tensor(k_src, cute.make_layout((k_mn * sf_groups * l_size,), stride=(1,))))
+    q_target = cutlass.make_array_view(cute.make_tensor(q_dst, cute.make_layout((q_total_lines * _BYTES_PER_LINE,), stride=(1,))))
+    k_target = cutlass.make_array_view(cute.make_tensor(k_dst, cute.make_layout(((total_lines - q_total_lines) * _BYTES_PER_LINE,), stride=(1,))))
+
+    if line_idx < q_total_lines:
+        l_idx = line_idx // q_lines_per_l
+        line_in_l = line_idx - l_idx * q_lines_per_l
+        atom = line_in_l // _LINES_PER_ATOM
+        m0 = line_in_l - atom * _LINES_PER_ATOM
+        m_tile = atom // sf_tiles
+        sf_tile = atom - m_tile * sf_tiles
+        dst_base = l_idx * q_lines_per_l * _BYTES_PER_LINE + line_in_l * _BYTES_PER_LINE
+        batch = l_idx // n_heads_kv
+        kv_head = l_idx - batch * n_heads_kv
+
+        for m1 in cutlass.range_constexpr(4):
+            m = m_tile * _ATOM_ROWS + m1 * _LINES_PER_ATOM + m0
+            for k0 in cutlass.range_constexpr(4):
+                sf = sf_tile * _ATOM_COLS + k0
+                value = cutlass.Uint8(0)
+                if m < q_mn and sf < sf_groups:
+                    token = m // qhead_per_kv_head
+                    q_head = kv_head * qhead_per_kv_head + m % qhead_per_kv_head
+                    src_idx = ((batch * q_seq_len + token) * (n_heads_kv * qhead_per_kv_head) + q_head) * sf_groups + sf
+                    value = cutlass.Uint8(q_source[src_idx])
+                q_target[dst_base + m1 * _ATOM_COLS + k0] = value
+    elif line_idx < total_lines:
+        k_line_idx = line_idx - q_total_lines
+        l_idx = k_line_idx // k_lines_per_l
+        line_in_l = k_line_idx - l_idx * k_lines_per_l
+        atom = line_in_l // _LINES_PER_ATOM
+        m0 = line_in_l - atom * _LINES_PER_ATOM
+        m_tile = atom // sf_tiles
+        sf_tile = atom - m_tile * sf_tiles
+        dst_base = l_idx * k_lines_per_l * _BYTES_PER_LINE + line_in_l * _BYTES_PER_LINE
+        batch = l_idx // n_heads_kv
+        kv_head = l_idx - batch * n_heads_kv
+
+        for m1 in cutlass.range_constexpr(4):
+            m = m_tile * _ATOM_ROWS + m1 * _LINES_PER_ATOM + m0
+            for k0 in cutlass.range_constexpr(4):
+                sf = sf_tile * _ATOM_COLS + k0
+                value = cutlass.Uint8(0)
+                if m < k_mn and sf < sf_groups:
+                    src_idx = ((batch * k_seq_len + m) * n_heads_kv + kv_head) * sf_groups + sf
+                    value = cutlass.Uint8(k_source[src_idx])
+                k_target[dst_base + m1 * _ATOM_COLS + k0] = value
+
+
+_pack_qk_bshd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _pack_host(
     src,
@@ -166,6 +246,41 @@ def _pack_host(
     ).launch(grid=((total_lines + _THREADS - 1) // _THREADS, 1, 1), block=(_THREADS, 1, 1), stream=stream)
 
 
+@cute.jit
+def _pack_qk_bshd_host(
+    q_src,
+    k_src,
+    q_dst,
+    k_dst,
+    q_mn,
+    k_mn,
+    sf_groups,
+    l_size,
+    q_seq_len,
+    k_seq_len,
+    n_heads_kv,
+    qhead_per_kv_head: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
+    sf_tiles = (sf_groups + _ATOM_COLS - 1) // _ATOM_COLS
+    q_lines = l_size * ((q_mn + _ATOM_ROWS - 1) // _ATOM_ROWS) * sf_tiles * _LINES_PER_ATOM
+    k_lines = l_size * ((k_mn + _ATOM_ROWS - 1) // _ATOM_ROWS) * sf_tiles * _LINES_PER_ATOM
+    _pack_qk_bshd_kernel(
+        q_src,
+        k_src,
+        q_dst,
+        k_dst,
+        q_mn,
+        k_mn,
+        sf_groups,
+        l_size,
+        q_seq_len,
+        k_seq_len,
+        n_heads_kv,
+        qhead_per_kv_head,
+    ).launch(grid=((q_lines + k_lines + _THREADS - 1) // _THREADS, 1, 1), block=(_THREADS, 1, 1), stream=stream)
+
+
 def _pointer(dtype):
     return cute.runtime.make_ptr(dtype, 1, cute.AddressSpace.gmem, assumed_align=1)
 
@@ -189,6 +304,30 @@ def _compile(source_layout: int, qhead_per_kv_head: int, device_index: int):
         cutlass.Int64(0),
         cutlass.Int64(0),
         source_layout,
+        qhead_per_kv_head,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options=compile_options("--opt-level 3"),
+    )
+
+
+@lru_cache(maxsize=None)
+def _compile_qk_bshd(qhead_per_kv_head: int, device_index: int):
+    """Compile the shape-generic paired BSHD packer for one device."""
+    del device_index  # Cache partition only; compile_options resolves the active device.
+    null_u8 = _pointer(cutlass.Uint8)
+    return cute.compile(
+        _pack_qk_bshd_host,
+        null_u8,
+        null_u8,
+        null_u8,
+        null_u8,
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
         qhead_per_kv_head,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=compile_options("--opt-level 3"),
@@ -251,5 +390,47 @@ def _launch_pack(
         cutlass.Int64(int(seq_len)),
         cutlass.Int64(int(n_heads_kv)),
         cutlass.Int64(int(num_sequences)),
+        stream,
+    )
+
+
+def _launch_qk_bshd_pack(
+    q_src,
+    k_src,
+    q_dst,
+    k_dst,
+    *,
+    q_mn: int,
+    k_mn: int,
+    sf_groups: int,
+    l_size: int,
+    q_seq_len: int,
+    k_seq_len: int,
+    n_heads_kv: int,
+    qhead_per_kv_head: int,
+    stream: cuda.CUstream,
+) -> None:
+    """Launch the paired raw-byte BSHD packer into validated outputs.
+
+    Q/K inputs and outputs are contiguous one-byte CUDA tensors.  Runtime
+    extents do not participate in the compile key; only Q heads per KV head
+    and device select the compiled artifact.  After first compile this call is
+    asynchronous, allocation-free, and mutates both destination tensors.
+    """
+    if q_dst.numel() == 0 and k_dst.numel() == 0:
+        return
+    compiled = _compile_qk_bshd(int(qhead_per_kv_head), q_src.device.index)
+    compiled(
+        q_src.data_ptr(),
+        k_src.data_ptr(),
+        q_dst.data_ptr(),
+        k_dst.data_ptr(),
+        cutlass.Int64(int(q_mn)),
+        cutlass.Int64(int(k_mn)),
+        cutlass.Int64(int(sf_groups)),
+        cutlass.Int64(int(l_size)),
+        cutlass.Int64(int(q_seq_len)),
+        cutlass.Int64(int(k_seq_len)),
+        cutlass.Int64(int(n_heads_kv)),
         stream,
     )

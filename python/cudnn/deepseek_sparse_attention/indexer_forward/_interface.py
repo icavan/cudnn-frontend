@@ -364,6 +364,7 @@ def indexer_fwd(
         cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
         current_stream=current_stream,
+        _out_validated=True,
     )
     return _finish_dense_out(out, out_orig, need_pad=need_pad, current_stream=current_stream)
 
@@ -391,6 +392,8 @@ def _finish_dense_out(
     current_stream=None,
 ) -> torch.Tensor:
     """Copy a staged result back into the caller's ``out`` (identity kept) or make an allocated padded view contiguous."""
+    if out_orig is out or (out_orig is None and not need_pad):
+        return out
     with _torch_stream_context(current_stream):
         if out_orig is not None and out_orig is not out:
             copy_into_on_stream(out_orig, out, current_stream, out_orig.device)  # R1 staging: the destination is recorded first
@@ -426,6 +429,7 @@ def _indexer_fwd_bound(
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
     sf_vec_size: int = 32,
     current_stream=None,
+    _out_validated: bool = False,
 ) -> torch.Tensor:
     """Strict dense entry (what ``IndexerForward.execute`` calls): binds a validated padded-stride ``out``
     directly; never allocates, never copies, raises on strided inputs or an unbindable ``out``."""
@@ -560,7 +564,8 @@ def _indexer_fwd_bound(
             f"indexer_fwd requires out: allocate {(*out_shape[:-1], padded_seqlen_k(seqlen_k_dim))} fp32 and pass "
             f"out[..., :{seqlen_k_dim}] (indexer_forward_wrapper allocates it for you)"
         )
-    _validate_out_view(out, out_shape, seqlen_k_dim, device)
+    if not _out_validated:
+        _validate_out_view(out, out_shape, seqlen_k_dim, device)
 
     if precision == "mxfp8":
         assert q_scale is not None and k_scale is not None

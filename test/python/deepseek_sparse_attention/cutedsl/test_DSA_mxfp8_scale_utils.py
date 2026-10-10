@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-only tests for the SM100 MXFP8 scale-layout contract."""
+"""Tests for the SM100 MXFP8 scale-layout contract."""
 
 import pytest
 import torch
@@ -112,6 +112,21 @@ def test_mxfp8_scale_pack_order_bshd_k_l_dimension_host_only():
     k_packed = mxfp8_scale_utils.pack_k_scale_bshd(k_scale)
     k_unpacked = mxfp8_scale_utils.unpack_blockscaled_scale_mkl(k_packed, mn=3, sf_groups=4)
     assert torch.equal(k_unpacked, k_mkl)
+
+
+def test_mxfp8_scale_pack_qk_bshd_matches_individual_packers_host_only():
+    bs, sq, sk, hq, hkv, groups, qhpkv = 2, 3, 5, 8, 2, 5, 4
+    q = torch.arange(bs * sq * hq * groups, dtype=torch.int64).reshape(bs, sq, hq, groups)
+    k = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).reshape(bs, sk, hkv, groups)
+
+    q_packed, k_packed = mxfp8_scale_utils.pack_qk_scale_bshd(
+        q,
+        k,
+        qhead_per_kv_head=qhpkv,
+    )
+
+    assert torch.equal(q_packed, mxfp8_scale_utils.pack_q_scale_bshd(q, qhpkv))
+    assert torch.equal(k_packed, mxfp8_scale_utils.pack_k_scale_bshd(k))
 
 
 def test_mxfp8_scale_pack_order_thd_with_padding_host_only():
@@ -226,6 +241,72 @@ def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
 
     assert mxfp8_scale_utils.pack_q_scale_bshd(q_cuda, qhpkv, out=q_out) is q_out
     assert mxfp8_scale_utils.pack_k_scale_bshd(k_cuda, out=k_out) is k_out
+    torch.cuda.synchronize()
+
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
+    device = torch.device("cuda")
+    bs, sq, sk, hq, hkv, groups, qhpkv = 2, 131, 259, 64, 1, 5, 64
+    q_cpu = torch.arange(bs * sq * hq * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sq, hq, groups)
+    k_cpu = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sk, hkv, groups)
+    q_ref = mxfp8_scale_utils.pack_q_scale_bshd(q_cpu, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_bshd(k_cpu)
+    q = q_cpu.to(device)
+    k = k_cpu.to(device)
+    q_out = torch.empty_like(q_ref, device=device)
+    k_out = torch.empty_like(k_ref, device=device)
+
+    actual_q, actual_k = mxfp8_scale_utils.pack_qk_scale_bshd(
+        q,
+        k,
+        qhead_per_kv_head=qhpkv,
+        q_out=q_out,
+        k_out=k_out,
+    )
+    torch.cuda.synchronize()
+
+    assert actual_q is q_out
+    assert actual_k is k_out
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_qk_bshd_cuda_is_async_graph_capturable_and_honors_stream():
+    cuda = pytest.importorskip("cuda.bindings.driver")
+    q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
+    k = torch.arange(259 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 259, 1, 5)
+    q_ref = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu(), 64)
+    k_ref = mxfp8_scale_utils.pack_k_scale_bshd(k.cpu())
+    q_out = torch.empty_like(q_ref, device="cuda")
+    k_out = torch.empty_like(k_ref, device="cuda")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        mxfp8_scale_utils.pack_qk_scale_bshd(
+            q,
+            k,
+            64,
+            q_out=q_out,
+            k_out=k_out,
+            stream=cuda.CUstream(side.cuda_stream),
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.current_stream().wait_stream(side)
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mxfp8_scale_utils.pack_qk_scale_bshd(q, k, 64, q_out=q_out, k_out=k_out)
+    graph.replay()
     torch.cuda.synchronize()
 
     assert torch.equal(q_out.cpu(), q_ref)

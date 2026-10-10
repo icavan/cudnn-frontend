@@ -99,9 +99,10 @@ def stream_context(stream, device=None, *, verify_current: bool = False) -> Iter
 
     handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
     _reject_per_thread_stream(handle)
-    if not verify_current and handle not in DEFAULT_STREAM_HANDLES:
+    if not verify_current:
         raw = _raw_current_stream(torch, device)
-        if raw is not None and handle == raw:
+        same_legacy_stream = handle in DEFAULT_STREAM_HANDLES and raw in DEFAULT_STREAM_HANDLES
+        if raw is not None and (handle == raw or same_legacy_stream):
             yield
             return
     with torch.cuda.stream(as_torch_stream(stream, device)):
@@ -115,9 +116,12 @@ def launch_stream(stream, device=None):
 
     index = _device_index(torch, device)
     if stream is None:
-        stream = _raw_current_stream(torch, index)
-        if stream is None:
-            return torch.cuda.current_stream(index)
+        raw = _raw_current_stream(torch, index)
+        if raw is not None:
+            _reject_per_thread_stream(raw)
+            if raw in DEFAULT_STREAM_HANDLES:
+                return torch.cuda.default_stream(index)
+        return torch.cuda.current_stream(index)
     return as_torch_stream(stream, index)
 
 

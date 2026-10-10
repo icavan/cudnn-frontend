@@ -253,7 +253,7 @@ def indexer_forward_wrapper(
     convenience (one copy kernel each). ``IndexerForward`` itself declines all
     of that in ``check_support()`` and binds only a padded-stride ``out``.
     """
-    if device_major() == 9:
+    if device_major(q.device) == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
             raise NotImplementedError("MXFP8 scale padded cu_seqlens are only supported on SM100+")
         unsupported = []
