@@ -175,6 +175,7 @@ class KdaBpropBars(NamedTuple):
     mb_q_decay_ready: MBarrier
     mb_decay_done: MBarrier
     mb_decay_scale_ready: MBarrier
+    mb_decay_scale_done: MBarrier
     mb_t_inv_ready: MBarrier
     mb_t_inv_done: MBarrier
     mb_a_ready: MBarrier
@@ -254,6 +255,7 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_q_decay_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
         mb_decay_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=MMA, producer=Producer.MMA_COMMIT),
         mb_decay_scale_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
+        mb_decay_scale_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG1, producer=Producer.THREAD),
         mb_t_inv_ready=MBarrier(
             alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=WARP, producer=Producer.THREAD
         ),
@@ -1813,6 +1815,7 @@ def compute0_warp_group(
             # ---- decay-slot guard ----------------------------------------------------
             operand_done_phase = ((chunk_serial // cfg.smem_decay_stages) + 1) % 2
             bars.mb_decay_done[decay_stage].wait(operand_done_phase)
+            bars.mb_decay_scale_done[decay_stage].wait(operand_done_phase)
 
             # ---- decay scale: exp2(g last) per key channel ---------------------------
             if channel_active:
@@ -2093,14 +2096,14 @@ def compute1_warp_group(
         num_compute_chunks = compute_end - write_start
 
         # ---- dstate seed: GMEM -> TMEM + SMEM ----------------------------------------
-        if cutlass.const_expr(cfg.use_dstate_in):
-            if num_compute_chunks > 0:
+        if num_compute_chunks > 0:
+            seed_stage = chunk_serial_base % cfg.smem_decay_stages
+            bars.mb_decay_scale_ready[seed_stage].wait((chunk_serial_base // cfg.smem_decay_stages) % 2)
+            if cutlass.const_expr(cfg.use_dstate_in):
                 seed_true = compute_end == batch_num_chunks
                 bars.mb_dstate_smem_done.wait(dstate_smem_done_index.phase)
                 bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
                 dstate_smem_done_index = advance(dstate_smem_done_index, 1)
-                seed_stage = chunk_serial_base % cfg.smem_decay_stages
-                bars.mb_decay_scale_ready[seed_stage].wait((chunk_serial_base // cfg.smem_decay_stages) % 2)
                 seed_scale_ptr = sDecay_scale_raw.data_ptr() + seed_stage * cfg.d_k
                 row_lo_addr = tmem_row << 16
                 seed_vw = 16 // (mDstate_in.element_type.width // 8)
@@ -2132,6 +2135,7 @@ def compute1_warp_group(
                         seed_pack[0:8],
                     )
                 nvvm.tcgen05_wait("store")
+                bars.mb_decay_scale_done[seed_stage].arrive()
                 bars.mb_dstate_input_ready.arrive()
 
                 # ---- dstate seed: TMEM -> sDstate ------------------------------------
@@ -2150,6 +2154,10 @@ def compute1_warp_group(
                             (sDstate_raw.data_ptr() + h_addr).store(h_vec, alignment=16)
                 nvvm.fence_proxy("async.shared", space="cta")
                 bars.mb_dstate_smem_ready.arrive()
+            else:
+                # Even without a seed, acknowledge the ready phase before this
+                # stage can be reused; PTX requires one successful wait per phase.
+                bars.mb_decay_scale_done[seed_stage].arrive()
 
         for rev_idx in cutlass.range(num_compute_chunks, unroll=1):
             chunk_idx = compute_end - cutlass.Int32(1) - rev_idx
@@ -2462,6 +2470,7 @@ def compute1_warp_group(
                         dstate_scaled[0:32],
                     )
                 nvvm.tcgen05_wait("store")
+                bars.mb_decay_scale_done[next_stage].arrive()
                 bars.mb_dstate_input_ready.arrive()
 
                 # ---- dstate input: TMEM -> sDstate -----------------------------------
@@ -3699,6 +3708,7 @@ def frost_kda_bprop(
                 bars.mb_q_decay_ready[stage].init()
                 bars.mb_decay_done[stage].init()
                 bars.mb_decay_scale_ready[stage].init()
+                bars.mb_decay_scale_done[stage].init()
             for stage in cutlass.range_constexpr(cfg.tmem_qk_raw_stages):
                 bars.mb_qk_raw_ready[stage].init()
                 bars.mb_qk_raw_done[stage].init()

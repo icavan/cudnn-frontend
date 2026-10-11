@@ -51,3 +51,16 @@ def test_kda_backward_tma_stores_are_elected_but_group_completion_is_warp_wide()
     assert not any(_is_inside_elect_one(call, parents) for call in waits)
     assert len(done_arrivals) == 4
     assert not any(_is_inside_elect_one(call, parents) for call in done_arrivals)
+
+
+@pytest.mark.parametrize("kernel", ["kda_bprop_f16.py", "kda_bprop_summary_f16.py"])
+def test_kda_backward_decay_scale_stage_waits_for_all_readers(kernel):
+    source = (Path(__file__).resolve().parents[4] / "python" / "cudnn" / "linear_attention" / "frost" / "kernel" / kernel).read_text()
+
+    assert "mb_decay_scale_done: MBarrier" in source
+    assert "mb_decay_scale_done=MBarrier(alloc(cfg.smem_decay_stages)" in source
+    assert "init_count=CG1, producer=Producer.THREAD" in source
+    assert "bars.mb_decay_scale_done[decay_stage].wait(operand_done_phase)" in source
+    assert "bars.mb_decay_scale_done[seed_stage].arrive()" in source
+    assert "bars.mb_decay_scale_done[next_stage].arrive()" in source
+    assert "bars.mb_decay_scale_done[stage].init()" in source
