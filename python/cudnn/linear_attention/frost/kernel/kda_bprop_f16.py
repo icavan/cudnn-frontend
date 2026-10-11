@@ -580,29 +580,35 @@ def epilogue_warp(
 
             # ---- dQ/dK/dGate/dV: one-behind store ladder -----------------------------
             if rev_idx > 0:
+                # A TMA store is issued once per warp.  Commit/wait and the
+                # 32-thread completion barriers below intentionally stay warp-wide.
                 bars.mb_dq_tmastg_ready[dq_index.idx].wait(dq_index.phase)
                 if pend_writes:
                     desc_dq_slot = (desc_dq_base + slot).tospace(cutlass.AddressSpace.generic)
                     dq_slice = tma_slice_runtime_desc(desc_dq_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDq_tma[dq_index.idx], dq_slice, acquire=False)
+                    if elect_one:
+                        tma_store_tile(sDq_tma[dq_index.idx], dq_slice, acquire=False)
                     tma_store_commit()
                 bars.mb_dk_tmastg_ready[dk_index.idx].wait(dk_index.phase)
                 if pend_writes:
                     desc_dk_slot = (desc_dk_base + slot).tospace(cutlass.AddressSpace.generic)
                     dk_slice = tma_slice_runtime_desc(desc_dk_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDk_tma[dk_index.idx], dk_slice, acquire=False)
+                    if elect_one:
+                        tma_store_tile(sDk_tma[dk_index.idx], dk_slice, acquire=False)
                     tma_store_commit()
                 bars.mb_dgate_tmastg_ready[dgate_index.idx].wait(dgate_index.phase)
                 if pend_writes:
                     desc_dgate_slot = (desc_dgate_base + slot).tospace(cutlass.AddressSpace.generic)
                     dgate_slice = tma_slice_runtime_desc(desc_dgate_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice, acquire=False)
+                    if elect_one:
+                        tma_store_tile(sDgate_tma[dgate_index.idx], dgate_slice, acquire=False)
                     tma_store_commit()
                 bars.mb_dv_tmastg_ready[dv_index.idx].wait(dv_index.phase)
                 if pend_writes:
                     desc_dv_slot = (desc_dv_base + slot).tospace(cutlass.AddressSpace.generic)
                     dv_slice = tma_slice_runtime_desc(desc_dv_slot, cutlass.Int32(0), head_o, pend_start)
-                    tma_store_tile(sDv_tma[dv_index.idx], dv_slice, acquire=False)
+                    if elect_one:
+                        tma_store_tile(sDv_tma[dv_index.idx], dv_slice, acquire=False)
                     tma_store_commit()
                 tma_store_wait(3)
                 bars.mb_dq_tmastg_done[dq_index.idx].arrive()
