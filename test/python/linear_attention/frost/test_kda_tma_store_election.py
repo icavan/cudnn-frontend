@@ -31,6 +31,10 @@ def _is_inside_elect_one(node, parents):
     return False
 
 
+def _contains_name(node, name):
+    return any(isinstance(child, ast.Name) and child.id == name for child in ast.walk(node))
+
+
 def test_kda_backward_tma_stores_are_elected_but_group_completion_is_warp_wide():
     epilogue, parents = _epilogue_tree()
 
@@ -64,3 +68,36 @@ def test_kda_backward_decay_scale_stage_waits_for_all_readers(kernel):
     assert "bars.mb_decay_scale_done[seed_stage].arrive()" in source
     assert "bars.mb_decay_scale_done[next_stage].arrive()" in source
     assert "bars.mb_decay_scale_done[stage].init()" in source
+
+
+@pytest.mark.parametrize("kernel", ["kda_bprop_f16.py", "kda_bprop_summary_f16.py"])
+def test_kda_backward_in_place_gate_exchange_has_load_store_barrier(kernel):
+    source = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "linear_attention" / "frost" / "kernel" / kernel
+    tree = ast.parse(source.read_text())
+    compute0 = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "compute0_warp_group")
+
+    gate_loads = [
+        node
+        for node in ast.walk(compute0)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "load" and _contains_name(node.func.value, "sGate_ptr")
+    ]
+    prefix_stores = [
+        node
+        for node in ast.walk(compute0)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "store"
+        and _contains_name(node.func.value, "sGate_exchange_ptr")
+    ]
+    cg0_barriers = [
+        node
+        for node in ast.walk(compute0)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "barrier_cta_sync"
+        and node.args
+        and ast.unparse(node.args[0]) == "cfg.cg0_sync_barrier_id"
+    ]
+
+    assert gate_loads and prefix_stores
+    assert any(max(load.lineno for load in gate_loads) < barrier.lineno < min(store.lineno for store in prefix_stores) for barrier in cg0_barriers)
