@@ -39,6 +39,41 @@ USE_PDL = True
 
 uncut_backward_cache = {}
 
+# Runtime tensor slots in uncut_backward_host; Constexpr arguments are erased.
+UNCUT_BACKWARD_BUFFERS = (
+    "q",
+    "k",
+    "v",
+    "do",
+    "dq",
+    "dk",
+    "dv",
+    "gate",
+    "gate_main",
+    "beta",
+    "a_log",
+    "dt_bias",
+    "cu_seqlens",
+    "checkpoints",
+    "seed_checkpoints",
+    "state_in",
+    "dgate",
+    "dbeta",
+    "dstate0",
+    "dstate_in",
+    "work_items",
+    "work_count",
+    "series_items",
+    "series_count",
+    "scheduler_all",
+    "scheduler_order_recompute",
+    "scheduler_order_bwd",
+    "scheduler_recompute",
+    "scheduler_bwd",
+    "recompute_words",
+    "bprop_words",
+)
+
 
 @cute.kernel
 def frost_kda_regenerate_prologue(

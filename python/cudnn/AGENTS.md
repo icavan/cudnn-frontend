@@ -739,6 +739,13 @@ repository benchmark shapes or a documented target workload. A favorable
 synthetic shape establishes a local effect, not representative benefit; it does
 not by itself justify another compile-cache specialization.
 
+TMEM raw-slot reuse needs an explicit `tcgen05.wait::ld` before its reader-done
+handoff. A true register dependency orders the consuming arithmetic, not the
+anti-dependency against another warp's next store. The KDA detector is
+`linear_attention/frost/test_kda_warm_backward.py::test_raw_qk_loads_complete_before_slot_release`;
+pair it with changed-input replay and racecheck rather than treating numerical
+agreement as a memory-order proof.
+
 ## The public function contract
 
 Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.

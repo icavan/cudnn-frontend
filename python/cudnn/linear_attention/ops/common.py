@@ -8,6 +8,8 @@ import threading
 
 import torch
 import cudnn
+from cudnn._torch_stream import device_context, stream_context
+from cudnn.graph_types import Tensor
 
 TORCH_DTYPE_TO_CUDNN = {
     torch.float16: cudnn.data_type.HALF,
@@ -68,7 +70,7 @@ def graph_workspace(graph, device, stream=None):
                     graph.build()
                 else:
                     graph.build_plans()
-    with torch.cuda.device(device), torch.cuda.stream(stream):
+    with device_context(device), stream_context(stream, device):
         return torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device=device)
 
 
@@ -103,15 +105,27 @@ def execute_graph(graph, variant_pack, workspace, handle):
     """Execute a cached graph with caller-owned scratch and a thread-private handle.
 
     The first call is serialized because FROST plans finish lazy compilation and
-    initialize immutable launch records there. Steady-state launches stay lock-free.
+    initialize immutable launch records there. Steady-state launches stay lock-free
+    and use the public ordered-buffer API for the original descriptor order.
+    Only descriptors/UIDs are cached; operands, workspace and handle remain per call.
     """
     if getattr(graph, "_la_ops_execution_ready", False):
-        graph.execute(variant_pack, workspace=workspace, handle=handle)
+        binding = getattr(graph, "_la_ops_binding", None)
+        if binding is not None and tuple(variant_pack) == binding[0]:
+            graph.execute(tuple(variant_pack.values()), workspace=workspace, handle=handle, tensor_uids=binding[1])
+        else:
+            graph.execute(variant_pack, workspace=workspace, handle=handle)
         return
     lock = _graph_lock(graph)
     with lock:
         if not getattr(graph, "_la_ops_execution_ready", False):
             graph.execute(variant_pack, workspace=workspace, handle=handle)
+            # Retain immutable descriptors/uids only, never caller tensors or
+            # scratch. The ordered public path validates fresh buffers for both
+            # backend and Python plans; a changed binding order uses the map.
+            if variant_pack and all(isinstance(tensor, Tensor) for tensor in variant_pack):
+                keys = tuple(variant_pack)
+                graph._la_ops_binding = (keys, tuple(tensor.get_uid() for tensor in keys))
             graph._la_ops_execution_ready = True
             return
     graph.execute(variant_pack, workspace=workspace, handle=handle)
