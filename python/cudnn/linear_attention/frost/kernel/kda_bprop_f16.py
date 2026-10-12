@@ -2914,7 +2914,7 @@ def compute2_warp_group(
                         nvvm.barrier_cta_sync(cfg.cg2_sync_barrier_id, thread_count=cfg.cg2_threads)
                 else:
                     # Stage the two FP32 gradients before changing from channel
-                    # ownership to token ownership.  The raw BF16 Q/K values are read
+                    # ownership to token ownership.  The raw 16-bit Q/K values are read
                     # directly from their TMA ring; CG2 releases that slot after both
                     # projections have finished consuming it.
                     dq_stage = chunk_serial % cfg.smem_dq_stages

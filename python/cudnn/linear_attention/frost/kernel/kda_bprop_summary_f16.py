@@ -40,9 +40,9 @@ Algorithm overview (per chunk c, iterated c = compute_end-1 .. write_start):
 
 SMEM layout (stage counts live in kda_bprop_config.py and the kernel cfg; sizes at DK = DV = 128, bf16 io, fp32 Gate):
   Buffer                       Size (B)  Stages
-  Q / K (raw)                  2 x 4096       2
-  dO (raw)                         4096       2
-  Gate (raw)                       8192       2
+  Q / K (raw)                  2 x 4096       3
+  dO (raw)                         4096       3
+  Gate (raw)                       8192       3
   Beta                               64       4
   K decay / K inv / Q decay    3 x 4096       2
   decay scale                       512       2
