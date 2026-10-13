@@ -186,6 +186,7 @@ cudnn.csa.CSACompressorBackward
 cudnn.csa.CSACompressorBackward.check_support
 cudnn.csa.CSACompressorBackward.compile
 cudnn.csa.CSACompressorBackward.execute
+cudnn.csa.CSACompressorBackward.scratch_workspace_bytes
 cudnn.csa.CSACompressorForward
 cudnn.csa.CSACompressorForward.check_support
 cudnn.csa.CSACompressorForward.compile
@@ -378,6 +379,8 @@ cudnn.flex_attention.MaskPlan.debug_snapshot
 cudnn.flex_attention.MaskPlan.metadata
 cudnn.flex_attention.create_mask_plan
 cudnn.flex_attention.flex_attn_func
+cudnn.frost
+cudnn.frost.cutedsl_runtime_available
 cudnn.gated_attention_block
 cudnn.gated_attention_block.Fp4Format
 cudnn.gated_attention_block.Fp4Format.MXFP4
@@ -701,8 +704,6 @@ cudnn.jax.block_sparse_attention_backward
 cudnn.jax.block_sparse_attention_forward
 cudnn.jax.call
 cudnn.jax.gemm_operand_spec
-cudnn.jax.grouped_gemm_dswiglu
-cudnn.jax.grouped_gemm_swiglu
 cudnn.jax.kimi_delta_attention
 cudnn.jax.kimi_delta_attention_bwd
 cudnn.jax.kimi_delta_attention_fwd
@@ -1430,6 +1431,7 @@ cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm90
 cudnn.sdpa.fwd.sdpa_fwd_wrapper_sm80
 cudnn.sdpa.fwd.torch_op
 cudnn.sdpa.fwd.torch_op.sdpa
+cudnn.sdpa_capabilities
 cudnn.set_stream
 cudnn.tensor
 cudnn.tensor.get_alignment
@@ -1470,8 +1472,6 @@ cudnn.torch.block_sparse_attention_backward
 cudnn.torch.block_sparse_attention_forward
 cudnn.torch.block_sparse_attention_fp8_forward
 cudnn.torch.calls
-cudnn.torch.grouped_gemm_dswiglu
-cudnn.torch.grouped_gemm_swiglu
 cudnn.torch.install
 cudnn.torch.served_plan_names
 cudnn.wrapper
