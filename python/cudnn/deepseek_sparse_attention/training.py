@@ -154,7 +154,7 @@ def _native_forward(q, kv, indices, sink, lengths, scale):
 
 class _SparseAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, indices, sink, lengths, scale, trusted):
+    def forward(ctx, q, kv, indices, sink, lengths, scale, trusted, deterministic):
         with torch.cuda.device(q.device):
             safe_indices, safe_lengths = _normalize_cudnn_sparse_metadata(
                 indices,
@@ -167,6 +167,7 @@ class _SparseAttention(torch.autograd.Function):
             out, max_logits, lse = _native_forward(q, kv, safe_indices, effective_sink, safe_lengths, scale)
         ctx.scale = scale
         ctx.has_lengths = safe_lengths is not None
+        ctx.deterministic = deterministic
         if any(ctx.needs_input_grad[i] for i in (0, 1, 3)):
             tensors = [q, kv, out, lse, effective_sink, safe_indices]
             if safe_lengths is not None:
@@ -180,7 +181,7 @@ class _SparseAttention(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, dout, _dmax, _dlse):
         if dout is None:
-            return (None,) * 7
+            return (None,) * 8
         q, kv, out, lse, sink, indices, *rest = ctx.saved_tensors
         from .sparse_attention_backward.api import sparse_attention_backward_wrapper
 
@@ -195,9 +196,19 @@ class _SparseAttention(torch.autograd.Function):
                 indices,
                 softmax_scale=ctx.scale,
                 topk_length=rest[0] if ctx.has_lengths else None,
+                deterministic=ctx.deterministic,
             )
         needs = ctx.needs_input_grad
-        return (result["dq"] if needs[0] else None, result["dkv"] if needs[1] else None, None, result["d_sink"] if needs[3] else None, None, None, None)
+        return (
+            result["dq"] if needs[0] else None,
+            result["dkv"] if needs[1] else None,
+            None,
+            result["d_sink"] if needs[3] else None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def sparse_attention(
@@ -208,6 +219,7 @@ def sparse_attention(
     softmax_scale: Optional[float] = None,
     topk_length: Optional[torch.Tensor] = None,
     trusted_compact_metadata: bool = False,
+    deterministic: bool = False,
 ) -> TupleDict:
     """Native BF16 MQA sparse attention with first-order PyTorch autograd.
 
@@ -223,11 +235,20 @@ def sparse_attention(
     lengths in [0,K]. Without lengths, all nonnegative indices must be in range.
     Top-K is padded to a 128-slot launch envelope. This allocating composition
     does not change the lower-level APIBase execute contract.
+
+    ``deterministic=True`` selects the fixed-order native backward for bitwise
+    reproducible Q, KV, and sink gradients. It is request-or-fail: unsupported
+    shapes or devices raise instead of falling back to the atomic path. The
+    forward path and metadata normalization are already fixed-order. Warm the
+    specialization before CUDA graph capture; captured allocations belong to
+    the graph's private pool.
     """
     if not isinstance(trusted_compact_metadata, bool):
         raise TypeError("trusted_compact_metadata must be a bool")
+    if not isinstance(deterministic, bool):
+        raise TypeError("deterministic must be a bool")
     scale = _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
-    out, max_logits, lse = _SparseAttention.apply(q, kv, indices, attn_sink, topk_length, scale, trusted_compact_metadata)
+    out, max_logits, lse = _SparseAttention.apply(q, kv, indices, attn_sink, topk_length, scale, trusted_compact_metadata, deterministic)
     return TupleDict(out=out, max_logits=max_logits, lse=lse)
 
 

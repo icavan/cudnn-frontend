@@ -133,13 +133,16 @@ def test_stream_and_changed_input_graph_replay():
         for _ in range(3):
             result = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            captured = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)["out"]
-        q.mul_(2)
-        kv.mul_(0.5)
-        graph.replay()
-        expected = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)["out"]
-        torch.testing.assert_close(captured, expected)
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                captured = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)["out"]
+            q.mul_(2)
+            kv.mul_(0.5)
+            graph.replay()
+            expected = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)["out"]
+            torch.testing.assert_close(captured, expected)
+        finally:
+            graph.reset()
     torch.cuda.current_stream().wait_stream(stream)
 
 
@@ -150,6 +153,8 @@ def test_unsupported_shape_and_device_scale_fail_before_launch():
     q, kv, idx, a, lens = inputs()
     with pytest.raises(TypeError, match="host real"):
         DSA.sparse_attention(q, kv, idx, a, softmax_scale=torch.tensor(1.0, device="cuda"))
+    with pytest.raises(TypeError, match="deterministic must be a bool"):
+        DSA.sparse_attention(q, kv, idx, a, deterministic=1)
 
 
 def test_old_dsl_declines_before_any_kernel_launch(monkeypatch):
@@ -161,7 +166,8 @@ def test_old_dsl_declines_before_any_kernel_launch(monkeypatch):
         DSA.sparse_attention(q, kv, idx, a)
 
 
-def test_training_graph_replay_uses_changed_inputs_and_metadata():
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_training_graph_replay_uses_changed_inputs_and_metadata(deterministic):
     q, kv, idx, a, lens = inputs()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -171,25 +177,28 @@ def test_training_graph_replay_uses_changed_inputs_and_metadata():
             for tensor in (q, kv, a):
                 if tensor.grad is not None:
                     tensor.grad.zero_()
-            output = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)["out"]
+            output = DSA.sparse_attention(q, kv, idx, a, topk_length=lens, deterministic=deterministic)["out"]
             output.sum().backward()
             return output
 
         for _ in range(3):
             step()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            captured = step()
-        with torch.no_grad():
-            q.mul_(1.5)
-            kv.mul_(0.7)
-            idx[0, 0] = 3
-            lens[1] = 1
-        graph.replay()
-        actual = [tensor.grad.clone() for tensor in (q, kv, a)]
-        actual_output = captured.clone()
-        expected_output = step()
-        assert_numerics(actual_output, expected_output, 0.01)
-        for grad, tensor in zip(actual, (q, kv, a)):
-            assert_numerics(grad, tensor.grad, 0.01)
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                captured = step()
+            with torch.no_grad():
+                q.mul_(1.5)
+                kv.mul_(0.7)
+                idx[0, 0] = 3
+                lens[1] = 1
+            graph.replay()
+            actual = [tensor.grad.clone() for tensor in (q, kv, a)]
+            actual_output = captured.clone()
+            expected_output = step()
+            assert_numerics(actual_output, expected_output, 0.01)
+            for grad, tensor in zip(actual, (q, kv, a)):
+                assert_numerics(grad, tensor.grad, 0.01)
+        finally:
+            graph.reset()
     torch.cuda.current_stream().wait_stream(stream)
