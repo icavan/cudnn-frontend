@@ -465,6 +465,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "AlignedHCABackward": (".deepseek_sparse_attention", "AlignedHCABackward"),
     "aligned_hca_backward_wrapper": (".deepseek_sparse_attention", "aligned_hca_backward_wrapper"),
     "CSA": (".csa", "CSA"),
+    "CompressedSparseAttention": (".csa", "CompressedSparseAttention"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
     "CSACompressorBackward": (".csa", "CSACompressorBackward"),
     "csa_compressor_forward_wrapper": (".csa", "csa_compressor_forward_wrapper"),
