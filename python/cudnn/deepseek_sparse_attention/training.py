@@ -148,7 +148,10 @@ def _native_forward(q, kv, indices, sink, lengths, scale):
         softmax_scale=scale,
     )
     if heads < 64:
-        return tuple(result[key][:, :heads].contiguous() for key in ("out", "max_logits", "lse"))
+        # ``contiguous()`` may return the sliced view unchanged when S_q == 1,
+        # because singleton strides do not participate in PyTorch's contiguity
+        # check.  Backward's CuTe binding requires the canonical compact stride.
+        return tuple(result[key][:, :heads].clone(memory_format=torch.contiguous_format) for key in ("out", "max_logits", "lse"))
     return result["out"], result["max_logits"], result["lse"]
 
 

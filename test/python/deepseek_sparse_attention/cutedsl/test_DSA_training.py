@@ -210,6 +210,21 @@ def test_deterministic_training_numerics_and_bitwise_repeat(heads, dim, sink, le
             assert torch.equal(actual, expected)
 
 
+@pytest.mark.L0
+def test_deterministic_h16_singleton_query_backward_uses_compact_layout():
+    """H16 forward slicing must materialize canonical strides when S_q is one."""
+    q, kv, idx, a, lens = inputs(heads=16)
+    q = q[:1].detach().clone().requires_grad_()
+    idx, lens = idx[:1], lens[:1]
+
+    out = DSA.sparse_attention(q, kv, idx, a, topk_length=lens, deterministic=True)["out"]
+    assert out.stride() == (16 * 512, 512, 1)
+    out.sum().backward()
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(kv.grad).all()
+    assert torch.isfinite(a.grad).all()
+
+
 @pytest.mark.parametrize("q_grad,kv_grad,sink_grad", [(True, False, False), (False, True, False), (False, False, True)])
 def test_deterministic_training_respects_partial_gradient_requests(q_grad, kv_grad, sink_grad):
     q, kv, idx, a, lens = inputs()
