@@ -52,11 +52,12 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
   g_last terms, reverse-cumsummed in registers.  Compute group 1: dBeta = sum over v of dY.(V - k state) + the M-term,
   dV = Beta.dY.  The epilogue warp stores dQ / dK / dV / dGate through a one-behind TMA ladder.
 
-SMEM layout (stage counts live in kda_bprop_config.py; sizes at DK = DV = 128, bf16 io, fp32 Gate):
+SMEM layout (defaults in kda_bprop_config.py; normalized D128 uncut uses two raw
+stages, other schedules keep three; sizes at DK = DV = 128, bf16 io, fp32 Gate):
   Buffer                       Size (B)  Stages
-  Q / K (raw)                  2 x 4096       3
-  V / dO (raw)                 2 x 4096       3
-  Gate (raw)                       8192       3
+  Q / K (raw)                  2 x 4096     2/3
+  V / dO (raw)                 2 x 4096     2/3
+  Gate (raw)                       8192     2/3
   K decay / K inv / Q decay    3 x 4096       2
   decay scale                       512       2
   T_inv / A / dA / dM (intermediate) 2560     2    <-- five BT x BT tiles per stage
@@ -4078,7 +4079,9 @@ def build_cfg(
     max_active_clusters: int,
     d_k: int,
     d_v: int,
+    smem_raw_stages: int | None = None,
 ) -> KdaBpropCfg:
+    """Derive all buffer sizes from the selected schedule and raw ring depth."""
     cfg = KdaBpropCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
@@ -4095,6 +4098,8 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
     )
+    if smem_raw_stages is not None:
+        cfg.smem_raw_stages = smem_raw_stages
     cfg.threads_per_cta = 16 * cfg.threads_per_warp
     cfg.cg0_threads = len(cfg.compute_group_0_warp_ids) * cfg.threads_per_warp
     cfg.cg2_threads = len(cfg.compute_group_2_warp_ids) * cfg.threads_per_warp

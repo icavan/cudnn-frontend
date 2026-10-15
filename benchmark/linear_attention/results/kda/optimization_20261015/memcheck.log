@@ -1,0 +1,48 @@
+# Device-memory check only; CUDA API error reporting disabled
+# compute-sanitizer --tool memcheck --report-api-errors no --kernel-name kns=cutlass_frost_kda_bprop_ --error-exitcode 86 python -m pytest linear_attention/frost/test_kda_execution.py::test_uncut_bwd_raw_ring_wraps_and_changed_input_replay -q
+========= COMPUTE-SANITIZER
+===== cudnn-frontend conftest.py ====
+cuDNN Frontend Version: 1.32.0
+cuDNN Frontend Path: /root/kda-opt-20261012/continuation-20261015/source/python/cudnn/__init__.py
+Test run id: 381068_3d2a3fe3
+cuDNN Backend Version: 91900
+GPU Name: NVIDIA L20C
+SM Arch Version: (10, 0)
+PyTorch Version: 2.11.0+cu130
+PyTorch Path: /root/csa-ant-cudnn-e2e-20261012/venv/lib/python3.10/site-packages/torch/__init__.py
+PyTorch CUDA Version: 13.0
+PyTorch cuDNN Version: 91900
+........                                                                 [100%]
+=============================== warnings summary ===============================
+../../../../../csa-ant-cudnn-e2e-20261012/venv/lib/python3.10/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/typing.py:668
+  /root/csa-ant-cudnn-e2e-20261012/venv/lib/python3.10/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl/typing.py:668: DeprecationWarning: `np.float` is a deprecated alias for the builtin `float`. To silence this warning, use `float` by itself. Doing this will not modify any behavior and is safe. If you specifically wanted the numpy scalar type, use `np.float64` here.
+  Deprecated in NumPy 1.20; for more details and guidance: https://numpy.org/devdocs/release/1.20.0-notes.html#deprecations
+    np_dtype = getattr(np, name.lower(), None)
+
+linear_attention/test_la.py:2710
+  /root/kda-opt-20261012/continuation-20261015/source/test/python/linear_attention/test_la.py:2710: PytestUnknownMarkWarning: Unknown pytest.mark.xdist_group - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.xdist_group(name="gpu_exclusive")
+
+linear_attention/test_la.py:2720
+  /root/kda-opt-20261012/continuation-20261015/source/test/python/linear_attention/test_la.py:2720: PytestUnknownMarkWarning: Unknown pytest.mark.xdist_group - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.xdist_group(name="gpu_exclusive")
+
+linear_attention/test_la.py:2730
+  /root/kda-opt-20261012/continuation-20261015/source/test/python/linear_attention/test_la.py:2730: PytestUnknownMarkWarning: Unknown pytest.mark.xdist_group - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.xdist_group(name="gpu_exclusive")
+
+linear_attention/test_la.py:2814
+  /root/kda-opt-20261012/continuation-20261015/source/test/python/linear_attention/test_la.py:2814: PytestUnknownMarkWarning: Unknown pytest.mark.xdist_group - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.xdist_group(name="gpu_exclusive")
+
+linear_attention/test_la.py:3535
+  /root/kda-opt-20261012/continuation-20261015/source/test/python/linear_attention/test_la.py:3535: PytestUnknownMarkWarning: Unknown pytest.mark.xdist_group - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.xdist_group(name="gpu_exclusive")
+
+linear_attention/frost/test_kda_execution.py:27
+  /root/kda-opt-20261012/continuation-20261015/source/test/python/linear_attention/frost/test_kda_execution.py:27: PytestUnknownMarkWarning: Unknown pytest.mark.xdist_group - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8 passed, 7 warnings in 60.86s (0:01:00)
+========= ERROR SUMMARY: 0 errors

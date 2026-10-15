@@ -390,6 +390,7 @@ def uncut_backward_host(
 
 
 def build_configs(io_dtype, state_dtype, gate_dtype, *, recompute, coarse, has_state_in, use_initial_state, use_dstate_in, use_dstate0, **flags):
+    """Use two raw stages only for the measured D128 normalized uncut schedule."""
     recompute_cfg = None
     if recompute:
         recompute_cfg = kda_recompute_f16.build_cfg(
@@ -408,6 +409,8 @@ def build_configs(io_dtype, state_dtype, gate_dtype, *, recompute, coarse, has_s
         use_dstate_in=use_dstate_in,
         use_dstate0=use_dstate0,
         use_initial_state=use_initial_state,
+        # D128 normalization retains raw slots through the final dQ consumer.
+        smem_raw_stages=2 if flags["d_k"] == flags["d_v"] == 128 and flags["l2norm"] else None,
         **flags,
     )
     return recompute_cfg, bprop_cfg

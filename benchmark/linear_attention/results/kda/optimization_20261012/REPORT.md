@@ -1,5 +1,12 @@
 # KDA forward/backward E2E optimization — 2026-10-12
 
+> Historical measurements: a subsequent ownership audit found that this
+> pipeline rescheduling moved the dO-ready wait past earlier consumers and
+> left the late dQ MMA out of the dO-reuse acknowledgement. The follow-up in
+> `../optimization_20261015/REPORT.md` fixes those edges and measures resource
+> tuning against a corrected baseline. These original timings/logs are retained
+> for provenance, not as a substitute for the follow-up correctness validation.
+
 ## Outcome and scope
 
 On `aistudio-61550139-ssctl`, SM100, BF16 THD, B=1/S=8192/H=96/K=V=128,

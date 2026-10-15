@@ -1,0 +1,1298 @@
+{
+  "status": "pre-dO-fix exploration only; not final shipping gains or final correctness validation",
+  "baseline_commit": "220d5e9a0345c1f3c23320802f489484dd45e6fb",
+  "host": "aistudio-61550139-ssctl",
+  "final_timing_gpu": 1,
+  "exploration_gpu": 0,
+  "raw_results_directory": "/root/kda-opt-20261012/continuation-20261015/results",
+  "scope": "uncut backward, K=V=128, in-kernel Q/K L2 normalization; all other raw-stage defaults unchanged",
+  "final_ab": {
+    "final_ab_cp16.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 16,
+      "dtype": "bfloat16",
+      "e2e": false,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/final_ab_cp16.json",
+      "samples_us": {
+        "baseline": [
+          1991.1392211914062,
+          1990.5204772949219,
+          1990.3680165608723,
+          1990.008544921875,
+          1990.2325948079426,
+          1990.5162811279297,
+          1990.049107869466,
+          1989.9147033691406
+        ],
+        "candidate": [
+          1920.3083038330078,
+          1919.7130839029949,
+          1919.9264526367188,
+          1919.9551900227864,
+          1920.4597473144531,
+          1919.5947011311848,
+          1919.7781880696614,
+          1919.6703592936199
+        ]
+      },
+      "median_us": {
+        "baseline": 1990.3003056844075,
+        "candidate": 1919.85232035319
+      },
+      "speedup": 1.0366944814371228,
+      "latency_reduction": 0.03539565618817131,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "final_ab_cp0.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 0,
+      "dtype": "bfloat16",
+      "e2e": false,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/final_ab_cp0.json",
+      "samples_us": {
+        "baseline": [
+          2620.0340270996094,
+          2618.297576904297,
+          2618.153635660807,
+          2616.935475667318,
+          2618.6388651529946,
+          2617.9466247558594,
+          2618.5216267903647,
+          2618.1920369466147
+        ],
+        "candidate": [
+          2550.1686096191406,
+          2548.3189900716147,
+          2549.192555745443,
+          2547.6608276367188,
+          2548.3670552571616,
+          2547.855885823568,
+          2549.2235819498696,
+          2549.0526835123696
+        ]
+      },
+      "median_us": {
+        "baseline": 2618.244806925456,
+        "candidate": 2548.7098693847656
+      },
+      "speedup": 1.0272824060423462,
+      "latency_reduction": 0.026557844154513455,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "final_ab_16k.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 16384,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 16,
+      "dtype": "bfloat16",
+      "e2e": false,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/final_ab_16k.json",
+      "samples_us": {
+        "baseline": [
+          3978.9545694986978,
+          3977.1316528320312,
+          3977.079518636068,
+          3977.6265462239585,
+          3977.838897705078,
+          3977.2799173990884,
+          3978.4639994303384,
+          3977.4068196614585
+        ],
+        "candidate": [
+          3832.917277018229,
+          3833.5253397623696,
+          3832.319895426432,
+          3834.4459533691406,
+          3833.6255391438804,
+          3832.539621988932,
+          3833.0708821614585,
+          3832.633717854818
+        ]
+      },
+      "median_us": {
+        "baseline": 3977.5166829427085,
+        "candidate": 3832.9940795898438
+      },
+      "speedup": 1.0377048856199458,
+      "latency_reduction": 0.036334883011965635,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "final_e2e_ab_cp16.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 16,
+      "dtype": "bfloat16",
+      "e2e": true,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/final_e2e_ab_cp16.json",
+      "samples_us": {
+        "baseline": [
+          2653.1071980794272,
+          2652.331797281901,
+          2651.7311096191406,
+          2652.5472005208335,
+          2652.148183186849,
+          2652.167510986328,
+          2651.8773396809897,
+          2652.7381896972656
+        ],
+        "candidate": [
+          2583.4187825520835,
+          2583.7376912434897,
+          2583.3099365234375,
+          2583.2064310709634,
+          2583.0111185709634,
+          2583.2201639811196,
+          2583.1914265950522,
+          2583.174387613932
+        ]
+      },
+      "median_us": {
+        "baseline": 2652.2496541341143,
+        "candidate": 2583.2132975260415
+      },
+      "speedup": 1.02672499273451,
+      "latency_reduction": 0.02602935832245823,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "final_e2e_ab_cp0.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 0,
+      "dtype": "bfloat16",
+      "e2e": true,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/final_e2e_ab_cp0.json",
+      "samples_us": {
+        "baseline": [
+          3099.040985107422,
+          3097.613779703776,
+          3097.841135660807,
+          3097.2671508789062,
+          3096.4937845865884,
+          3099.292755126953,
+          3097.6638793945312,
+          3098.4074910481772
+        ],
+        "candidate": [
+          3030.6111653645835,
+          3029.418690999349,
+          3028.6399841308594,
+          3030.609130859375,
+          3029.682159423828,
+          3030.7510375976562,
+          3029.6958923339844,
+          3030.3914388020835
+        ]
+      },
+      "median_us": {
+        "baseline": 3097.752507527669,
+        "candidate": 3030.043665568034
+      },
+      "speedup": 1.0223458304344077,
+      "latency_reduction": 0.021857408490542518,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    }
+  },
+  "precision": {
+    "final_precision_safe.json": {
+      "kernel_sha256": {
+        "baseline": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "8747d8dd4aeb23a4f74994ec849a399a113959dd46663a8e8cac24ded6db0635",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        },
+        "candidate": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "a47765dea2eb85a76ec8f6de0b16b8026763b879d66f382a7adca119e858e91c",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        }
+      },
+      "args": {
+        "self_test": false,
+        "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+        "lengths": [
+          0,
+          17,
+          31,
+          256
+        ],
+        "heads": 2,
+        "reference_heads": 1,
+        "dim": 128,
+        "checkpoint": 16,
+        "seed": 1234,
+        "dtypes": [
+          "bfloat16",
+          "float16"
+        ],
+        "distributions": [
+          "normal",
+          "small_norm",
+          "correlated",
+          "cancellation",
+          "radial"
+        ],
+        "safe_gate": true,
+        "batch_invariant": false,
+        "parameters": true,
+        "require_identical": true,
+        "json": "/root/kda-opt-20261012/continuation-20261015/results/final_precision_safe.json"
+      },
+      "cases": [
+        {
+          "dtype": "bfloat16",
+          "distribution": "normal",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00003451631675268914,
+            "rms_relative": 0.004555878435226727,
+            "max_abs": 0.00045546355206996236,
+            "reference_rms": 0.0075762154858663175,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.004195288381956667,
+            "dk": 0.004203538331342867,
+            "dv": 0.003674410906938464,
+            "dg": 0.005737761521288427,
+            "dbeta": 0.0034159999956518434,
+            "da_log": 0.0028899900028493773,
+            "ddt_bias": 0.007269995753530444
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.000264769117017033,
+            "dk": 0.0003942898097005418,
+            "dv": 0.0003366344212416064,
+            "dg": 0.00016591904725904699,
+            "dbeta": 0.0005277290941308396,
+            "da_log": 0.017011777350874446,
+            "ddt_bias": 0.0013551458604475347
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "small_norm",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000022044060520188427,
+            "rms_relative": 0.0044824213796023984,
+            "max_abs": 0.00038397664841659934,
+            "reference_rms": 0.004917891169380373,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.004022047553225711,
+            "dk": 0.003313997943700822,
+            "dv": 0.003650337547071897,
+            "dg": 0.005513214513037391,
+            "dbeta": 0.003435119711428486,
+            "da_log": 0.0021435202504137864,
+            "ddt_bias": 0.006569750352386518
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 3.0183035198508037,
+            "dk": 4.447963429274182,
+            "dv": 0.0003026189851471073,
+            "dg": 0.00012947998902495313,
+            "dbeta": 0.0005504264171665024,
+            "da_log": 0.010819915161918381,
+            "ddt_bias": 0.0009774997803363022
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "correlated",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000035169099618772495,
+            "rms_relative": 0.006869249869455329,
+            "max_abs": 0.0005596276349444096,
+            "reference_rms": 0.005119787500401568,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.006283848223779145,
+            "dk": 0.004673276883308654,
+            "dv": 0.006379876174531603,
+            "dg": 0.008941784447463585,
+            "dbeta": 0.007241317828507646,
+            "da_log": 0.05766946863553291,
+            "ddt_bias": 0.016178768077488644
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.0003163451561266836,
+            "dk": 0.0004656413265279394,
+            "dv": 0.00034438726630262734,
+            "dg": 0.00047558538505173935,
+            "dbeta": 0.0010578328113750035,
+            "da_log": 0.03186235658917791,
+            "ddt_bias": 0.0023557697222350432
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "cancellation",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00003788254145140325,
+            "rms_relative": 0.008967530805460689,
+            "max_abs": 0.0004671219124137843,
+            "reference_rms": 0.004224411632724479,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.008479783378124592,
+            "dk": 0.004347698199179923,
+            "dv": 0.006379876174531603,
+            "dg": 0.01107235568860354,
+            "dbeta": 0.006746720622433648,
+            "da_log": 0.023902870862639335,
+            "ddt_bias": 0.028320806128941098
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.0004388047651784962,
+            "dk": 0.0005409280863859778,
+            "dv": 0.00034438726630262734,
+            "dg": 0.00032494218341063547,
+            "dbeta": 0.001106774540646234,
+            "da_log": 0.01806589793034974,
+            "ddt_bias": 0.0022775949725177755
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "radial",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00037044829710298225,
+            "rms_relative": 0.006503979015008274,
+            "max_abs": 0.0028071580403317697,
+            "reference_rms": 0.05695717902043553,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 257361.9680971,
+            "dk": 1772223.1716519645,
+            "dv": 0.00569956604617558,
+            "dg": 1,
+            "dbeta": 0.007017918354332319,
+            "da_log": 1,
+            "ddt_bias": 1
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00014209723615967937,
+            "dk": 0.004272461180576795,
+            "dv": 0.004282640064624296,
+            "dg": 1.2030132763825339e-20,
+            "dbeta": 0.008658364099419114,
+            "da_log": 2.0474720735813822e-17,
+            "ddt_bias": 2.0947203999793904e-20
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "normal",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000004379115832973006,
+            "rms_relative": 0.0005780191837874961,
+            "max_abs": 0.000039686494968882435,
+            "reference_rms": 0.00757607352108741,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0005203017055144571,
+            "dk": 0.0005207115956543416,
+            "dv": 0.00046777941901423665,
+            "dg": 0.0007451834133347442,
+            "dbeta": 0.0004287566436321919,
+            "da_log": 0.0005821241614963595,
+            "ddt_bias": 0.0008959037519400463
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00003939741631134308,
+            "dk": 0.00003859963615673867,
+            "dv": 0.00003682838989103876,
+            "dg": 0.00002746593608818869,
+            "dbeta": 0.0000739273035000737,
+            "da_log": 0.0030981275927022267,
+            "ddt_bias": 0.0001884093916044438
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "small_norm",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.0000028149308181020727,
+            "rms_relative": 0.0005723222931153164,
+            "max_abs": 0.00006148253197301584,
+            "reference_rms": 0.004918436433394176,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0005125057694404453,
+            "dk": 0.00046390012784884897,
+            "dv": 0.0004685861287192786,
+            "dg": 0.0007442792075837758,
+            "dbeta": 0.00045828769790111,
+            "da_log": 0.00036010047798019446,
+            "ddt_bias": 0.0008868250839398612
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.30592812898089505,
+            "dk": 0.4799310039988427,
+            "dv": 0.00003488098092612607,
+            "dg": 0.000028863961445369646,
+            "dbeta": 0.00006778362090777146,
+            "da_log": 0.0016625591495276204,
+            "ddt_bias": 0.00013866798785799536
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "correlated",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000004314407530267144,
+            "rms_relative": 0.0008427321607496992,
+            "max_abs": 0.00005015813545096448,
+            "reference_rms": 0.005119547741513773,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0008407675444146547,
+            "dk": 0.0005720033576610955,
+            "dv": 0.0007811044303767629,
+            "dg": 0.0010781398420370882,
+            "dbeta": 0.0008820476950839625,
+            "da_log": 0.0011628366885210793,
+            "ddt_bias": 0.0017756006265937892
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.000045338403074613744,
+            "dk": 0.00006816029481136743,
+            "dv": 0.000047893246581318105,
+            "dg": 0.00003945183741875264,
+            "dbeta": 0.00016272604893903878,
+            "da_log": 0.0006754921255235358,
+            "ddt_bias": 0.00022544685486150517
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "cancellation",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000004603750630111461,
+            "rms_relative": 0.0010899489606647464,
+            "max_abs": 0.000059440882674566264,
+            "reference_rms": 0.004223822212100363,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0010400507616014029,
+            "dk": 0.0005474014786599803,
+            "dv": 0.0007811044303767629,
+            "dg": 0.0014087799234287985,
+            "dbeta": 0.0008264899107323182,
+            "da_log": 0.0011634093593724875,
+            "ddt_bias": 0.0038981591359716853
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00004234223267805641,
+            "dk": 0.000060872752449411816,
+            "dv": 0.000047893246581318105,
+            "dg": 0.00004091404284570395,
+            "dbeta": 0.00013966759846813226,
+            "da_log": 0.0007932225062946552,
+            "ddt_bias": 0.00024352405801567056
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "radial",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00004510514963545785,
+            "rms_relative": 0.0007919048677902014,
+            "max_abs": 0.0003432828823535794,
+            "reference_rms": 0.056957788075382196,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 33314.62612251039,
+            "dk": 244920.4771762077,
+            "dv": 0.0007133880918453569,
+            "dg": 1,
+            "dbeta": 0.0008826155882629829,
+            "da_log": 1,
+            "ddt_bias": 1
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00001633179732543795,
+            "dk": 0.00045442598871873324,
+            "dv": 0.0005548391446235784,
+            "dg": 1.2081578542310237e-20,
+            "dbeta": 0.0009552531767780814,
+            "da_log": 2.0361568673164924e-17,
+            "ddt_bias": 2.0937286052775652e-20
+          },
+          "max_abs_error_increase": 0
+        }
+      ]
+    },
+    "final_precision_long.json": {
+      "kernel_sha256": {
+        "baseline": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "8747d8dd4aeb23a4f74994ec849a399a113959dd46663a8e8cac24ded6db0635",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        },
+        "candidate": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "a47765dea2eb85a76ec8f6de0b16b8026763b879d66f382a7adca119e858e91c",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        }
+      },
+      "args": {
+        "self_test": false,
+        "baseline": "/root/kda-opt-20261012/continuation-20261015/current_snapshot/python/cudnn/linear_attention/frost/kernel",
+        "lengths": [
+          8192
+        ],
+        "heads": 2,
+        "reference_heads": 1,
+        "dim": 128,
+        "checkpoint": 16,
+        "seed": 1234,
+        "dtypes": [
+          "bfloat16",
+          "float16"
+        ],
+        "distributions": [
+          "normal"
+        ],
+        "safe_gate": true,
+        "batch_invariant": true,
+        "parameters": true,
+        "require_identical": true,
+        "json": "/root/kda-opt-20261012/continuation-20261015/results/final_precision_long.json"
+      },
+      "cases": [
+        {
+          "dtype": "bfloat16",
+          "distribution": "normal",
+          "lengths": [
+            8192
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000041990601700577976,
+            "rms_relative": 0.004663123790586223,
+            "max_abs": 0.0006551669957977485,
+            "reference_rms": 0.009004822429408236,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.004217210460928428,
+            "dk": 0.004252951756277365,
+            "dv": 0.0037369628687186707,
+            "dg": 0.0051484231344812335,
+            "dbeta": 0.0037273002860935,
+            "da_log": 0.012084120618844788,
+            "ddt_bias": 0.005832915841820666
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00052291190927857,
+            "dk": 0.0006226132016474983,
+            "dv": 0.0004956488009998233,
+            "dg": 0.00046157392044628463,
+            "dbeta": 0.0010174617298716881,
+            "da_log": 0.143562282174436,
+            "ddt_bias": 0.009382152632403495
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "normal",
+          "lengths": [
+            8192
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000005276008987292171,
+            "rms_relative": 0.0005859093300017352,
+            "max_abs": 0.00006741232002305947,
+            "reference_rms": 0.009004821594625479,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0005291145605710977,
+            "dk": 0.0006231183312766916,
+            "dv": 0.0006402265415102881,
+            "dg": 0.0012733123265267514,
+            "dbeta": 0.0006240246449703852,
+            "da_log": 0.0011894994599036073,
+            "ddt_bias": 0.0016542047741581383
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.000059403721052266045,
+            "dk": 0.0009322612042326291,
+            "dv": 0.00038676007005864974,
+            "dg": 0.0008932333786676606,
+            "dbeta": 0.0008031792582851825,
+            "da_log": 0.016429714552005592,
+            "ddt_bias": 0.006385082963138777
+          },
+          "max_abs_error_increase": 0
+        }
+      ]
+    }
+  },
+  "exploration": {
+    "trials_8192.json": {
+      "args": {
+        "tokens": 8192,
+        "heads": 96,
+        "rounds": 8,
+        "repeats": 30,
+        "trials": [
+          "current",
+          "independent_aa",
+          "cg2_168",
+          "cg1_160",
+          "raw2",
+          "pieces3"
+        ],
+        "json": "/root/kda-opt-20261012/continuation-20261015/results/trials_8192.json"
+      },
+      "results": {
+        "current": {
+          "registers": null,
+          "raw_stages": 3,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            1991.8463389078777,
+            1991.1679585774739,
+            1991.4452870686848,
+            1991.8485005696614,
+            1991.988245646159,
+            1991.095479329427,
+            1991.7835235595703,
+            1991.7835235595703
+          ],
+          "median_us": 1991.7835235595703,
+          "latency_reduction": 0,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "independent_aa": {
+          "registers": [
+            144,
+            152,
+            160,
+            56
+          ],
+          "raw_stages": 3,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            1991.0315195719402,
+            1989.8709615071614,
+            1990.823491414388,
+            1990.0042215983074,
+            1989.9402618408203,
+            1989.8709615071614,
+            1990.213394165039,
+            1990.9642537434895
+          ],
+          "median_us": 1990.1088078816733,
+          "latency_reduction": 0.0008408120953345977,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "cg2_168": {
+          "registers": [
+            136,
+            152,
+            168,
+            56
+          ],
+          "raw_stages": 3,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            2009.5999399820964,
+            2009.2650095621746,
+            2008.9856465657551,
+            2009.396235148112,
+            2009.5317840576172,
+            2010.0767771402996,
+            2009.3994140625,
+            2010.214360555013
+          ],
+          "median_us": 2009.4655990600586,
+          "latency_reduction": -0.008877508670665168,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "cg1_160": {
+          "registers": [
+            144,
+            160,
+            152,
+            56
+          ],
+          "raw_stages": 3,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            1994.8511759440105,
+            1994.7893778483074,
+            1994.991938273112,
+            1994.991938273112,
+            1994.7093963623047,
+            1994.5823669433594,
+            1994.4447835286458,
+            1994.5802052815754
+          ],
+          "median_us": 1994.7493871053061,
+          "latency_reduction": -0.0014890491414627505,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "raw2": {
+          "registers": [
+            144,
+            152,
+            160,
+            56
+          ],
+          "raw_stages": 2,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            1922.4586486816406,
+            1922.3147074381511,
+            1922.388203938802,
+            1922.525914510091,
+            1922.2527821858723,
+            1921.8442281087239,
+            1921.7056274414062,
+            1921.9114939371746
+          ],
+          "median_us": 1922.2837448120117,
+          "latency_reduction": 0.03489323911232767,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "pieces3": {
+          "registers": null,
+          "raw_stages": 3,
+          "pieces": 3,
+          "workspace_bytes": 56653952,
+          "samples_us": [
+            2854.498036702474,
+            2857.50732421875,
+            2855.4570515950522,
+            2856.0043334960938,
+            2857.7791849772134,
+            2856.0778299967446,
+            2857.0955912272134,
+            2855.3888956705728
+          ],
+          "median_us": 2856.041081746419,
+          "latency_reduction": -0.4339113904518652,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        }
+      }
+    },
+    "trials_16384.json": {
+      "args": {
+        "tokens": 16384,
+        "heads": 96,
+        "rounds": 8,
+        "repeats": 30,
+        "trials": [
+          "current",
+          "independent_aa",
+          "raw2"
+        ],
+        "json": "/root/kda-opt-20261012/continuation-20261015/results/trials_16384.json"
+      },
+      "results": {
+        "current": {
+          "registers": null,
+          "raw_stages": 3,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            3982.3018391927085,
+            3980.5269877115884,
+            3981.0038248697915,
+            3980.322011311849,
+            3979.7078450520835,
+            3980.9364318847656,
+            3981.2779744466147,
+            3981.6182454427085
+          ],
+          "median_us": 3980.9701283772783,
+          "latency_reduction": 0,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "independent_aa": {
+          "registers": [
+            144,
+            152,
+            160,
+            56
+          ],
+          "raw_stages": 3,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            3979.8431396484375,
+            3979.7035217285156,
+            3979.089101155599,
+            3980.1162719726562,
+            3979.706573486328,
+            3979.7696431477866,
+            3979.297129313151,
+            3980.3296407063804
+          ],
+          "median_us": 3979.7381083170576,
+          "latency_reduction": 0.0003094773435847742,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        },
+        "raw2": {
+          "registers": [
+            144,
+            152,
+            160,
+            56
+          ],
+          "raw_stages": 2,
+          "pieces": 0,
+          "workspace_bytes": 5504,
+          "samples_us": [
+            3835.8016967773438,
+            3836.006418863932,
+            3836.006418863932,
+            3835.4601542154946,
+            3835.9519958496094,
+            3836.3957722981772,
+            3836.5524291992188,
+            3835.528564453125
+          ],
+          "median_us": 3835.9792073567705,
+          "latency_reduction": 0.03642100200325016,
+          "max_abs_gradient_difference": 0,
+          "all_gradients_finite": true
+        }
+      }
+    }
+  }
+}

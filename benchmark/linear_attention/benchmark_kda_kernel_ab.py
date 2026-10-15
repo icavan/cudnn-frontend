@@ -9,6 +9,7 @@ config snapshot. Both variants use the candidate host path, isolating GPU change
 
 import argparse
 import importlib.util
+import inspect
 import json
 import statistics
 import sys
@@ -31,6 +32,16 @@ def load_baseline(directory):
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
+            if stem == "kda_bprop_f16" and "smem_raw_stages" not in inspect.signature(module.build_cfg).parameters:
+                original_build_cfg = module.build_cfg
+
+                def build_cfg(*args, smem_raw_stages=None, **kwargs):
+                    """Keep an old snapshot's resource settings under the new host."""
+                    # Older snapshots retain their own ring depth; the candidate
+                    # host's new resource override must not alter the baseline.
+                    return original_build_cfg(*args, **kwargs)
+
+                module.build_cfg = build_cfg
             modules.append(module)
             if stem == "kda_bprop_config":
                 # Derived config dataclasses stamp CFG defaults at import time.
@@ -50,6 +61,10 @@ def run(args):
     q, k, v, do = [torch.randn(shape, dtype=dtype, generator=generator).cuda() for _ in range(4)]
     g = (torch.randn(shape, generator=generator) - 4).cuda()
     beta = torch.randn(shape[:2], generator=generator).cuda()
+    inputs = (q, k, v, g, beta)
+    if args.e2e:
+        for tensor in inputs:
+            tensor.requires_grad_(True)
     cu = torch.tensor([0, args.tokens], dtype=torch.int32, device="cuda")
     opts = dict(use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True, safe_gate=True, plan_name="kda_frost")
     out = ops.kimi_delta_attention(q, k, v, g, beta, cu, checkpoint_every_n_tokens=args.checkpoint, **opts)
@@ -71,6 +86,9 @@ def run(args):
             package.kda_bprop_summary_f16 = summary
 
             def call():
+                if args.e2e:
+                    output = ops.kimi_delta_attention(*inputs, cu, checkpoint_every_n_tokens=args.checkpoint, **opts)[0]
+                    return (output,) + torch.autograd.grad(output, inputs, do)
                 return ops.kda_bwd(do, q, k, v, g, beta, cu, args.dim**-0.5, state_checkpoints=checkpoints, checkpoint_every_n_tokens=args.checkpoint, **opts)
 
             for _ in range(5):
@@ -90,7 +108,13 @@ def run(args):
             rms = expected.double().square().mean().sqrt().item()
             difference = actual.double() - expected.double()
             relative = difference.square().mean().sqrt().item() / max(rms, 1e-30)
-            metrics.append({"max_abs": difference.abs().max().item(), "rms_relative": relative})
+            metrics.append(
+                {
+                    "max_abs": difference.abs().max().item(),
+                    "rms_relative": relative,
+                    "bitwise_identical": bool(torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))),
+                }
+            )
             assert torch.isfinite(actual).all() and relative < 0.01, metrics
         for round_index in range(args.rounds):
             order = ("baseline", "candidate") if round_index % 2 == 0 else ("candidate", "baseline")
@@ -124,6 +148,7 @@ if __name__ == "__main__":
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--checkpoint", type=int, default=16)
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
+    parser.add_argument("--e2e", action="store_true", help="capture forward plus autograd backward instead of direct backward")
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--json", type=Path, required=True)

@@ -746,6 +746,21 @@ anti-dependency against another warp's next store. The KDA detector is
 pair it with changed-input replay and racecheck rather than treating numerical
 agreement as a memory-order proof.
 
+Apply a ring-depth override before deriving SMEM cosizes, descriptors and
+per-stage TMA transaction bytes. Check the actual config builder at multiple
+depths and rectangular dimensions, not just the selected stage count; KDA's
+`test_raw_ring_override_derives_consistent_buffer_sizes` is the detector.
+Reducing depth also changes consume-to-reuse timing: audit every optional reader
+and phase wrap before broadening the selection. Keep unmeasured schedules on
+their defaults (`test_uncut_raw_ring_override_is_limited_to_measured_schedule`).
+
+Moving an MMA also moves its buffer-lifetime obligations. A ready wait must
+precede the first consumer, not just the rescheduled operation; reuse credits
+must include every asynchronous reader. KDA's dO barrier combines epilogue
+arrivals with CG1's acknowledgement of the committed dstate epoch (which follows
+the last dO MMA). `linear_attention/frost/test_kda_do_pipeline.py` guards both
+edges. A passing racecheck does not replace these ownership checks.
+
 ## The public function contract
 
 Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.

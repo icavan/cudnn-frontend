@@ -1,0 +1,1062 @@
+{
+  "baseline_commit": "45b11933a284143b383b0d6dca11e16541f17174",
+  "host": "aistudio-61550139-ssctl",
+  "gpu": 1,
+  "raw_results_directory": "/root/kda-opt-20261012/continuation-20261015/results",
+  "dO_fix": "explicit readiness for both consumer roles; epilogue and CG1 completion credits before reuse",
+  "resource_scope": "two raw stages only for normalized D128 uncut; other defaults remain three",
+  "validation": {
+    "pytest_cases": 120,
+    "ordering_detectors_red_on_220d": 3,
+    "ordering_detectors_green": 3,
+    "fp64_cases": 12,
+    "all_gradients_bitwise_identical": true,
+    "racecheck_errors": 0,
+    "racecheck_warnings": 0,
+    "racecheck_hazards_displayed": 0,
+    "device_memcheck_errors": 0,
+    "memcheck_report_api_errors": false
+  },
+  "ab": {
+    "do_fixed_ab_cp16.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 16,
+      "dtype": "bfloat16",
+      "e2e": false,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_ab_cp16.json",
+      "samples_us": {
+        "baseline": [
+          1998.3146667480469,
+          1995.0144449869792,
+          1995.9424336751301,
+          1995.687484741211,
+          1994.8949178059895,
+          1996.285883585612,
+          1995.7407633463542,
+          1994.9141184488933
+        ],
+        "candidate": [
+          1921.3514963785808,
+          1921.1413065592449,
+          1921.5946197509766,
+          1920.850118001302,
+          1921.4122772216797,
+          1920.8128611246746,
+          1921.9445546468098,
+          1921.824010213216
+        ]
+      },
+      "median_us": {
+        "baseline": 1995.7141240437827,
+        "candidate": 1921.3818868001304
+      },
+      "speedup": 1.038686862697267,
+      "latency_reduction": 0.03724593434907297,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "do_fixed_e2e_ab_cp16.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 16,
+      "dtype": "bfloat16",
+      "e2e": true,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_e2e_ab_cp16.json",
+      "samples_us": {
+        "baseline": [
+          2659.660847981771,
+          2656.4971923828125,
+          2657.2331746419272,
+          2657.3270161946616,
+          2656.3156127929688,
+          2656.396738688151,
+          2656.0587565104165,
+          2658.1141153971353
+        ],
+        "candidate": [
+          2585.242716471354,
+          2584.4991048177085,
+          2585.333251953125,
+          2584.972890218099,
+          2584.7946166992188,
+          2585.1425170898438,
+          2585.0911458333335,
+          2584.8042805989585
+        ]
+      },
+      "median_us": {
+        "baseline": 2656.86518351237,
+        "candidate": 2585.0320180257163
+      },
+      "speedup": 1.027788114416283,
+      "latency_reduction": 0.027036812380404784,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "do_fixed_ab_cp0.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 0,
+      "dtype": "bfloat16",
+      "e2e": false,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_ab_cp0.json",
+      "samples_us": {
+        "baseline": [
+          2623.7162272135415,
+          2622.925821940104,
+          2622.8597005208335,
+          2623.206329345703,
+          2621.864573160807,
+          2622.6420084635415,
+          2623.0934143066406,
+          2623.9840189615884
+        ],
+        "candidate": [
+          2551.617177327474,
+          2551.5029907226562,
+          2549.8814900716147,
+          2550.520579020182,
+          2550.830841064453,
+          2550.797780354818,
+          2550.5355834960938,
+          2550.6848653157554
+        ]
+      },
+      "median_us": {
+        "baseline": 2623.009618123372,
+        "candidate": 2550.7413228352866
+      },
+      "speedup": 1.0283322713444558,
+      "latency_reduction": 0.02755166995528968,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "do_fixed_e2e_ab_cp0.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 8192,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 0,
+      "dtype": "bfloat16",
+      "e2e": true,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_e2e_ab_cp0.json",
+      "samples_us": {
+        "baseline": [
+          3103.449503580729,
+          3102.288055419922,
+          3103.028361002604,
+          3101.1296590169272,
+          3102.2666931152344,
+          3102.0950317382812,
+          3101.7354329427085,
+          3102.9525756835938
+        ],
+        "candidate": [
+          3039.091237386068,
+          3036.7637634277344,
+          3037.7428690592446,
+          3037.6139322916665,
+          3037.4783833821616,
+          3038.1385803222656,
+          3038.0020141601562,
+          3037.3184204101562
+        ]
+      },
+      "median_us": {
+        "baseline": 3102.277374267578,
+        "candidate": 3037.6784006754556
+      },
+      "speedup": 1.0212659027952922,
+      "latency_reduction": 0.020823081175123437,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    },
+    "do_fixed_ab_16k.json": {
+      "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+      "tokens": 16384,
+      "heads": 96,
+      "dim": 128,
+      "checkpoint": 16,
+      "dtype": "bfloat16",
+      "e2e": false,
+      "rounds": 8,
+      "repeats": 30,
+      "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_ab_16k.json",
+      "samples_us": {
+        "baseline": [
+          3989.8228963216147,
+          3986.5514119466147,
+          3987.256622314453,
+          3988.953653971354,
+          3988.2720947265625,
+          3988.080088297526,
+          3987.7237955729165,
+          3987.4720255533853
+        ],
+        "candidate": [
+          3835.1455688476562,
+          3835.724894205729,
+          3835.448455810547,
+          3835.076141357422,
+          3836.169687906901,
+          3835.5562845865884,
+          3836.6238911946616,
+          3835.6852213541665
+        ]
+      },
+      "median_us": {
+        "baseline": 3987.901941935221,
+        "candidate": 3835.6207529703775
+      },
+      "speedup": 1.0397018367488273,
+      "latency_reduction": 0.038185790719554635,
+      "accuracy": [
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        },
+        {
+          "max_abs": 0,
+          "rms_relative": 0,
+          "bitwise_identical": true
+        }
+      ]
+    }
+  },
+  "precision": {
+    "do_fixed_precision_safe.json": {
+      "args": {
+        "self_test": false,
+        "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+        "lengths": [
+          0,
+          17,
+          31,
+          256
+        ],
+        "heads": 2,
+        "reference_heads": 1,
+        "dim": 128,
+        "checkpoint": 16,
+        "seed": 1234,
+        "dtypes": [
+          "bfloat16",
+          "float16"
+        ],
+        "distributions": [
+          "normal",
+          "small_norm",
+          "correlated",
+          "cancellation",
+          "radial"
+        ],
+        "safe_gate": true,
+        "batch_invariant": false,
+        "parameters": true,
+        "require_identical": true,
+        "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_precision_safe.json"
+      },
+      "kernel_sha256": {
+        "baseline": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "37abae3a9eadd562e3b1b6c105b58cf2649c9b1d3ba2e496529a4aaa98fc5d87",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        },
+        "candidate": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "ba12ce2650812a7fe512092bfd6a09ab7837d6648a9c29cb9967c1d18a65b0aa",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        }
+      },
+      "cases": [
+        {
+          "dtype": "bfloat16",
+          "distribution": "normal",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00003451631675268914,
+            "rms_relative": 0.004555878435226727,
+            "max_abs": 0.00045546355206996236,
+            "reference_rms": 0.0075762154858663175,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.004195288381956667,
+            "dk": 0.004203538331342867,
+            "dv": 0.003674410906938464,
+            "dg": 0.005737761521288427,
+            "dbeta": 0.0034159999956518434,
+            "da_log": 0.0028899900028493773,
+            "ddt_bias": 0.007269995753530444
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.000264769117017033,
+            "dk": 0.0003942898097005418,
+            "dv": 0.0003366344212416064,
+            "dg": 0.00016591904725904699,
+            "dbeta": 0.0005277290941308396,
+            "da_log": 0.017011777350874446,
+            "ddt_bias": 0.0013551458604475347
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "small_norm",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000022044060520188427,
+            "rms_relative": 0.0044824213796023984,
+            "max_abs": 0.00038397664841659934,
+            "reference_rms": 0.004917891169380373,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.004022047553225711,
+            "dk": 0.003313997943700822,
+            "dv": 0.003650337547071897,
+            "dg": 0.005513214513037391,
+            "dbeta": 0.003435119711428486,
+            "da_log": 0.0021435202504137864,
+            "ddt_bias": 0.006569750352386518
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 3.0183035198508037,
+            "dk": 4.447963429274182,
+            "dv": 0.0003026189851471073,
+            "dg": 0.00012947998902495313,
+            "dbeta": 0.0005504264171665024,
+            "da_log": 0.010819915161918381,
+            "ddt_bias": 0.0009774997803363022
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "correlated",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000035169099618772495,
+            "rms_relative": 0.006869249869455329,
+            "max_abs": 0.0005596276349444096,
+            "reference_rms": 0.005119787500401568,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.006283848223779145,
+            "dk": 0.004673276883308654,
+            "dv": 0.006379876174531603,
+            "dg": 0.008941784447463585,
+            "dbeta": 0.007241317828507646,
+            "da_log": 0.05766946863553291,
+            "ddt_bias": 0.016178768077488644
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.0003163451561266836,
+            "dk": 0.0004656413265279394,
+            "dv": 0.00034438726630262734,
+            "dg": 0.00047558538505173935,
+            "dbeta": 0.0010578328113750035,
+            "da_log": 0.03186235658917791,
+            "ddt_bias": 0.0023557697222350432
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "cancellation",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00003788254145140325,
+            "rms_relative": 0.008967530805460689,
+            "max_abs": 0.0004671219124137843,
+            "reference_rms": 0.004224411632724479,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.008479783378124592,
+            "dk": 0.004347698199179923,
+            "dv": 0.006379876174531603,
+            "dg": 0.01107235568860354,
+            "dbeta": 0.006746720622433648,
+            "da_log": 0.023902870862639335,
+            "ddt_bias": 0.028320806128941098
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.0004388047651784962,
+            "dk": 0.0005409280863859778,
+            "dv": 0.00034438726630262734,
+            "dg": 0.00032494218341063547,
+            "dbeta": 0.001106774540646234,
+            "da_log": 0.01806589793034974,
+            "ddt_bias": 0.0022775949725177755
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "bfloat16",
+          "distribution": "radial",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00037044829710298225,
+            "rms_relative": 0.006503979015008274,
+            "max_abs": 0.0028071580403317697,
+            "reference_rms": 0.05695717902043553,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 257361.9680971,
+            "dk": 1772223.1716519645,
+            "dv": 0.00569956604617558,
+            "dg": 1,
+            "dbeta": 0.007017918354332319,
+            "da_log": 1,
+            "ddt_bias": 1
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00014209723615967937,
+            "dk": 0.004272461180576795,
+            "dv": 0.004282640064624296,
+            "dg": 1.2030132763825339e-20,
+            "dbeta": 0.008658364099419114,
+            "da_log": 2.0474720735813822e-17,
+            "ddt_bias": 2.0947203999793904e-20
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "normal",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000004379115832973006,
+            "rms_relative": 0.0005780191837874961,
+            "max_abs": 0.000039686494968882435,
+            "reference_rms": 0.00757607352108741,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0005203017055144571,
+            "dk": 0.0005207115956543416,
+            "dv": 0.00046777941901423665,
+            "dg": 0.0007451834133347442,
+            "dbeta": 0.0004287566436321919,
+            "da_log": 0.0005821241614963595,
+            "ddt_bias": 0.0008959037519400463
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00003939741631134308,
+            "dk": 0.00003859963615673867,
+            "dv": 0.00003682838989103876,
+            "dg": 0.00002746593608818869,
+            "dbeta": 0.0000739273035000737,
+            "da_log": 0.0030981275927022267,
+            "ddt_bias": 0.0001884093916044438
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "small_norm",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.0000028149308181020727,
+            "rms_relative": 0.0005723222931153164,
+            "max_abs": 0.00006148253197301584,
+            "reference_rms": 0.004918436433394176,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0005125057694404453,
+            "dk": 0.00046390012784884897,
+            "dv": 0.0004685861287192786,
+            "dg": 0.0007442792075837758,
+            "dbeta": 0.00045828769790111,
+            "da_log": 0.00036010047798019446,
+            "ddt_bias": 0.0008868250839398612
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.30592812898089505,
+            "dk": 0.4799310039988427,
+            "dv": 0.00003488098092612607,
+            "dg": 0.000028863961445369646,
+            "dbeta": 0.00006778362090777146,
+            "da_log": 0.0016625591495276204,
+            "ddt_bias": 0.00013866798785799536
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "correlated",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000004314407530267144,
+            "rms_relative": 0.0008427321607496992,
+            "max_abs": 0.00005015813545096448,
+            "reference_rms": 0.005119547741513773,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0008407675444146547,
+            "dk": 0.0005720033576610955,
+            "dv": 0.0007811044303767629,
+            "dg": 0.0010781398420370882,
+            "dbeta": 0.0008820476950839625,
+            "da_log": 0.0011628366885210793,
+            "ddt_bias": 0.0017756006265937892
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.000045338403074613744,
+            "dk": 0.00006816029481136743,
+            "dv": 0.000047893246581318105,
+            "dg": 0.00003945183741875264,
+            "dbeta": 0.00016272604893903878,
+            "da_log": 0.0006754921255235358,
+            "ddt_bias": 0.00022544685486150517
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "cancellation",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000004603750630111461,
+            "rms_relative": 0.0010899489606647464,
+            "max_abs": 0.000059440882674566264,
+            "reference_rms": 0.004223822212100363,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0010400507616014029,
+            "dk": 0.0005474014786599803,
+            "dv": 0.0007811044303767629,
+            "dg": 0.0014087799234287985,
+            "dbeta": 0.0008264899107323182,
+            "da_log": 0.0011634093593724875,
+            "ddt_bias": 0.0038981591359716853
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00004234223267805641,
+            "dk": 0.000060872752449411816,
+            "dv": 0.000047893246581318105,
+            "dg": 0.00004091404284570395,
+            "dbeta": 0.00013966759846813226,
+            "da_log": 0.0007932225062946552,
+            "ddt_bias": 0.00024352405801567056
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "radial",
+          "lengths": [
+            0,
+            17,
+            31,
+            256
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.00004510514963545785,
+            "rms_relative": 0.0007919048677902014,
+            "max_abs": 0.0003432828823535794,
+            "reference_rms": 0.056957788075382196,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 33314.62612251039,
+            "dk": 244920.4771762077,
+            "dv": 0.0007133880918453569,
+            "dg": 1,
+            "dbeta": 0.0008826155882629829,
+            "da_log": 1,
+            "ddt_bias": 1
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00001633179732543795,
+            "dk": 0.00045442598871873324,
+            "dv": 0.0005548391446235784,
+            "dg": 1.2081578542310237e-20,
+            "dbeta": 0.0009552531767780814,
+            "da_log": 2.0361568673164924e-17,
+            "ddt_bias": 2.0937286052775652e-20
+          },
+          "max_abs_error_increase": 0
+        }
+      ]
+    },
+    "do_fixed_precision_long.json": {
+      "args": {
+        "self_test": false,
+        "baseline": "/root/kda-opt-20261012/continuation-20261015/do_fixed_snapshot/python/cudnn/linear_attention/frost/kernel",
+        "lengths": [
+          8192
+        ],
+        "heads": 2,
+        "reference_heads": 1,
+        "dim": 128,
+        "checkpoint": 16,
+        "seed": 1234,
+        "dtypes": [
+          "bfloat16",
+          "float16"
+        ],
+        "distributions": [
+          "normal"
+        ],
+        "safe_gate": true,
+        "batch_invariant": true,
+        "parameters": true,
+        "require_identical": true,
+        "json": "/root/kda-opt-20261012/continuation-20261015/results/do_fixed_precision_long.json"
+      },
+      "kernel_sha256": {
+        "baseline": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "37abae3a9eadd562e3b1b6c105b58cf2649c9b1d3ba2e496529a4aaa98fc5d87",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        },
+        "candidate": {
+          "kda_bprop_config": "07c460ac65e038285dcaa6d2ce252d2f369adee42efcfafa95c5911c500bc9b2",
+          "kda_bprop_f16": "ba12ce2650812a7fe512092bfd6a09ab7837d6648a9c29cb9967c1d18a65b0aa",
+          "kda_bprop_summary_f16": "7fcf15d20dcb12164e7eb0bd8e420c7f5fa166647fd1d9c729a1a8e10ce9d5c1"
+        }
+      },
+      "cases": [
+        {
+          "dtype": "bfloat16",
+          "distribution": "normal",
+          "lengths": [
+            8192
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000041990601700577976,
+            "rms_relative": 0.004663123790586223,
+            "max_abs": 0.0006551669957977485,
+            "reference_rms": 0.009004822429408236,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.004217210460928428,
+            "dk": 0.004252951756277365,
+            "dv": 0.0037369628687186707,
+            "dg": 0.0051484231344812335,
+            "dbeta": 0.0037273002860935,
+            "da_log": 0.012084120618844788,
+            "ddt_bias": 0.005832915841820666
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.00052291190927857,
+            "dk": 0.0006226132016474983,
+            "dv": 0.0004956488009998233,
+            "dg": 0.00046157392044628463,
+            "dbeta": 0.0010174617298716881,
+            "da_log": 0.143562282174436,
+            "ddt_bias": 0.009382152632403495
+          },
+          "max_abs_error_increase": 0
+        },
+        {
+          "dtype": "float16",
+          "distribution": "normal",
+          "lengths": [
+            8192
+          ],
+          "heads": 2,
+          "dim": 128,
+          "checkpoint": 16,
+          "schedules": {
+            "baseline": {
+              "chain": false,
+              "pieces": 0
+            },
+            "candidate": {
+              "chain": false,
+              "pieces": 0
+            }
+          },
+          "finite": true,
+          "all_gradients_bitwise_identical": true,
+          "forward_fp64_error": {
+            "rms_error": 0.000005276008987292171,
+            "rms_relative": 0.0005859093300017352,
+            "max_abs": 0.00006741232002305947,
+            "reference_rms": 0.009004821594625479,
+            "finite": true
+          },
+          "gradient_fp64_rms_relative": {
+            "dq": 0.0005291145605710977,
+            "dk": 0.0006231183312766916,
+            "dv": 0.0006402265415102881,
+            "dg": 0.0012733123265267514,
+            "dbeta": 0.0006240246449703852,
+            "da_log": 0.0011894994599036073,
+            "ddt_bias": 0.0016542047741581383
+          },
+          "gradient_fp64_max_abs": {
+            "dq": 0.000059403721052266045,
+            "dk": 0.0009322612042326291,
+            "dv": 0.00038676007005864974,
+            "dg": 0.0008932333786676606,
+            "dbeta": 0.0008031792582851825,
+            "da_log": 0.016429714552005592,
+            "ddt_bias": 0.006385082963138777
+          },
+          "max_abs_error_increase": 0
+        }
+      ]
+    }
+  }
+}
