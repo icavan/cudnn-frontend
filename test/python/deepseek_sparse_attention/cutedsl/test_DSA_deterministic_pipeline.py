@@ -313,6 +313,7 @@ def test_csa_dsa_deterministic_training_pipeline_cuda_graph_changed_inputs():
         try:
             with torch.cuda.graph(graph, stream=stream):
                 captured = _run_pipeline(data)
+            graph.replay()
             reference = _clone_outputs(captured)
             for repeat in range(1, 8):
                 graph.replay()
