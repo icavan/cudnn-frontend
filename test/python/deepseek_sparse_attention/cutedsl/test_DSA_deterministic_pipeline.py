@@ -298,17 +298,17 @@ def test_csa_dsa_deterministic_training_pipeline_configuration_matrix(ratio, cof
 @pytest.mark.parametrize(
     "total_tokens,sq,topk,attention_heads,backend",
     [
-        pytest.param(8194, 2, 2048, 32, "default", id="short-k2048-default"),
+        pytest.param(9218, 2, 2048, 32, "default", id="short-k2048-default"),
         pytest.param(4096, 193, 896, 64, "sm100_v2", id="persistent-k896-v2"),
     ],
 )
 def test_csa_dsa_deterministic_training_pipeline_large_topk(total_tokens, sq, topk, attention_heads, backend):
-    """Large Top-K composes through attention and repeated indexer producer handoffs."""
+    """Large Top-K and cutoff ties compose through every downstream consumer."""
     data = _inputs(total_tokens=total_tokens, sq=sq, topk=topk, attention_heads=attention_heads, seed=2600 + sq + topk)
-    reference = _clone_outputs(_run_pipeline(data, backend=backend))
+    reference = _clone_outputs(_run_pipeline(data, backend=backend, check_topk=True))
     _assert_no_unexpected_nonfinite(reference)
     for repeat in range(1, 3):
-        actual = _clone_outputs(_run_pipeline(data, backend=backend))
+        actual = _clone_outputs(_run_pipeline(data, backend=backend, check_topk=True))
         _assert_bitwise_equal(actual, reference, f" at repeat {repeat}")
 
 
