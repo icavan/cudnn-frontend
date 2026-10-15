@@ -158,7 +158,10 @@ synchronization; GPU numbers use CUDA events. Peak eager allocated memory and
 post-capture live/reserved memory expose transient workspace versus the CUDA
 Graph private pool. The profiler tables identify wrapper/allocation/autograd
 cost on the eager path. CUDA Graph replay is the serving/training steady-state
-control for launch overhead.
+control for launch overhead. The harness temporarily disables PyTorch's
+deterministic uninitialized-memory debug fill, so timings compare the requested
+algorithms rather than fill kernels for wrapper-owned outputs and workspaces;
+the caller's setting is restored on exit.
 
 ### Standalone Indexer Top-K
 

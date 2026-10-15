@@ -248,7 +248,11 @@ def main():
 
     previous = torch.are_deterministic_algorithms_enabled()
     previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
     torch.use_deterministic_algorithms(args.deterministic, warn_only=False)
+    # Measure the selected algorithms, not PyTorch's debug fill kernels for
+    # wrapper-owned torch.empty outputs and workspaces.
+    torch.utils.deterministic.fill_uninitialized_memory = False
     graph = None
     capture_stream = None
     try:
@@ -335,6 +339,7 @@ def main():
     finally:
         if graph is not None:
             graph.reset()
+        torch.utils.deterministic.fill_uninitialized_memory = previous_fill_uninitialized
         torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
 
 
