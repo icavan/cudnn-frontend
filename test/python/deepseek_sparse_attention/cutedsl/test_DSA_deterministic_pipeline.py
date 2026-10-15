@@ -7,8 +7,7 @@ import pytest
 import torch
 
 from cudnn import CSA, DSA
-
-pytestmark = pytest.mark.L1
+from test_utils import bitwise_bits
 
 
 @pytest.fixture(autouse=True)
@@ -29,30 +28,43 @@ def supported():
         torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
 
 
-def _inputs(*, ratio=4, coff=1, total_tokens=1024, sq=4, with_sink=True, short_topk_rows=False, seed=2301):
+def _inputs(
+    *,
+    ratio=4,
+    coff=1,
+    total_tokens=1024,
+    sq=4,
+    topk=128,
+    attention_heads=64,
+    with_sink=True,
+    seq_lens=None,
+    seed=2301,
+):
     torch.manual_seed(seed)
-    heads = 64
+    indexer_heads = 64
     num_blocks = total_tokens // ratio
+    if num_blocks < topk:
+        raise ValueError(f"test setup requires num_blocks >= topk, got {num_blocks} < {topk}")
     compressor_kv = torch.randn(total_tokens, coff * 128, dtype=torch.bfloat16, device="cuda")
     compressor_score = torch.randn_like(compressor_kv)
     ape = torch.randn(ratio, coff * 128, dtype=torch.float32, device="cuda")
     cu_seqlens = torch.tensor([0, total_tokens], dtype=torch.int32, device="cuda")
     cu_seqlens_comp = torch.tensor([0, num_blocks], dtype=torch.int32, device="cuda")
-    index_q = torch.randn(1, sq, heads, 128, dtype=torch.bfloat16, device="cuda")
-    weights = torch.randn(1, sq, heads, dtype=torch.bfloat16, device="cuda")
-    attn_q = torch.randn(sq, heads, 512, dtype=torch.bfloat16, device="cuda")
+    index_q = torch.randn(1, sq, indexer_heads, 128, dtype=torch.bfloat16, device="cuda")
+    weights = torch.randn(1, sq, indexer_heads, dtype=torch.bfloat16, device="cuda")
+    attn_q = torch.randn(sq, attention_heads, 512, dtype=torch.bfloat16, device="cuda")
     attn_kv = torch.randn(total_tokens, 512, dtype=torch.bfloat16, device="cuda")
-    attn_sink = torch.randn(heads, dtype=torch.float32, device="cuda") if with_sink else None
+    attn_sink = torch.randn(attention_heads, dtype=torch.float32, device="cuda") if with_sink else None
     dout = torch.randn_like(attn_q)
     q_causal_offsets = torch.tensor([total_tokens - sq], dtype=torch.int32, device="cuda")
-    if short_topk_rows:
-        seq_lens = torch.linspace(32, 128, steps=sq, dtype=torch.float32, device="cuda").to(torch.int32)
-    else:
-        seq_lens = torch.full((sq,), num_blocks, dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((sq,), num_blocks, dtype=torch.int32, device="cuda") if seq_lens is None else torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    if seq_lens.shape != (sq,):
+        raise ValueError(f"test setup requires one logical length per query row, got {tuple(seq_lens.shape)} for sq={sq}")
     return {
         "ratio": ratio,
         "coff": coff,
         "num_blocks": num_blocks,
+        "topk": topk,
         "compressor_kv": compressor_kv,
         "compressor_score": compressor_score,
         "ape": ape,
@@ -72,6 +84,7 @@ def _inputs(*, ratio=4, coff=1, total_tokens=1024, sq=4, with_sink=True, short_t
 def _run_pipeline(data, *, deterministic_dk_planes=96, backend="default", check_topk=False):
     ratio = data["ratio"]
     num_blocks = data["num_blocks"]
+    topk_size = data["topk"]
     index_k = CSA.csa_compressor_forward_wrapper(
         data["compressor_kv"],
         data["compressor_score"],
@@ -95,31 +108,33 @@ def _run_pipeline(data, *, deterministic_dk_planes=96, backend="default", check_
     topk = DSA.indexer_top_k_wrapper(
         scores.reshape(-1, num_blocks),
         data["seq_lens"],
-        top_k=128,
+        top_k=topk_size,
         return_val=True,
         deterministic=True,
     )
-    block_indices = topk["indices"].view(1, scores.shape[1], 128)
+    block_indices = topk["indices"].view(1, scores.shape[1], topk_size)
     tied_topk = None
     if check_topk:
         assert torch.all(block_indices >= 0)
         gathered_values = torch.gather(scores, -1, block_indices.long())
         assert torch.equal(topk["values"].view_as(gathered_values), gathered_values)
 
-        # A same-shape side probe places 160 equal maxima across the K=128 cutoff.
+        tie_count = topk_size + 32
+        assert num_blocks >= tie_count, "tie probe needs equal maxima on both sides of the cutoff"
+        # A same-shape side probe places equal maxima across the Top-K cutoff.
         # Deterministic Top-K must choose and order the smallest source indices,
         # independent of scheduling.
         tied_scores = torch.zeros_like(scores)
-        tied_scores[..., :160] = 1.0
+        tied_scores[..., :tie_count] = 1.0
         tied_topk = DSA.indexer_top_k_wrapper(
             tied_scores.reshape(-1, num_blocks),
             data["seq_lens"],
-            top_k=128,
+            top_k=topk_size,
             return_val=True,
             deterministic=True,
         )
         tied_indices = tied_topk["indices"].view_as(block_indices)
-        expected_indices = torch.arange(128, dtype=torch.int32, device="cuda").view(1, 1, 128).expand_as(tied_indices)
+        expected_indices = torch.arange(topk_size, dtype=torch.int32, device="cuda").view(1, 1, topk_size).expand_as(tied_indices)
         assert torch.equal(tied_indices, expected_indices)
 
     token_indices = (block_indices.squeeze(0).unsqueeze(-1) * ratio + torch.arange(ratio, dtype=torch.int32, device="cuda").view(1, 1, ratio)).reshape(
@@ -145,7 +160,7 @@ def _run_pipeline(data, *, deterministic_dk_planes=96, backend="default", check_
             attention["lse"],
             token_indices,
         )["target"]
-        .view(scores.shape[1], 128, ratio)
+        .view(scores.shape[1], topk_size, ratio)
         .sum(-1)
         .unsqueeze(0)
     )
@@ -211,9 +226,19 @@ def _clone_outputs(outputs):
 def _assert_bitwise_equal(actual, expected, context=""):
     assert actual.keys() == expected.keys()
     for name in actual:
-        assert torch.equal(actual[name], expected[name]), f"{name} changed{context}"
+        assert torch.equal(bitwise_bits(actual[name]), bitwise_bits(expected[name])), f"{name} changed{context}"
 
 
+@pytest.mark.L0
+def test_csa_dsa_deterministic_training_pipeline_smoke():
+    """Default CI executes one complete strict-deterministic training step twice."""
+    data = _inputs()
+    reference = _clone_outputs(_run_pipeline(data))
+    actual = _clone_outputs(_run_pipeline(data))
+    _assert_bitwise_equal(actual, reference)
+
+
+@pytest.mark.L1
 def test_csa_dsa_deterministic_training_pipeline_repeat_100():
     """Every floating output and gradient is bitwise stable for 100 executions."""
     data = _inputs()
@@ -223,25 +248,29 @@ def test_csa_dsa_deterministic_training_pipeline_repeat_100():
         _assert_bitwise_equal(actual, reference, f" at repeat {repeat}")
 
 
+@pytest.mark.L1
 @pytest.mark.parametrize(
-    "ratio,coff,with_sink,backend,planes,short_topk_rows",
+    "ratio,coff,total_tokens,sq,attention_heads,with_sink,backend,planes,seq_lens",
     [
-        (2, 1, False, "default", 96, True),
-        (4, 2, True, "default", 128, False),
-        (4, 1, True, "sm100_v2", 148, False),
+        pytest.param(2, 1, 1023, 1, 16, False, "default", 96, (1,), id="singleton-h16-r2-tail"),
+        pytest.param(4, 2, 1024, 4, 32, True, "default", 128, (1, 2, 127, 128), id="length-boundaries-h32"),
+        pytest.param(4, 1, 1025, 129, 128, True, "sm100_v2", 148, None, id="q-wave-plus-one-h128-tail-v2"),
     ],
 )
-def test_csa_dsa_deterministic_training_pipeline_configuration_matrix(ratio, coff, with_sink, backend, planes, short_topk_rows):
-    """Cross compressor modes, indexer backends/planes, no sink, and short Top-K rows."""
+def test_csa_dsa_deterministic_training_pipeline_configuration_matrix(ratio, coff, total_tokens, sq, attention_heads, with_sink, backend, planes, seq_lens):
+    """Orthogonally cover compressor modes, attention heads, lengths, backends, and planes."""
     data = _inputs(
         ratio=ratio,
         coff=coff,
+        total_tokens=total_tokens,
+        sq=sq,
+        attention_heads=attention_heads,
         with_sink=with_sink,
-        short_topk_rows=short_topk_rows,
-        seed=2400 + ratio + coff + planes,
+        seq_lens=seq_lens,
+        seed=2400 + ratio + coff + planes + sq + attention_heads,
     )
     reference = _clone_outputs(_run_pipeline(data, deterministic_dk_planes=planes, backend=backend))
-    if short_topk_rows:
+    if seq_lens is not None:
         indices = reference["topk_indices"].view(data["seq_lens"].numel(), -1)
         values = reference["topk_values"].view_as(indices)
         positions = torch.arange(indices.shape[1], dtype=torch.int32, device="cuda").unsqueeze(0)
@@ -254,6 +283,24 @@ def test_csa_dsa_deterministic_training_pipeline_configuration_matrix(ratio, cof
         _assert_bitwise_equal(actual, reference, f" at repeat {repeat}")
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "total_tokens,sq,topk,attention_heads,backend",
+    [
+        pytest.param(8194, 2, 2048, 32, "default", id="short-k2048-default"),
+        pytest.param(4096, 193, 896, 64, "sm100_v2", id="persistent-k896-v2"),
+    ],
+)
+def test_csa_dsa_deterministic_training_pipeline_large_topk(total_tokens, sq, topk, attention_heads, backend):
+    """Large Top-K composes through attention and repeated indexer producer handoffs."""
+    data = _inputs(total_tokens=total_tokens, sq=sq, topk=topk, attention_heads=attention_heads, seed=2600 + sq + topk)
+    reference = _clone_outputs(_run_pipeline(data, backend=backend))
+    for repeat in range(1, 3):
+        actual = _clone_outputs(_run_pipeline(data, backend=backend))
+        _assert_bitwise_equal(actual, reference, f" at repeat {repeat}")
+
+
+@pytest.mark.L1
 def test_csa_dsa_deterministic_training_pipeline_cuda_graph_changed_inputs():
     """The complete allocating composition remains replayable and reads changed source tensors."""
     data = _inputs()
@@ -266,6 +313,11 @@ def test_csa_dsa_deterministic_training_pipeline_cuda_graph_changed_inputs():
         try:
             with torch.cuda.graph(graph, stream=stream):
                 captured = _run_pipeline(data)
+            reference = _clone_outputs(captured)
+            for repeat in range(1, 8):
+                graph.replay()
+                actual = _clone_outputs(captured)
+                _assert_bitwise_equal(actual, reference, f" at graph replay {repeat}")
             with torch.no_grad():
                 data["compressor_kv"].mul_(0.75)
                 data["compressor_score"].mul_(1.25)
