@@ -229,11 +229,20 @@ def _assert_bitwise_equal(actual, expected, context=""):
         assert torch.equal(bitwise_bits(actual[name]), bitwise_bits(expected[name])), f"{name} changed{context}"
 
 
+def _assert_no_unexpected_nonfinite(outputs):
+    for name, tensor in outputs.items():
+        if name in ("index_scores", "topk_values", "tied_topk_values"):
+            assert torch.all(torch.isfinite(tensor) | torch.isneginf(tensor)), f"{name} contains NaN or positive infinity"
+        else:
+            assert torch.isfinite(tensor).all(), f"{name} contains a non-finite value"
+
+
 @pytest.mark.L0
 def test_csa_dsa_deterministic_training_pipeline_smoke():
     """Default CI executes one complete strict-deterministic training step twice."""
     data = _inputs()
     reference = _clone_outputs(_run_pipeline(data))
+    _assert_no_unexpected_nonfinite(reference)
     actual = _clone_outputs(_run_pipeline(data))
     _assert_bitwise_equal(actual, reference)
 
@@ -243,6 +252,7 @@ def test_csa_dsa_deterministic_training_pipeline_repeat_100():
     """Every floating output and gradient is bitwise stable for 100 executions."""
     data = _inputs()
     reference = _clone_outputs(_run_pipeline(data, check_topk=True))
+    _assert_no_unexpected_nonfinite(reference)
     for repeat in range(1, 100):
         actual = _clone_outputs(_run_pipeline(data, check_topk=True))
         _assert_bitwise_equal(actual, reference, f" at repeat {repeat}")
@@ -270,6 +280,7 @@ def test_csa_dsa_deterministic_training_pipeline_configuration_matrix(ratio, cof
         seed=2400 + ratio + coff + planes + sq + attention_heads,
     )
     reference = _clone_outputs(_run_pipeline(data, deterministic_dk_planes=planes, backend=backend))
+    _assert_no_unexpected_nonfinite(reference)
     if seq_lens is not None:
         indices = reference["topk_indices"].view(data["seq_lens"].numel(), -1)
         values = reference["topk_values"].view_as(indices)
@@ -295,6 +306,7 @@ def test_csa_dsa_deterministic_training_pipeline_large_topk(total_tokens, sq, to
     """Large Top-K composes through attention and repeated indexer producer handoffs."""
     data = _inputs(total_tokens=total_tokens, sq=sq, topk=topk, attention_heads=attention_heads, seed=2600 + sq + topk)
     reference = _clone_outputs(_run_pipeline(data, backend=backend))
+    _assert_no_unexpected_nonfinite(reference)
     for repeat in range(1, 3):
         actual = _clone_outputs(_run_pipeline(data, backend=backend))
         _assert_bitwise_equal(actual, reference, f" at repeat {repeat}")
@@ -315,6 +327,7 @@ def test_csa_dsa_deterministic_training_pipeline_cuda_graph_changed_inputs():
                 captured = _run_pipeline(data)
             graph.replay()
             reference = _clone_outputs(captured)
+            _assert_no_unexpected_nonfinite(reference)
             for repeat in range(1, 8):
                 graph.replay()
                 actual = _clone_outputs(captured)
