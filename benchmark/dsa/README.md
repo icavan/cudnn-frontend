@@ -12,6 +12,11 @@ run them:
   `benchmark_dsa_sparse_attention_backward.py`,
   `benchmark_dsa_indexer_h32.py`) — ad-hoc shapes, execute-vs-wrapper split,
   compact-H32 adapter comparisons, and `profile` mode for nsys/ncu.
+- **End-to-end deterministic training** (`benchmark_csa_dsa_pipeline.py`) —
+  CSA compressor forward/backward, dense indexer, deterministic Top-K, sparse
+  attention training, score recompute, and deterministic indexer backward;
+  reports eager versus CUDA Graph host enqueue and GPU latency plus warm eager
+  CPU/CUDA profiler tables.
 
 ## Contents
 
@@ -131,6 +136,29 @@ results/<config>/<gpu>/
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
 
 ## Single Scripts
+
+### End-to-End Deterministic CSA/DSA Training
+
+`benchmark_csa_dsa_pipeline.py` profiles the public allocating-wrapper path and
+the CUDA Graph captured form of the same pipeline. Its default local shape
+(`tokens=16384`) models a 1M-token sequence sharded over CP64 with ratio 4. The
+timed regions exclude compilation, capture, correctness checks, and profiler
+collection. The deterministic default verifies changed-input replay bitwise
+before reporting; `--no-deterministic` is the numerical/performance control.
+
+```bash
+python -m benchmark.dsa.benchmark_csa_dsa_pipeline
+python -m benchmark.dsa.benchmark_csa_dsa_pipeline --tokens 1024 --sq 4 --topk 128
+python -m benchmark.dsa.benchmark_csa_dsa_pipeline --no-deterministic
+python -m benchmark.dsa.benchmark_csa_dsa_pipeline --trace /tmp/csa-dsa.json
+```
+
+The host numbers measure warm Python enqueue time without a per-step device
+synchronization; GPU numbers use CUDA events. Peak eager allocated memory and
+post-capture live/reserved memory expose transient workspace versus the CUDA
+Graph private pool. The profiler tables identify wrapper/allocation/autograd
+cost on the eager path. CUDA Graph replay is the serving/training steady-state
+control for launch overhead.
 
 ### Standalone Indexer Top-K
 

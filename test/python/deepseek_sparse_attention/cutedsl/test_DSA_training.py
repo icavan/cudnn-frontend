@@ -166,6 +166,76 @@ def test_old_dsl_declines_before_any_kernel_launch(monkeypatch):
         DSA.sparse_attention(q, kv, idx, a)
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "heads,dim,sink,lengths",
+    [
+        (32, 576, False, True),
+        (64, 576, True, False),
+        (128, 512, False, True),
+    ],
+)
+def test_deterministic_training_numerics_and_bitwise_repeat(heads, dim, sink, lengths):
+    """Determinism composes with D576, H128, no-sink, and no-length variants."""
+    q, kv, idx, a, lens = inputs(heads, dim, sink, lengths)
+    qr, kr = q.detach().float().requires_grad_(), kv.detach().float().requires_grad_()
+    ar = a.detach().clone().requires_grad_() if a is not None else None
+    out_ref, _, _, _ = reference(qr, kr, idx, ar, lens)
+    # D576 carries 512 value channels, so the output/gradient width is not the
+    # Q/K logical record width.
+    grad = torch.randn_like(out_ref, dtype=torch.bfloat16)
+    out_ref.backward(grad.float())
+
+    def run():
+        for tensor in (q, kv, a):
+            if tensor is not None:
+                tensor.grad = None
+        out = DSA.sparse_attention(q, kv, idx, a, topk_length=lens, deterministic=True)["out"]
+        out.backward(grad)
+        grads = [q.grad.detach().clone(), kv.grad.detach().clone()]
+        if a is not None:
+            grads.append(a.grad.detach().clone())
+        return out.detach().clone(), grads
+
+    expected_out, expected_grads = run()
+    assert_numerics(expected_out, out_ref, 0.01)
+    assert_numerics(expected_grads[0], qr.grad)
+    assert_numerics(expected_grads[1], kr.grad)
+    if ar is not None:
+        assert_numerics(expected_grads[2], ar.grad)
+    for _ in range(2):
+        actual_out, actual_grads = run()
+        assert torch.equal(actual_out, expected_out)
+        for actual, expected in zip(actual_grads, expected_grads):
+            assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("q_grad,kv_grad,sink_grad", [(True, False, False), (False, True, False), (False, False, True)])
+def test_deterministic_training_respects_partial_gradient_requests(q_grad, kv_grad, sink_grad):
+    q, kv, idx, a, lens = inputs()
+    q.requires_grad_(q_grad)
+    kv.requires_grad_(kv_grad)
+    a.requires_grad_(sink_grad)
+    DSA.sparse_attention(q, kv, idx, a, topk_length=lens, deterministic=True)["out"].sum().backward()
+    for requested, tensor in ((q_grad, q), (kv_grad, kv), (sink_grad, a)):
+        assert (tensor.grad is not None) == requested
+
+
+def test_deterministic_flag_does_not_touch_backward_for_forward_only(monkeypatch):
+    q, kv, idx, a, lens = inputs()
+    q, kv, a = q.detach(), kv.detach(), a.detach()
+    expected = DSA.sparse_attention(q, kv, idx, a, topk_length=lens, deterministic=False)
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import api as backward_api
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("forward-only call reached sparse backward")
+
+    monkeypatch.setattr(backward_api, "sparse_attention_backward_wrapper", forbidden)
+    actual = DSA.sparse_attention(q, kv, idx, a, topk_length=lens, deterministic=True)
+    for key in ("out", "max_logits", "lse"):
+        assert torch.equal(actual[key], expected[key])
+
+
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_training_graph_replay_uses_changed_inputs_and_metadata(deterministic):
     q, kv, idx, a, lens = inputs()
