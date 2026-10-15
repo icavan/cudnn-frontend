@@ -286,11 +286,11 @@ def test_short_valid_prefixes_remain_finite_and_in_range():
     assert all(grad is not None and torch.isfinite(grad).all() for grad in grads)
 
 
-@pytest.mark.parametrize("ratio", [1, 4])
-def test_deterministic_topk_uses_smaller_indices_for_ties(ratio):
+@pytest.mark.parametrize("ratio,tokens", [(1, 512), (4, 1024)])
+def test_deterministic_topk_uses_smaller_indices_for_ties(ratio, tokens):
     """Direct and compressed routes preserve Top-K's deterministic tie rule."""
 
-    data = _inputs(ratio=ratio, sq=2)
+    data = _inputs(ratio=ratio, sq=2, tokens=tokens)
     data["index_q"] = torch.zeros_like(data["index_q"], requires_grad=True)
     module = CompressedSparseAttention(compress_ratio=ratio, top_k=data["top_k"], deterministic=True, device="cuda")
     result = _call(module, data)

@@ -302,8 +302,19 @@ The measured incremental eager high-water mark was 5750 MiB for the ordinary
 path and 5770 MiB for every deterministic plane choice. This does not contradict
 the per-indexer scratch sizes above: a different pipeline stage establishes the
 full-call peak, while the indexer workspaces have disjoint lifetimes. Reproduce
-the table with `benchmark/csa/benchmark_csa_training.py`; it prints both Markdown
-and JSON and supports reversed construction order.
+the table with:
+
+```bash
+python benchmark/csa/benchmark_csa_training.py \
+  --tokens 16384 --sq 8192 --heads 64 --dim 512 \
+  --ratio 4 --coff 1 --top-k 2048 \
+  --k-norm-placement after_pool --backend default \
+  --planes 96 128 148 --warmup 3 --samples 10 \
+  --construction-order non-deterministic-first
+```
+
+Repeat with `--construction-order deterministic-first` in a fresh process to
+measure the reversed order. The script prints both Markdown and JSON.
 
 ### High-level wrappers
 

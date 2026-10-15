@@ -270,8 +270,10 @@ def main():
             graph_device = _device_us(graph.replay, args.iterations)
 
             with torch.no_grad():
+                graph_pipeline.compressor_kv.mul_(0.75)
                 graph_pipeline.index_q.mul_(0.75)
                 graph_pipeline.attn_q.mul_(1.25)
+                graph_pipeline.attn_kv.mul_(0.8)
             graph.replay()
             replayed = {name: tensor.detach().clone() for name, tensor in captured.items()}
             expected = graph_pipeline.run()
