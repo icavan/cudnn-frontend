@@ -161,6 +161,63 @@ def test_frost_native_kda_backward_respects_output_strides(total, heads):
         assert torch.isnan(padded[name][..., reference.shape[-1] :]).all(), f"{name} wrote into output padding"
 
 
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("checkpoint", [0, 16])
+def test_uncut_bwd_raw_ring_wraps_and_changed_input_replay(monkeypatch, dim, dtype, checkpoint):
+    """Five chunks cover raw-ring phase wraps, a tail and fresh replay operands."""
+    from cudnn.linear_attention.ops import kda as ops
+
+    monkeypatch.setattr(ops, "bprop_cache", {})
+    generator = torch.Generator().manual_seed(418)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        shape = (65, 1, dim)
+        q, k, v = [torch.randn(shape, dtype=dtype, generator=generator).cuda().requires_grad_(True) for _ in range(3)]
+        g = (torch.randn(shape, generator=generator) - 4).cuda().requires_grad_(True)
+        beta = torch.randn(shape[:2], generator=generator).cuda().requires_grad_(True)
+        cu = torch.tensor([0, shape[0]], device="cuda", dtype=torch.int32)
+        do = torch.randn(shape, dtype=dtype, generator=generator).cuda()
+        leaves = [q, k, v, g, beta]
+        options = dict(use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True, safe_gate=True, batch_invariant=True, plan_name="kda_frost")
+        if checkpoint == 0:
+            state = torch.randn((1, 1, dim, dim), generator=generator).cuda().requires_grad_(True)
+            a_log = torch.zeros(1, device="cuda", requires_grad=True)
+            dt_bias = torch.zeros((1, dim), device="cuda", requires_grad=True)
+            options.update(initial_state=state, a_log=a_log, dt_bias=dt_bias)
+            leaves.extend((state, a_log, dt_bias))
+
+        def call():
+            """Use the public autograd path, including checkpoint/recompute work."""
+            output = kimi_delta_attention(q, k, v, g, beta, cu, checkpoint_every_n_tokens=checkpoint, **options)[0]
+            return torch.autograd.grad(output, leaves, do)
+
+        call()
+        baseline = call()
+        assert len(ops.bprop_cache) == 1
+        host_graph, _ = next(iter(ops.bprop_cache.values()))
+        assert not host_graph._compiled_plans[host_graph._plan_index].compiled.chain
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                actual = call()
+            for _ in range(2):
+                graph.replay()
+                for got, want in zip(actual, baseline, strict=True):
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+            with torch.no_grad():
+                v.add_(0.25)
+            baseline = call()
+            graph.replay()
+            for got, want in zip(actual, baseline, strict=True):
+                assert torch.isfinite(got).all()
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+        finally:
+            stream.synchronize()
+            graph.reset()
+
+
 @pytest.mark.parametrize("optional", [False, True])
 @pytest.mark.parametrize("safe_gate", [False, True])
 @pytest.mark.parametrize("checkpoint", [0, 32])

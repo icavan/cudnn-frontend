@@ -229,7 +229,8 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_raw_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
         mb_raw_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=CG0 + CG2 + CG1, producer=Producer.THREAD),
         mb_do_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
-        mb_do_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=WARP, producer=Producer.THREAD),
+        # Epilogue reads plus CG1's acknowledgement of all dO-reading MMAs.
+        mb_do_done=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=WARP + CG1, producer=Producer.THREAD),
         mb_state_ready=MBarrier(alloc(cfg.smem_state_stages), try_wait=True, stages=cfg.smem_state_stages, init_count=1, producer=Producer.TMA_LOAD),
         mb_state_done=MBarrier(alloc(cfg.smem_state_stages), try_wait=True, stages=cfg.smem_state_stages, init_count=MMA, producer=Producer.MMA_COMMIT),
         mb_state_cg0_done=MBarrier(alloc(cfg.smem_state_stages), try_wait=True, stages=cfg.smem_state_stages, init_count=CG0, producer=Producer.THREAD),
@@ -522,6 +523,7 @@ def epilogue_warp(
                 # ---- dA = tril(dO @ U^T, 0) ------------------------------------------
                 bars.mb_u_smem_ready.wait(u_index.phase)
                 u_index = advance(u_index, 1)
+                bars.mb_do_ready[raw_stage].wait(raw_index.phase)
                 da_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
                 for accum_idx in cutlass.range_constexpr(8):
                     da_acc[accum_idx] = cutlass.Float32(0.0)
@@ -1201,6 +1203,7 @@ def tcgen05_mma_warp(
                 dstate_input_index = advance(dstate_input_index, 1)
 
             # ---- dU intra += dO^T(S) @ A ---------------------------------------------
+            bars.mb_do_ready[raw_stage_idx].wait((chunk_serial // cfg.smem_raw_stages) % 2)
             bars.mb_a_ready[intermediate_stage].wait(intermediate_phase)
             mma_ss(
                 bmm_do_a_desc,
@@ -1267,7 +1270,6 @@ def tcgen05_mma_warp(
             bars.mb_dqk_acc_done.wait(parts_done_index.phase)
             parts_done_index = advance(parts_done_index, 1)
             bars.mb_state_input_ready[chunk_serial % 2].wait((chunk_serial // 2) % 2)
-            bars.mb_do_ready[raw_stage_idx].wait((chunk_serial // cfg.smem_raw_stages) % 2)
             if chunk_idx >= FIRST_STATE_CHUNK:
                 a_ptr = nvvm.make_tmem_ptr((tmem_base + cfg.tmem_state_input_offset + (chunk_serial % 2) * (cfg.d_v // 2)), cutlass.Int8)
                 b_desc = d_do0 + raw_stage_idx * do_seg
@@ -2405,6 +2407,8 @@ def compute1_warp_group(
             # ---- dstate capture for the next chunk -----------------------------------
             bars.mb_dstate_acc_ready.wait(dstate_ready_index.phase)
             dstate_ready_index = advance(dstate_ready_index, 1)
+            # The committed dstate epoch also completes the earlier dQ dO reads.
+            bars.mb_do_done[raw_index.idx].arrive()
             if rev_idx + cutlass.Int32(1) < num_compute_chunks:
                 bars.mb_dstate_smem_done.wait(dstate_smem_done_index.phase)
                 bars.mb_dstate_smem_cg2_done.wait(dstate_smem_done_index.phase)
