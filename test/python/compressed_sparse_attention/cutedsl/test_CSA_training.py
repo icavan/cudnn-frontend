@@ -8,6 +8,7 @@ import warnings
 import pytest
 import torch
 from cudnn import CSA, CompressedSparseAttention
+from test_utils import bitwise_bits
 
 pytestmark = pytest.mark.L1
 
@@ -23,12 +24,11 @@ def supported():
         pytest.skip(error)
 
 
-def _inputs(*, ratio=1, coff=1, sq=4, indexer_heads=64, attention_heads=64, top_k=None, seed=9021):
+def _inputs(*, ratio=1, coff=1, sq=4, tokens=512, indexer_heads=64, attention_heads=64, top_k=None, seed=9021):
     """Create one single-sequence module invocation."""
 
     torch.manual_seed(seed)
     top_k = 128 * ratio if top_k is None else top_k
-    tokens = 512
     blocks = tokens if ratio == 1 else tokens // ratio
     index_q = torch.randn(1, sq, indexer_heads, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     if ratio == 1:
@@ -94,6 +94,10 @@ def _grad_inputs(module, data):
     return tensors
 
 
+def _assert_bitwise_equal(actual, expected, context=""):
+    assert torch.equal(bitwise_bits(actual.reshape(-1)), bitwise_bits(expected.reshape(-1))), context
+
+
 def test_public_exports_are_the_same_class():
     """Top-level and namespace imports share one lazily loaded class."""
 
@@ -104,10 +108,13 @@ def test_public_exports_are_the_same_class():
     "kwargs,message",
     [
         ({"compress_ratio": 128, "top_k": 2048}, "compress_ratio"),
+        ({"compress_ratio": True}, "compress_ratio must be an int"),
         ({"compress_ratio": 1, "coff": 2}, "coff must be 1"),
+        ({"top_k": 2048.0}, "top_k must be an int"),
         ({"compress_ratio": 4, "top_k": 256}, "128 \\* compress_ratio"),
         ({"k_norm_placement": "middle"}, "k_norm_placement"),
         ({"deterministic": False, "deterministic_dk_planes": 128}, "only when deterministic"),
+        ({"deterministic_dk_planes": 96.0}, "deterministic_dk_planes must be an int"),
         ({"dtype": torch.float32}, "k_norm parameters must use torch.bfloat16"),
     ],
 )
@@ -279,14 +286,15 @@ def test_short_valid_prefixes_remain_finite_and_in_range():
     assert all(grad is not None and torch.isfinite(grad).all() for grad in grads)
 
 
-def test_deterministic_topk_uses_smaller_indices_for_ties():
-    """The integrated deterministic route preserves Top-K's documented tie rule."""
+@pytest.mark.parametrize("ratio", [1, 4])
+def test_deterministic_topk_uses_smaller_indices_for_ties(ratio):
+    """Direct and compressed routes preserve Top-K's deterministic tie rule."""
 
-    data = _inputs(ratio=1, sq=2)
+    data = _inputs(ratio=ratio, sq=2)
     data["index_q"] = torch.zeros_like(data["index_q"], requires_grad=True)
-    module = CompressedSparseAttention(compress_ratio=1, top_k=data["top_k"], deterministic=True, device="cuda")
+    module = CompressedSparseAttention(compress_ratio=ratio, top_k=data["top_k"], deterministic=True, device="cuda")
     result = _call(module, data)
-    expected = torch.arange(data["top_k"], dtype=torch.int32, device="cuda").expand(data["index_q"].shape[1], -1)
+    expected = torch.arange(data["block_top_k"], dtype=torch.int32, device="cuda").expand(data["index_q"].shape[1], -1)
     assert torch.equal(result["block_indices"].squeeze(0), expected)
 
 
@@ -302,8 +310,15 @@ def test_indexer_loss_backward_rejects_retained_graph_reuse():
         torch.autograd.grad(result["indexer_loss"], targets)
 
 
-@pytest.mark.parametrize("ratio", [2, 4])
-@pytest.mark.parametrize("placement", ["before_pool", "after_pool"])
+@pytest.mark.parametrize(
+    "ratio,placement",
+    [
+        pytest.param(2, "before_pool", id="r2-before"),
+        pytest.param(2, "after_pool", id="r2-after"),
+        pytest.param(4, "before_pool", id="r4-before"),
+        pytest.param(4, "after_pool", marks=pytest.mark.L0, id="r4-after-smoke"),
+    ],
+)
 def test_compressed_deterministic_autograd_is_bitwise_stable(ratio, placement):
     """Both compression ratios and normalization orders cover deterministic backward."""
 
@@ -332,16 +347,94 @@ def test_compressed_deterministic_autograd_is_bitwise_stable(ratio, placement):
                 reference = current
             else:
                 for actual, expected in zip(current, reference):
-                    assert torch.equal(actual, expected)
+                    _assert_bitwise_equal(actual, expected)
     finally:
         torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+
+
+def test_public_module_deterministic_autograd_repeat_100():
+    """The public compressed module keeps every result and gradient bitwise stable."""
+
+    data = _inputs(ratio=4, coff=1)
+    module = CompressedSparseAttention(
+        compress_ratio=4,
+        coff=1,
+        top_k=data["top_k"],
+        deterministic=True,
+        deterministic_dk_planes=96,
+        device="cuda",
+    )
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    try:
+        reference = None
+        for repeat in range(100):
+            result = _call(module, data)
+            loss = result["out"].float().square().mean() + result["indexer_loss"]
+            grads = torch.autograd.grad(loss, _grad_inputs(module, data))
+            current = [
+                result["out"].detach().clone(),
+                result["indexer_loss"].detach().clone(),
+                result["block_indices"].detach().clone(),
+                result["token_indices"].detach().clone(),
+            ]
+            current.extend(grad.detach().clone() for grad in grads)
+            if reference is None:
+                reference = current
+                assert all(torch.isfinite(tensor).all() for tensor in current if tensor.is_floating_point())
+            else:
+                for name, actual, expected in zip(
+                    ("out", "indexer_loss", "block_indices", "token_indices", *[f"grad_{i}" for i in range(len(grads))]),
+                    current,
+                    reference,
+                ):
+                    _assert_bitwise_equal(actual, expected, f"{name} changed at repeat {repeat}")
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+
+
+def test_non_deterministic_path_is_rejected_by_strict_torch_mode():
+    """A negative control proves strict mode distinguishes the atomic backward."""
+
+    data = _inputs(ratio=4)
+    module = CompressedSparseAttention(compress_ratio=4, top_k=data["top_k"], deterministic=False, device="cuda")
+    previous = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    try:
+        result = _call(module, data)
+        with pytest.raises(RuntimeError, match="deterministic"):
+            torch.autograd.grad(result["out"].float().square().mean() + result["indexer_loss"], _grad_inputs(module, data))
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+
+
+def test_indexer_loss_coefficient_scales_value_and_gradients_once():
+    """The custom backward matches the public mean-KL coefficient contract."""
+
+    data = _inputs(ratio=1)
+    reference_module = CompressedSparseAttention(compress_ratio=1, top_k=data["top_k"], indexer_loss_coeff=1.0, deterministic=True, device="cuda")
+    scaled_module = CompressedSparseAttention(compress_ratio=1, top_k=data["top_k"], indexer_loss_coeff=0.25, deterministic=True, device="cuda")
+    scaled_module.load_state_dict(reference_module.state_dict())
+
+    reference = _call(reference_module, data)
+    reference_inputs = [data["index_q"], data["index_k"], data["weights"], reference_module.k_norm.weight, reference_module.k_norm.bias]
+    reference_grads = torch.autograd.grad(reference["indexer_loss"], reference_inputs)
+    scaled = _call(scaled_module, data)
+    scaled_inputs = [data["index_q"], data["index_k"], data["weights"], scaled_module.k_norm.weight, scaled_module.k_norm.bias]
+    scaled_grads = torch.autograd.grad(scaled["indexer_loss"], scaled_inputs)
+
+    assert torch.equal(scaled["indexer_loss"], reference["indexer_loss"] * 0.25)
+    for actual, expected in zip(scaled_grads, reference_grads):
+        assert torch.equal(actual, expected * 0.25)
 
 
 @pytest.mark.parametrize("ratio", [1, 4])
 def test_cuda_graph_replay_reads_changed_inputs(ratio):
     """Direct and compressed paths capture after warmup and rebind live values."""
 
-    data = _inputs(ratio=ratio)
+    data = _inputs(ratio=ratio, tokens=1024)
     module = CompressedSparseAttention(compress_ratio=ratio, top_k=data["top_k"], deterministic=True, device="cuda")
     grad_inputs = _grad_inputs(module, data)
 
@@ -373,6 +466,17 @@ def test_cuda_graph_replay_reads_changed_inputs(ratio):
             with torch.cuda.graph(graph, stream=capture_stream):
                 captured_result, captured_grads = run()
         capture_stream.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        reference = [captured_result["out"].detach().clone(), captured_result["indexer_loss"].detach().clone()]
+        reference.extend(grad.detach().clone() for grad in captured_grads)
+        for repeat in range(1, 8):
+            graph.replay()
+            torch.cuda.synchronize()
+            current = [captured_result["out"].detach().clone(), captured_result["indexer_loss"].detach().clone()]
+            current.extend(grad.detach().clone() for grad in captured_grads)
+            for name, actual, expected in zip(("out", "indexer_loss", *[f"grad_{i}" for i in range(len(captured_grads))]), current, reference):
+                _assert_bitwise_equal(actual, expected, f"{name} changed at graph replay {repeat}")
         with torch.no_grad():
             data["index_q"].add_(0.25)
             data["index_k"].mul_(0.75)
@@ -381,6 +485,9 @@ def test_cuda_graph_replay_reads_changed_inputs(ratio):
                 data["ape"].mul_(0.875)
             data["attention_q"].mul_(0.5)
             data["attention_kv"].add_(0.125)
+            data["attention_sink"].add_(0.03125)
+            data["seq_lens"].sub_(1)
+            data["q_causal_offsets"].sub_(ratio + 1)
         graph.replay()
         torch.cuda.synchronize()
         replay = [captured_result["out"].detach().clone(), captured_result["indexer_loss"].detach().clone()]

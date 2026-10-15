@@ -280,6 +280,31 @@ Graph capture; wrapper-owned outputs and workspaces captured afterward belong to
 the graph's private pool. This convenience module allocates and is separate from
 the allocation-free APIBase `execute()` contracts.
 
+#### Integrated training performance
+
+The following B200 measurements use the public module for one local shard of a
+1M-token, CP64 workload: `S_q=8192`, local KV=16384, H=64, D=512, ratio=4,
+token Top-K=2048, `coff=1`, `k_norm_placement="after_pool"`, and the default
+indexer backend. Values are CUDA-event medians over 10 iterations after three
+warmups on CUDA 13.0, PyTorch 2.11, and CuTe DSL 4.7. Compilation, graph
+capture, correctness checks, and host enqueue are excluded. The run was
+repeated in fresh processes with non-deterministic-first and
+deterministic-first construction orders; ranges below span both orders.
+
+| policy | dK planes | indexer dK scratch | eager GPU | eager slowdown | graph GPU | graph slowdown |
+|---|---:|---:|---:|---:|---:|---:|
+| non-deterministic | - | 2 MiB | 17.171–17.311 ms | 1.00x | 17.185–17.189 ms | 1.00x |
+| deterministic | 96 | 192 MiB | 25.635–25.646 ms | 1.48–1.49x | 25.443–25.467 ms | 1.48x |
+| deterministic | 128 | 256 MiB | 25.678–25.682 ms | 1.48–1.50x | 25.438–25.462 ms | 1.48x |
+| deterministic | 148 | 296 MiB | 25.704–25.736 ms | 1.48–1.50x | 25.470–25.508 ms | 1.48x |
+
+The measured incremental eager high-water mark was 5750 MiB for the ordinary
+path and 5770 MiB for every deterministic plane choice. This does not contradict
+the per-indexer scratch sizes above: a different pipeline stage establishes the
+full-call peak, while the indexer workspaces have disjoint lifetimes. Reproduce
+the table with `benchmark/csa/benchmark_csa_training.py`; it prints both Markdown
+and JSON and supports reversed construction order.
+
 ### High-level wrappers
 
 ```python

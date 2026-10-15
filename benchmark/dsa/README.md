@@ -15,8 +15,8 @@ run them:
 - **End-to-end deterministic training** (`benchmark_csa_dsa_pipeline.py`) —
   CSA compressor forward/backward, dense indexer, deterministic Top-K, sparse
   attention training, score recompute, and deterministic indexer backward;
-  reports eager versus CUDA Graph host enqueue and GPU latency plus warm eager
-  CPU/CUDA profiler tables.
+  reports eager versus CUDA Graph GPU latency plus warm eager CPU/CUDA profiler
+  tables.
 
 ## Contents
 
@@ -153,12 +153,11 @@ python -m benchmark.dsa.benchmark_csa_dsa_pipeline --no-deterministic
 python -m benchmark.dsa.benchmark_csa_dsa_pipeline --trace /tmp/csa-dsa.json
 ```
 
-The host numbers measure warm Python enqueue time without a per-step device
-synchronization; GPU numbers use CUDA events. Peak eager allocated memory and
-post-capture live/reserved memory expose transient workspace versus the CUDA
-Graph private pool. The profiler tables identify wrapper/allocation/autograd
-cost on the eager path. CUDA Graph replay is the serving/training steady-state
-control for launch overhead. The harness temporarily disables PyTorch's
+GPU numbers use CUDA events. Peak eager allocated memory and post-capture
+live/reserved memory expose transient workspace versus the CUDA Graph private
+pool. The profiler tables identify wrapper/allocation/autograd cost on the
+eager path. CUDA Graph replay is the steady-state control for launch overhead.
+The harness temporarily disables PyTorch's
 deterministic uninitialized-memory debug fill, so timings compare the requested
 algorithms rather than fill kernels for wrapper-owned outputs and workspaces;
 the caller's setting is restored on exit.

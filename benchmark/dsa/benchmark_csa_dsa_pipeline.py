@@ -5,16 +5,14 @@
 """Profile the deterministic CSA/DSA training pipeline end to end.
 
 The eager measurement intentionally drives the public allocating wrappers. The
-CUDA Graph measurement captures that same composition after warmup. Host enqueue
-latency and device latency are measured separately; compilation, correctness
-checks, and profiler collection are outside both timed regions.
+CUDA Graph measurement captures that same composition after warmup. CUDA-event
+device latency excludes compilation, correctness checks, and profiler collection.
 """
 
 import argparse
 import contextlib
 import json
 import statistics
-import time
 
 import torch
 from cudnn import CSA, DSA
@@ -170,21 +168,6 @@ class Pipeline:
         }
 
 
-def _percentile(values, fraction):
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(fraction * len(ordered)))]
-
-
-def _host_enqueue_us(call, iterations):
-    samples = []
-    for _ in range(iterations):
-        start = time.perf_counter_ns()
-        call()
-        samples.append((time.perf_counter_ns() - start) / 1000.0)
-    torch.cuda.synchronize()
-    return {"median": statistics.median(samples), "p90": _percentile(samples, 0.9)}
-
-
 def _device_us(call, iterations):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -261,7 +244,6 @@ def main():
             pipeline.run()
         torch.cuda.synchronize()
 
-        eager_host = _host_enqueue_us(pipeline.run, args.iterations)
         eager_device = _device_us(pipeline.run, args.iterations)
         eager_peak_memory = _peak_memory_mib(pipeline.run)
         cpu_table, cuda_table = _profile(pipeline, args.profile_iterations, args.trace)
@@ -285,7 +267,6 @@ def main():
             capture_stream.synchronize()
             graph_retained_allocated = (torch.cuda.memory_allocated() - graph_baseline_allocated) / (1024 * 1024)
             graph_retained_reserved = (torch.cuda.memory_reserved() - graph_baseline_reserved) / (1024 * 1024)
-            graph_host = _host_enqueue_us(graph.replay, args.iterations)
             graph_device = _device_us(graph.replay, args.iterations)
 
             with torch.no_grad():
@@ -323,14 +304,11 @@ def main():
                 "planes": args.planes,
                 "deterministic": args.deterministic,
             },
-            "eager_host_enqueue_us": eager_host,
-            "graph_host_enqueue_us": graph_host,
             "eager_device_us": eager_device,
             "graph_device_us": graph_device,
             "eager_peak_memory_mib": eager_peak_memory,
             "graph_capture_retained_allocated_mib": graph_retained_allocated,
             "graph_capture_retained_reserved_mib": graph_retained_reserved,
-            "host_enqueue_speedup": eager_host["median"] / graph_host["median"],
             "device_speedup": eager_device / graph_device,
         }
         print(json.dumps(result, indent=2))

@@ -131,7 +131,7 @@ def test_stream_and_changed_input_graph_replay():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream), torch.no_grad():
         for _ in range(3):
-            result = DSA.sparse_attention(q, kv, idx, a, topk_length=lens)
+            DSA.sparse_attention(q, kv, idx, a, topk_length=lens)
         graph = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.graph(graph, stream=stream):

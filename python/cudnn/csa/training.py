@@ -11,7 +11,7 @@ convenience layer above their APIBase contracts.
 from __future__ import annotations
 
 import math
-from numbers import Real
+from numbers import Integral, Real
 from typing import Optional
 
 import torch
@@ -360,6 +360,21 @@ class CompressedSparseAttention(torch.nn.Module):
         dtype=None,
     ):
         super().__init__()
+        integer_options = {
+            "index_head_dim": index_head_dim,
+            "compress_ratio": compress_ratio,
+            "coff": coff,
+            "top_k": top_k,
+            "deterministic_dk_planes": deterministic_dk_planes,
+        }
+        for name, value in integer_options.items():
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{name} must be an int, got {value!r}")
+        index_head_dim = int(index_head_dim)
+        compress_ratio = int(compress_ratio)
+        coff = int(coff)
+        top_k = int(top_k)
+        deterministic_dk_planes = int(deterministic_dk_planes)
         if index_head_dim != 128:
             raise ValueError(f"index_head_dim must be 128 for the native indexer, got {index_head_dim}")
         if compress_ratio not in _SUPPORTED_RATIOS:
