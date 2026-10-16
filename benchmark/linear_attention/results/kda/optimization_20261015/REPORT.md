@@ -1,5 +1,9 @@
 # KDA correctness and profiling continuation — 2026-10-15/16
 
+> Historical experiment: upstream now already uses two raw stages. Its rebase
+> validation is in `../optimization_20261016_upstream/REPORT.md`; the three-to-two
+> stage gain below must not be claimed against that newer baseline.
+
 ## Outcome and scope
 
 The final audit found and fixed a dO ownership gap in the existing optimized

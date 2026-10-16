@@ -3,13 +3,12 @@
 
 """Same-input alternating KDA backward control after the host migration.
 
-The baseline directory must contain an exported, safety-fixed bprop source and
-config snapshot. Both variants use the candidate host path, isolating GPU changes.
+The baseline directory must contain the exact exported bprop source and config
+snapshot. Both variants use the candidate host path, isolating GPU changes.
 """
 
 import argparse
 import importlib.util
-import inspect
 import json
 import statistics
 import sys
@@ -32,16 +31,6 @@ def load_baseline(directory):
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
-            if stem == "kda_bprop_f16" and "smem_raw_stages" not in inspect.signature(module.build_cfg).parameters:
-                original_build_cfg = module.build_cfg
-
-                def build_cfg(*args, smem_raw_stages=None, **kwargs):
-                    """Keep an old snapshot's resource settings under the new host."""
-                    # Older snapshots retain their own ring depth; the candidate
-                    # host's new resource override must not alter the baseline.
-                    return original_build_cfg(*args, **kwargs)
-
-                module.build_cfg = build_cfg
             modules.append(module)
             if stem == "kda_bprop_config":
                 # Derived config dataclasses stamp CFG defaults at import time.

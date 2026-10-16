@@ -1,5 +1,8 @@
 # KDA forward/backward E2E optimization — 2026-10-12
 
+> Latest upstream comparison: see `../optimization_20261016_upstream/REPORT.md`.
+> The results below use historical baselines, not the current upstream defaults.
+
 > Historical measurements: a subsequent ownership audit found that this
 > pipeline rescheduling moved the dO-ready wait past earlier consumers and
 > left the late dQ MMA out of the dO-reuse acknowledgement. The follow-up in

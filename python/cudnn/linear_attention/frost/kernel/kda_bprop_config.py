@@ -52,7 +52,7 @@ class Cfg:
     BUFFER_ALIGN_BYTES: int = 1024
 
     # --- SMEM / TMEM ring stage counts ---
-    SMEM_RAW_STAGES: int = 3
+    SMEM_RAW_STAGES: int = 2
     SMEM_S_STAGES: int = 1
     SMEM_DECAY_STAGES: int = 2
     SMEM_INTERMEDIATE_STAGES: int = 2

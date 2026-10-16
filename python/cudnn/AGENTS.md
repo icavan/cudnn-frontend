@@ -746,13 +746,15 @@ anti-dependency against another warp's next store. The KDA detector is
 pair it with changed-input replay and racecheck rather than treating numerical
 agreement as a memory-order proof.
 
-Apply a ring-depth override before deriving SMEM cosizes, descriptors and
-per-stage TMA transaction bytes. Check the actual config builder at multiple
-depths and rectangular dimensions, not just the selected stage count; KDA's
-`test_raw_ring_override_derives_consistent_buffer_sizes` is the detector.
-Reducing depth also changes consume-to-reuse timing: audit every optional reader
-and phase wrap before broadening the selection. Keep unmeasured schedules on
-their defaults (`test_uncut_raw_ring_override_is_limited_to_measured_schedule`).
+When changing ring depth, derive SMEM sizes and TMA geometry from that depth
+and audit every optional reader and phase wrap. Compare with the current
+upstream defaults: a historical three-to-two-stage gain is not a new gain
+once upstream already uses two stages. Keep independent A/B provenance.
+
+Changing lane ownership must preserve the original reduction tree and rounded
+intermediates when bitwise numerical compatibility is required. Small-norm
+inputs expose differences hidden by ordinary half/bfloat16 output rounding;
+the KDA FP64 audit includes these alongside ordinary and cancellation inputs.
 
 Moving an MMA also moves its buffer-lifetime obligations. A ready wait must
 precede the first consumer, not just the rescheduled operation; reuse credits

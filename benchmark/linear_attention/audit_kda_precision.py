@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare safety-fixed and optimized KDA gradients against one FP64 oracle.
+"""Compare an exported baseline and optimized KDA against one FP64 oracle.
 
 Inputs are generated on CPU and rounded before the oracle sees them. The oracle
 uses this source tree's normalization contract (additive squared-norm eps=1e-6).

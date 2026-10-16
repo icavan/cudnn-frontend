@@ -218,6 +218,61 @@ def test_uncut_bwd_raw_ring_wraps_and_changed_input_replay(monkeypatch, dim, dty
             graph.reset()
 
 
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("optional", [False, True])
+def test_kda_backward_only_changed_input_replay(dim, dtype, optional):
+    """Caller checkpoints isolate backward stage reuse from forward kernels."""
+    from cudnn.linear_attention.ops import kda as ops
+
+    generator = torch.Generator().manual_seed(419)
+    shape = (65, 2, dim)
+    q, k, v, do = [(torch.randn(shape, generator=generator) * 0.1).to(dtype).cuda() for _ in range(4)]
+    g = torch.full(shape, -4.0, device="cuda")
+    beta = torch.zeros(shape[:2], device="cuda")
+    cu = torch.tensor([0, shape[0]], device="cuda", dtype=torch.int32)
+    checkpoints = (torch.randn(shape[0] // 16 + 1, 2, dim, dim, generator=generator) * 0.01).to(dtype).cuda()
+    options = dict(
+        state_checkpoints=checkpoints,
+        checkpoint_every_n_tokens=16,
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        batch_invariant=True,
+        plan_name="kda_frost",
+    )
+    if optional:
+        state = torch.zeros((1, 2, dim, dim), device="cuda")
+        options.update(
+            initial_state=state, d_final_state=torch.full_like(state, 0.125), a_log=torch.zeros(2, device="cuda"), dt_bias=torch.zeros(2, dim, device="cuda")
+        )
+
+    def call():
+        return ops.kda_bwd(do, q, k, v, g, beta, cu, dim**-0.5, **options)
+
+    call()
+    expected = tuple(t.clone() for t in call())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            actual = call()
+        graph.replay()
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.isfinite(got).all()
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        do.add_(0.125)
+        v.add_(0.25)
+        expected = tuple(t.clone() for t in call())
+        graph.replay()
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.isfinite(got).all()
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+
+
 @pytest.mark.parametrize("optional", [False, True])
 @pytest.mark.parametrize("safe_gate", [False, True])
 @pytest.mark.parametrize("checkpoint", [0, 32])

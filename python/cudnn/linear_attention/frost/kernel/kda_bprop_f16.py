@@ -52,12 +52,11 @@ Algorithm overview (per chunk c, iterated c = NT-1 .. 0):
   g_last terms, reverse-cumsummed in registers.  Compute group 1: dBeta = sum over v of dY.(V - k state) + the M-term,
   dV = Beta.dY.  The epilogue warp stores dQ / dK / dV / dGate through a one-behind TMA ladder.
 
-SMEM layout (defaults in kda_bprop_config.py; normalized D128 uncut uses two raw
-stages, other schedules keep three; sizes at DK = DV = 128, bf16 io, fp32 Gate):
+SMEM layout (stage counts live in kda_bprop_config.py; sizes at DK = DV = 128, bf16 io, fp32 Gate):
   Buffer                       Size (B)  Stages
-  Q / K (raw)                  2 x 4096     2/3
-  V / dO (raw)                 2 x 4096     2/3
-  Gate (raw)                       8192     2/3
+  Q / K (raw)                  2 x 4096       2
+  V / dO (raw)                 2 x 4096       2
+  Gate (raw)                       8192       2
   K decay / K inv / Q decay    3 x 4096       2
   decay scale                       512       2
   T_inv / A / dA / dM (intermediate) 2560     2    <-- five BT x BT tiles per stage
@@ -2852,26 +2851,17 @@ def compute2_warp_group(
             else:
                 qf_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + qraw_col, cutlass.Float32), num=cfg.b_t // 2)
                 kf_words = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + kraw_col, cutlass.Float32), num=cfg.b_t // 2)
-                two = opaque_f32_zero() + cutlass.Float32(2.0)
-                for pair_idx in cutlass.range_constexpr(cfg.b_t // 2):
-                    t = pair_idx * 2
-                    q_pair = cutlass.Vector.from_elements((qf_words[pair_idx],), cutlass.Float32).bitcast(cfg.io_dtype)
-                    k_pair = cutlass.Vector.from_elements((kf_words[pair_idx],), cutlass.Float32).bitcast(cfg.io_dtype)
-                    q0 = q_pair[0].to(cutlass.Float32)
-                    q1 = q_pair[1].to(cutlass.Float32)
-                    k0 = k_pair[0].to(cutlass.Float32)
-                    k1 = k_pair[1].to(cutlass.Float32)
+                for t in cutlass.range_constexpr(cfg.b_t):
+                    q_pair = cutlass.Vector.from_elements((qf_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                    k_pair = cutlass.Vector.from_elements((kf_words[t // 2],), cutlass.Float32).bitcast(cfg.io_dtype)
+                    q_v = q_pair[t % 2].to(cutlass.Float32)
+                    k_v = k_pair[t % 2].to(cutlass.Float32)
                     if cutlass.const_expr(cfg.l2norm):
-                        q0, q1 = fmul2(q0, q1, sNorm_raw[norm_base + t], sNorm_raw[norm_base + t + 1])
-                        k0, k1 = fmul2(k0, k1, sNorm_raw[norm_base + cfg.b_t + t], sNorm_raw[norm_base + cfg.b_t + t + 1])
-                    dq0, dq1 = ffma2(da_diag[t], da_diag[t + 1], k0, k1, dq_n[t], dq_n[t + 1])
-                    dk0, dk1 = ffma2(da_diag[t], da_diag[t + 1], q0, q1, dk_n[t], dk_n[t + 1])
-                    inner0, inner1 = ffma2(two, two, dgate_regs[t], dgate_regs[t + 1], -dk0, -dk1)
-                    qterm0, qterm1 = fmul2(q0, q1, dq0, dq1)
-                    dg0, dg1 = ffma2(k0, k1, inner0, inner1, qterm0, qterm1)
-                    dq_n[t], dq_n[t + 1] = dq0, dq1
-                    dk_n[t], dk_n[t + 1] = dk0, dk1
-                    dgate_regs[t], dgate_regs[t + 1] = dg0, dg1
+                        q_v = q_v * sNorm_raw[norm_base + t]
+                        k_v = k_v * sNorm_raw[norm_base + cfg.b_t + t]
+                    dq_n[t] = dq_n[t] + da_diag[t] * k_v
+                    dk_n[t] = dk_n[t] + da_diag[t] * q_v
+                    dgate_regs[t] = q_v * dq_n[t] + k_v * (cutlass.Float32(2.0) * dgate_regs[t] - dk_n[t])
                 dgate_regs[cfg.b_t - 1] = dgate_regs[cfg.b_t - 1] + ((dgate_last_acc[0] + dgate_last_acc[1]) + (dgate_last_acc[2] + dgate_last_acc[3]))
 
             # ---- L2-norm backward row projection -------------------------------------
@@ -2952,7 +2942,7 @@ def compute2_warp_group(
                         norm_v = sNorm_raw[norm_base + inv_off + token]
                         grad_cache = cutlass.Array(cutlass.Float32, 16, alignment=16)
                         raw_cache = cutlass.Array(cutlass.Int32, 8, alignment=16)
-                        lane_dot = cutlass.Float32(0.0)
+                        warp_dots = cutlass.Array(cutlass.Float32, 2)
                         for group in cutlass.range_constexpr(2):
                             channel_base = group * 64 + lane8 * 8
                             grad_vec = (sProj_raw.data_ptr() + grad_base + token * cfg.cg2_threads + channel_base).load(count=8, alignment=16)
@@ -2969,18 +2959,27 @@ def compute2_warp_group(
                             gp2, gp3 = fmul2(grad_vec[2], grad_vec[3], raw_vec[2].to(cutlass.Float32), raw_vec[3].to(cutlass.Float32))
                             gp4, gp5 = fmul2(grad_vec[4], grad_vec[5], raw_vec[4].to(cutlass.Float32), raw_vec[5].to(cutlass.Float32))
                             gp6, gp7 = fmul2(grad_vec[6], grad_vec[7], raw_vec[6].to(cutlass.Float32), raw_vec[7].to(cutlass.Float32))
+                            # Match upstream's rounded (grad * raw) * norm terms.
+                            gp0, gp1 = fmul2(gp0, gp1, norm_v, norm_v)
+                            gp2, gp3 = fmul2(gp2, gp3, norm_v, norm_v)
+                            gp4, gp5 = fmul2(gp4, gp5, norm_v, norm_v)
+                            gp6, gp7 = fmul2(gp6, gp7, norm_v, norm_v)
                             pair01, pair23 = fadd2(gp0, gp2, gp1, gp3)
                             pair45, pair67 = fadd2(gp4, gp6, gp5, gp7)
                             quad03, quad47 = fadd2(pair01, pair45, pair23, pair67)
                             part = quad03 + quad47
-                            if cutlass.const_expr(group == 0):
-                                lane_dot = part
-                            else:
-                                lane_dot = lane_dot + part
-                        for step in (1, 2, 4):
-                            other = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, lane_dot, step, subwarp_mask_and_clamp, kind=nvvm.Shfl.BFLY))
-                            lane_dot = lane_dot + other
-                        norm_dot = (norm_v * norm_v) * lane_dot
+                            for step in (1, 2):
+                                other = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, part, step, subwarp_mask_and_clamp, kind=nvvm.Shfl.BFLY))
+                                part = part + other
+                            warp_dots[group] = part
+                        # Reproduce the original four 32-channel warp sums and
+                        # their left-to-right reduction, despite the new ownership.
+                        base_lane = lane_idx - lane8
+                        dot0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[0], base_lane, 31, kind=nvvm.Shfl.IDX))
+                        dot1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[0], base_lane + 4, 31, kind=nvvm.Shfl.IDX))
+                        dot2 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[1], base_lane, 31, kind=nvvm.Shfl.IDX))
+                        dot3 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[1], base_lane + 4, 31, kind=nvvm.Shfl.IDX))
+                        dot_total = ((dot0 + dot1) + dot2) + dot3
 
                         for group in cutlass.range_constexpr(2):
                             channel_base = group * 64 + lane8 * 8
@@ -2993,14 +2992,18 @@ def compute2_warp_group(
                                 (raw_cache[raw_off], raw_cache[raw_off + 1], raw_cache[raw_off + 2], raw_cache[raw_off + 3]), cutlass.Int32
                             )
                             raw_vec = raw_words.bitcast(cfg.io_dtype)
-                            sub0 = grad_cache[grad_off] - raw_vec[0].to(cutlass.Float32) * norm_dot
-                            sub1 = grad_cache[grad_off + 1] - raw_vec[1].to(cutlass.Float32) * norm_dot
-                            sub2 = grad_cache[grad_off + 2] - raw_vec[2].to(cutlass.Float32) * norm_dot
-                            sub3 = grad_cache[grad_off + 3] - raw_vec[3].to(cutlass.Float32) * norm_dot
-                            sub4 = grad_cache[grad_off + 4] - raw_vec[4].to(cutlass.Float32) * norm_dot
-                            sub5 = grad_cache[grad_off + 5] - raw_vec[5].to(cutlass.Float32) * norm_dot
-                            sub6 = grad_cache[grad_off + 6] - raw_vec[6].to(cutlass.Float32) * norm_dot
-                            sub7 = grad_cache[grad_off + 7] - raw_vec[7].to(cutlass.Float32) * norm_dot
+                            an0, an1 = fmul2(raw_vec[0].to(cutlass.Float32), raw_vec[1].to(cutlass.Float32), norm_v, norm_v)
+                            an2, an3 = fmul2(raw_vec[2].to(cutlass.Float32), raw_vec[3].to(cutlass.Float32), norm_v, norm_v)
+                            an4, an5 = fmul2(raw_vec[4].to(cutlass.Float32), raw_vec[5].to(cutlass.Float32), norm_v, norm_v)
+                            an6, an7 = fmul2(raw_vec[6].to(cutlass.Float32), raw_vec[7].to(cutlass.Float32), norm_v, norm_v)
+                            sub0 = grad_cache[grad_off] - an0 * dot_total
+                            sub1 = grad_cache[grad_off + 1] - an1 * dot_total
+                            sub2 = grad_cache[grad_off + 2] - an2 * dot_total
+                            sub3 = grad_cache[grad_off + 3] - an3 * dot_total
+                            sub4 = grad_cache[grad_off + 4] - an4 * dot_total
+                            sub5 = grad_cache[grad_off + 5] - an5 * dot_total
+                            sub6 = grad_cache[grad_off + 6] - an6 * dot_total
+                            sub7 = grad_cache[grad_off + 7] - an7 * dot_total
                             sub0, sub1 = fmul2(sub0, sub1, norm_v, norm_v)
                             sub2, sub3 = fmul2(sub2, sub3, norm_v, norm_v)
                             sub4, sub5 = fmul2(sub4, sub5, norm_v, norm_v)
@@ -4079,9 +4082,8 @@ def build_cfg(
     max_active_clusters: int,
     d_k: int,
     d_v: int,
-    smem_raw_stages: int | None = None,
 ) -> KdaBpropCfg:
-    """Derive all buffer sizes from the selected schedule and raw ring depth."""
+    """Derive all buffer sizes from the configured tile and ring depths."""
     cfg = KdaBpropCfg(
         io_dtype=io_dtype,
         gate_dtype=gate_dtype,
@@ -4098,8 +4100,6 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
     )
-    if smem_raw_stages is not None:
-        cfg.smem_raw_stages = smem_raw_stages
     cfg.threads_per_cta = 16 * cfg.threads_per_warp
     cfg.cg0_threads = len(cfg.compute_group_0_warp_ids) * cfg.threads_per_warp
     cfg.cg2_threads = len(cfg.compute_group_2_warp_ids) * cfg.threads_per_warp

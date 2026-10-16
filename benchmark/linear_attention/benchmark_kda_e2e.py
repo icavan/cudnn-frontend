@@ -10,6 +10,7 @@ four calls to reduce replay-submit overhead; inputs and autograd use one stream.
 
 import argparse
 import cProfile
+import hashlib
 import json
 import pstats
 import statistics
@@ -100,6 +101,7 @@ def run_case(args, batch, tokens, heads, checkpoint):
     torch.cuda.synchronize()
     assert all(torch.isfinite(t).all() for t in before)
     row = {"batch": batch, "tokens": tokens, "heads": heads, "dim": args.dim, "checkpoint": checkpoint}
+    row["fingerprints"] = [hashlib.sha256(t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest() for t in before]
     graph, _ = next(reversed(bprop_cache.values()))
     plan = graph._compiled_plans[graph._plan_index].compiled
     row["schedule"] = "chain" if plan.chain else "uncut"
@@ -152,6 +154,17 @@ def main():
         "source": cudnn.__file__,
         "torch": torch.__version__,
         "backend": cudnn.backend_version(),
+        "source_sha256": {
+            name: hashlib.sha256((Path(cudnn.__file__).parent / name).read_bytes()).hexdigest()
+            for name in (
+                "linear_attention/frost/kernel/kda_bprop_config.py",
+                "linear_attention/frost/kernel/kda_bprop_f16.py",
+                "linear_attention/frost/kernel/kda_bprop_summary_f16.py",
+                "linear_attention/frost/kernel/kda_uncut_backward_f16.py",
+                "linear_attention/frost/kda_engine.py",
+                "linear_attention/ops/common.py",
+            )
+        },
         "args": vars(args) | {"json": str(args.json)},
         "cases": [],
     }

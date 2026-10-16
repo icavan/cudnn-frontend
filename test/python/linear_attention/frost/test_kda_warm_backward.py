@@ -23,37 +23,6 @@ from cudnn.linear_attention.frost.kernel.kda_uncut_backward_f16 import UNCUT_BAC
 pytestmark = pytest.mark.L0
 
 
-@pytest.mark.parametrize("raw_stages", [2, 3])
-@pytest.mark.parametrize("d_k,d_v", [(64, 128), (128, 64), (128, 128)])
-def test_raw_ring_override_derives_consistent_buffer_sizes(raw_stages, d_k, d_v):
-    """A ring-depth override must precede all derived SMEM/TMA geometry."""
-    import cutlass
-    from cudnn.linear_attention.frost.kernel import kda_bprop_f16 as kernel
-
-    cfg = kernel.build_cfg(
-        cutlass.BFloat16,
-        cutlass.Float32,
-        use_dstate_in=False,
-        use_dstate0=False,
-        l2norm=True,
-        safe_gate=True,
-        gate_scale_log2=-5.0 * kernel.LOG2_E,
-        beta_sigmoid=True,
-        allow_neg_eigval=False,
-        use_initial_state=False,
-        max_active_clusters=1,
-        d_k=d_k,
-        d_v=d_v,
-        smem_raw_stages=raw_stages,
-    )
-    assert cfg.smem_raw_stages == raw_stages
-    assert cfg.raw_qk_cosize == cfg.raw_gate_cosize == raw_stages * cfg.b_t * d_k
-    assert cfg.raw_v_cosize == raw_stages * cfg.b_t * d_v
-    assert cfg.tma_q_bytes == cfg.tma_k_bytes == cfg.b_t * d_k * 2
-    assert cfg.tma_gate_bytes == cfg.b_t * d_k * 4
-    assert cfg.tma_v_bytes == cfg.tma_do_bytes == cfg.b_t * d_v * 2
-
-
 def test_raw_qk_loads_complete_before_slot_release():
     """A new raw-slot writer cannot overtake CG2's asynchronous TMEM reads."""
     import cudnn.linear_attention.frost.kernel.kda_bprop_f16 as kernel
@@ -65,36 +34,6 @@ def test_raw_qk_loads_complete_before_slot_release():
     drains = [node.lineno for node in calls if ast.unparse(node.func) == "nvvm.tcgen05_wait" and node.args[0].value == "load"]
     release = next(node.lineno for node in calls if ast.unparse(node.func) == "bars.mb_qk_raw_done[qk_raw_stage].arrive")
     assert max(loads) < max(drains) < release
-
-
-@pytest.mark.parametrize("l2norm", [False, True])
-@pytest.mark.parametrize("d_k,d_v", [(64, 64), (64, 128), (128, 64), (128, 128)])
-def test_uncut_raw_ring_override_is_limited_to_measured_schedule(l2norm, d_k, d_v):
-    """Unmeasured dimensions and non-normalized schedules keep their defaults."""
-    import cutlass
-    from cudnn.linear_attention.frost.kernel.kda_bprop_config import CFG
-    from cudnn.linear_attention.frost.kernel.kda_uncut_backward_f16 import build_configs
-
-    _, cfg = build_configs(
-        cutlass.BFloat16,
-        cutlass.Float32,
-        cutlass.Float32,
-        recompute=False,
-        coarse=False,
-        has_state_in=False,
-        use_initial_state=False,
-        use_dstate_in=False,
-        use_dstate0=False,
-        l2norm=l2norm,
-        safe_gate=True,
-        gate_scale_log2=-5.0,
-        beta_sigmoid=True,
-        allow_neg_eigval=False,
-        max_active_clusters=1,
-        d_k=d_k,
-        d_v=d_v,
-    )
-    assert cfg.smem_raw_stages == (2 if l2norm and d_k == d_v == 128 else CFG.SMEM_RAW_STAGES)
 
 
 @pytest.mark.parametrize("chain", [False, True])
