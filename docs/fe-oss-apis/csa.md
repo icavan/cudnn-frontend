@@ -199,6 +199,123 @@ pip install nvidia-cudnn-frontend
 
 ## API Usage
 
+### Integrated training module
+
+`CSA.CompressedSparseAttention` is an allocating PyTorch `nn.Module` that
+composes index-key pooling, key LayerNorm, dense indexer scoring,
+deterministic Top-K, sparse attention, score recompute, and their
+first-order backward paths. It returns the sparse-attention outputs together
+with the differentiable indexer KL loss, so callers do not need to invoke the
+individual backward wrappers themselves.
+
+The configuration is fixed when the module is constructed. A compression ratio
+of one is a direct sparse-attention path: the compressor is not called and the
+selected indices are used directly, without a block-to-token expansion. Ratios
+2 and 4 use the fused compressor. Key normalization is always present;
+its placement can be selected on either side of pooling because LayerNorm and
+pooling do not commute. This initial module implements NoPE and launches no
+position-encoding operations. Configurations that require positional encoding
+are intentionally outside this API's current support surface.
+
+```python
+from cudnn import CSA
+
+layer = CSA.CompressedSparseAttention(
+    compress_ratio=4,
+    coff=2,
+    top_k=2048,
+    k_norm_placement="after_pool",
+    deterministic=True,
+    deterministic_dk_planes=96,
+    device="cuda",
+)
+
+result = layer(
+    index_q,
+    compressor_kv,
+    index_weights,
+    attention_q,
+    attention_kv,
+    logical_index_lengths,
+    attention_sink,
+    compressor_score=compressor_score,
+    ape=ape,
+    cu_seqlens=cu_seqlens,
+    cu_seqlens_comp=cu_seqlens_comp,
+    q_causal_offsets=q_causal_offsets,
+)
+(task_loss(result["out"]) + result["indexer_loss"]).backward()
+```
+
+The initial integrated module serves one sequence per call: index Q is
+`[1,S_q,H_i,128]`; the direct index K is `[1,S_k,128]`; a compressed input is
+`[T,coff*128]` with two-entry token and compressed cumulative-length tensors.
+Attention Q is `[S_q,H_a,D]` and KV is `[S_kv,D]`, with BF16 inputs,
+`H_a in {16,32,64,128}`, and `D in {512,576}`; H128+D576 is unsupported.
+Indexer and attention head counts are independent; the indexer training path
+supports `H_i in {32,64}`, with H64 required for deterministic execution and
+the `sm100_v2` backend. `top_k` is the selected token budget, not the
+compressed-block count: it is at most 2048 and must be a multiple of
+`128 * compress_ratio`; the module selects `top_k / compress_ratio` blocks
+internally. The returned
+block and token indices are INT32 and non-differentiable. Only `out` and
+`indexer_loss` participate in autograd. The module owns learnable LayerNorm
+weight and bias in BF16, matching the native indexer inputs; move it to the
+input device as with any `nn.Module`. The current integrated training path
+requires SM100. Each `seq_lens` entry must describe the
+same valid compressed-key prefix as the ratio-causal mask selected by
+`q_causal_offsets`; otherwise masked `-inf` logits can enter the requested
+Top-K domain and make the KL loss infinite.
+
+The indexer-loss backward is single-use for each forward. Its native kernel
+reuses the saved target distribution as scratch, so invoking indexer-loss
+backward a second time on a retained graph raises an error; run another forward
+instead. Attention-only backward does not consume the saved indexer target.
+
+With `deterministic=True`, the module requests deterministic compressor dAPE,
+Top-K tie handling, sparse-attention backward, and indexer backward. Unsupported
+requests fail rather than silently choosing atomic execution. All work runs on
+PyTorch's current stream. Warm every fixed-shape specialization before CUDA
+Graph capture; wrapper-owned outputs and workspaces captured afterward belong to
+the graph's private pool. This convenience module allocates and is separate from
+the allocation-free APIBase `execute()` contracts.
+
+#### Integrated training performance
+
+The following B200 measurements use the public module for one local shard of a
+1M-token, CP64 workload: `S_q=8192`, local KV=16384, H=64, D=512, ratio=4,
+token Top-K=2048, `coff=1`, `k_norm_placement="after_pool"`, and the default
+indexer backend. Values are CUDA-event medians over 10 iterations after three
+warmups on CUDA 13.0, PyTorch 2.11, and CuTe DSL 4.7. Compilation, graph
+capture, correctness checks, and host enqueue are excluded. The run was
+repeated in fresh processes with non-deterministic-first and
+deterministic-first construction orders; ranges below span both orders.
+
+| policy | dK planes | indexer dK scratch | eager GPU | eager slowdown | graph GPU | graph slowdown |
+|---|---:|---:|---:|---:|---:|---:|
+| non-deterministic | - | 2 MiB | 17.171–17.311 ms | 1.00x | 17.185–17.189 ms | 1.00x |
+| deterministic | 96 | 192 MiB | 25.635–25.646 ms | 1.48–1.49x | 25.443–25.467 ms | 1.48x |
+| deterministic | 128 | 256 MiB | 25.678–25.682 ms | 1.48–1.50x | 25.438–25.462 ms | 1.48x |
+| deterministic | 148 | 296 MiB | 25.704–25.736 ms | 1.48–1.50x | 25.470–25.508 ms | 1.48x |
+
+The measured incremental eager high-water mark was 5750 MiB for the ordinary
+path and 5770 MiB for every deterministic plane choice. This does not contradict
+the per-indexer scratch sizes above: a different pipeline stage establishes the
+full-call peak, while the indexer workspaces have disjoint lifetimes. Reproduce
+the table with:
+
+```bash
+python benchmark/csa/benchmark_csa_training.py \
+  --tokens 16384 --sq 8192 --heads 64 --dim 512 \
+  --ratio 4 --coff 1 --top-k 2048 \
+  --k-norm-placement after_pool --backend default \
+  --planes 96 128 148 --warmup 3 --samples 10 \
+  --construction-order non-deterministic-first
+```
+
+Repeat with `--construction-order deterministic-first` in a fresh process to
+measure the reversed order. The script prints both Markdown and JSON.
+
 ### High-level wrappers
 
 ```python

@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``cudnn.csa`` — CuTe-DSL kernels for the CSA/HCA experimental attention variants.
+"""``cudnn.csa`` — experimental CSA/HCA kernels and training composition.
 
-Symbols (the fused ``Compressor`` APIs) resolve lazily on first attribute access, so
-importing ``cudnn`` never pulls in the optional ``[cutedsl]`` dependency stack.
+Symbols resolve lazily on first attribute access, so importing ``cudnn`` never
+pulls in the optional PyTorch or CuTe DSL dependency stack.
 """
 
 from importlib import import_module
 
 _SYMBOLS = {
+    "CompressedSparseAttention": (".training", "CompressedSparseAttention"),
     "CSACompressorForward": (".compressor", "CSACompressorForward"),
     "CSACompressorBackward": (".compressor", "CSACompressorBackward"),
     "csa_compressor_forward_wrapper": (".compressor", "csa_compressor_forward_wrapper"),
@@ -49,6 +50,7 @@ CSA = CSANamespace()
 
 __all__ = [
     "CSA",
+    "CompressedSparseAttention",
     "CSACompressorBackward",
     "CSACompressorForward",
     "csa_compressor_backward_wrapper",
