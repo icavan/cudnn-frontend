@@ -64,7 +64,7 @@ def oracle(reference, tensors, lengths, upstream, *, safe_gate, l2norm, paramete
         out, grads = oracle_block(reference, group, lengths, upstream[:, start:stop], safe_gate=safe_gate, l2norm=l2norm, parameters=parameters)
         outputs.append(out)
         gradients.append(grads)
-    return torch.cat(outputs, dim=1), tuple(torch.cat(group, dim=1 if i < 5 else 0) for i, group in enumerate(zip(*gradients)))
+    return torch.cat(outputs, dim=1), tuple(torch.cat(group, dim=1 if i < 5 else 0) for i, group in enumerate(zip(*gradients, strict=True)))
 
 
 def draw_case(lengths, heads, dim, dtype, distribution, seed, *, safe_gate, parameters, device):
@@ -141,7 +141,7 @@ def self_test():
     analytic = ((normalize(q) * normalize(k)).sum(-1) * beta.sigmoid())[..., None] * v / math.sqrt(8)
     wanted = torch.autograd.grad(analytic, (q, k, v, beta), do)
     torch.testing.assert_close(out, analytic.detach(), rtol=1e-13, atol=1e-13)
-    for actual, expected in zip((gradients[0], gradients[1], gradients[2], gradients[4]), wanted):
+    for actual, expected in zip((gradients[0], gradients[1], gradients[2], gradients[4]), wanted, strict=True):
         torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-13)
     assert all(torch.count_nonzero(gradients[i]) == 0 for i in (3, 5, 6))
     for safe_gate in (False, True):

@@ -91,7 +91,7 @@ def run(args):
             torch.cuda.synchronize()
             results[label] = tuple(t.detach().clone() for t in result)
         metrics = []
-        for actual, expected in zip(results["candidate"], results["baseline"]):
+        for actual, expected in zip(results["candidate"], results["baseline"], strict=True):
             if not expected.numel():
                 continue
             rms = expected.double().square().mean().sqrt().item()

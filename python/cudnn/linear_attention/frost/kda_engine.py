@@ -641,6 +641,7 @@ class CompiledKdaBwd:
         return self.workspace_size
 
     def bind(self, names) -> None:
+        """Prepare immutable slot indices/scalars in graph input and workspace order, without retaining operand storage."""
         pos = {name: i for i, name in enumerate(names)}
         self.index_q = pos["q"]
         self.index_k = pos["k"]

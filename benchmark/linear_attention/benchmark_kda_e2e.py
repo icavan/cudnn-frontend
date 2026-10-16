@@ -56,7 +56,7 @@ def graph_measure(call, repeats, rounds):
         graph.replay()
         torch.cuda.synchronize()
         fresh = call()
-        for actual, expected in zip(results[-1], fresh):
+        for actual, expected in zip(results[-1], fresh, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         return measured
     finally:
@@ -111,7 +111,7 @@ def run_case(args, batch, tokens, heads, checkpoint):
     row["graph_bwd"] = graph_measure(backward, args.repeats, args.rounds)
     row["eager_bwd"] = measure(backward, args.repeats, args.rounds)
     after = e2e()
-    for got, want in zip(after, before):
+    for got, want in zip(after, before, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     if args.cpu_profile:
         profiler = cProfile.Profile()
