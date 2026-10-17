@@ -227,6 +227,10 @@ Caller checkpoints avoid forward but chain still computes M through recompute;
 keep its reports separate from an uncut-only clean result. A racecheck log that
 reaches its hazard limit cannot establish that later kernels are clean: increase
 `NV_COMPUTE_SANITIZER_MAX_RACECHECK_HAZARDS` and rerun without kernel filters.
+Also use `--print-limit 0` for complete kernel attribution: the default prints
+only 100 reports even when the recording budget is not reached. Compare the
+displayed count with the error/warning totals before claiming later kernels
+are clean; retain limited runs separately from the complete rerun.
 
 Bind tensor views in the graph's declared axis order. A BSHD allocation and
 a BHSD declaration can have identical shapes when H == S; shape equality then
