@@ -745,10 +745,12 @@ class CompiledKdaBwd:
         self.fold_pairs = tuple((positions[f"d{port}_ho"], pos[f"d{port.upper()}"]) for port in ("q", "k", "v") if getattr(self, f"fold_d{port}"))
 
     def run(self, views, workspace, stream) -> None:
+        """Launch backward and its postpasses on ``stream``; ``None`` means legacy stream 0."""
+        stream = stream if stream is not None else 0
         launch = self.chain_launch if self.chain else self.uncut_launch
         if launch is not None:
             frame = (*views, *workspace.carve(self.carve), None)
-            launch(*self.launch_scalars, *self.launch_buffers(frame), self.stream_type(int(stream or 0)))
+            launch(*self.launch_scalars, *self.launch_buffers(frame), self.stream_type(int(stream)))
             self.finish(frame, stream)
             return
         q = views[self.index_q]
@@ -771,8 +773,6 @@ class CompiledKdaBwd:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         d_a_log = views[self.index_d_a_log] if self.index_d_a_log is not None else None
         d_dt_bias = views[self.index_d_dt_bias] if self.index_d_dt_bias is not None else None
-        stream = stream if stream is not None else 0
-
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         work_items = region["work_items"]
         work_count = region["work_count"]

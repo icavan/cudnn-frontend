@@ -117,7 +117,8 @@ def test_warm_backward_frame_matches_cold_with_new_buffers(chain, checkpoint, ga
     plan.channel_gate_bwd = lambda *args, **kwargs: finish.append((args, kwargs))
     plan.head_group_reduce = lambda *args, **kwargs: finish.append((args, kwargs))
     plan.chain_launch = plan.uncut_launch = None
-    for stream in (0, 17):
+    for stream in (None, 0, 17):
+        expected_stream = 0 if stream is None else stream
         views = tuple(object() for _ in names)
         scratch = tuple(object() for _ in plan.carve_names)
         workspace = SimpleNamespace(carve=lambda unused: scratch)
@@ -131,5 +132,5 @@ def test_warm_backward_frame_matches_cold_with_new_buffers(chain, checkpoint, ga
         plan.run(views, workspace, stream)
         cold = calls[-1]
         assert warm[:-1] == cold[:-1]
-        assert int(warm[-1]) == int(cold[-1]) == stream
+        assert int(warm[-1]) == int(cold[-1]) == expected_stream
         assert finish == warm_finish

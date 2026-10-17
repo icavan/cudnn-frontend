@@ -41,6 +41,7 @@ def load_baseline(directory):
 
 
 def run(args):
+    """Alternate captured baseline/candidate backward kernels under one host and input allocation."""
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_stream(stream)
@@ -75,6 +76,7 @@ def run(args):
             package.kda_bprop_summary_f16 = summary
 
             def call():
+                """Execute the selected variant's complete backward or forward/autograd path."""
                 if args.e2e:
                     output = ops.kimi_delta_attention(*inputs, cu, checkpoint_every_n_tokens=args.checkpoint, **opts)[0]
                     return (output,) + torch.autograd.grad(output, inputs, do)

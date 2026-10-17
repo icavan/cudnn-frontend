@@ -21,6 +21,7 @@ def test_ordered_execution_rebinds_current_buffers_and_preserves_map_fallback():
 
     class Graph:
         def execute(self, bindings, **kwargs):
+            """Record fresh operands and resource arguments without launching a kernel."""
             calls.append((bindings, kwargs))
 
     graph = Graph()

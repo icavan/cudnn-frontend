@@ -990,7 +990,10 @@
   },
   "sanitizer": {
     "final-bwd-mem": {
+      "raw_log_file": "final-bwd-mem.log",
       "raw_log_sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425",
+      "pytest_log_file": "final-bwd-mem-pytest.log",
+      "pytest_log_sha256": "3eef85de97a7672e03a7941963e91f0a0fd10746278547a717d2c9d2804c49f5",
       "summary": "========= ERROR SUMMARY: 0 errors",
       "kernel_families": [],
       "pytest_summary": "================ 8 passed, 26 deselected, 7 warnings in 32.53s ================="
@@ -1010,7 +1013,10 @@
       "pytest_summary": "=========== 8 passed, 26 deselected, 7 warnings in 72.42s (0:01:12) ============"
     },
     "final-e2e-mem": {
+      "raw_log_file": "final-e2e-mem.log",
       "raw_log_sha256": "a9d061cee538182f762e132abeea7bac7bddb844338f25751bbbb043f242c425",
+      "pytest_log_file": "final-e2e-mem-pytest.log",
+      "pytest_log_sha256": "9273574858c1e8267b8ab277dd3e2dd6fa433f845148066ebe1aef5bbd3e9f0b",
       "summary": "========= ERROR SUMMARY: 0 errors",
       "kernel_families": [],
       "pytest_summary": "================ 8 passed, 26 deselected, 7 warnings in 49.40s ================="
@@ -1034,7 +1040,7 @@
       ],
       "pytest_summary": null
     },
-    "qualification": "Full E2E racecheck is not clean; final backward-only is clean. Memcheck disables reporting of unsupported API probes but instruments all device memory accesses. No kernel filters; launch timeout and pytest watchdogs disabled."
+    "qualification": "raw_log_sha256 hashes only the separate Compute Sanitizer --log-file output, not pytest stdout/stderr. Both clean memcheck tool logs contain the same two lines and legitimately share a hash; the distinct pytest logs carry the run durations and have their own file names and hashes. Full E2E racecheck is not clean; final backward-only is clean. Memcheck disables reporting of unsupported API probes but instruments all device memory accesses. No kernel filters; launch timeout and pytest watchdogs disabled."
   },
   "pytest": {
     "final-native": {

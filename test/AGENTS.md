@@ -215,6 +215,12 @@ defaulting to `None`, while retaining argument order and default checks.
 
 ### Confirm you are testing the code you edited
 
+For a source export with symlinked tests, `linear_attention/conftest.py` resolves
+its own path to select the package tree. A borrowed conftest can redirect KDA
+submodules to the original checkout even when `cudnn.__file__` names the export.
+Copy that conftest into the export and assert the served executor's source path
+and kernel hash after collection; a top-level package-path print is insufficient.
+
 Bind tensor views in the graph's declared axis order. A BSHD allocation and
 a BHSD declaration can have identical shapes when H == S; shape equality then
 preserves the producer's strides and cannot infer the intended transpose.

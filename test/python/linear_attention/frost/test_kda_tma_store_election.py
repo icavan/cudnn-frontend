@@ -12,6 +12,7 @@ pytestmark = pytest.mark.L0
 
 
 def _epilogue_tree():
+    """Read this checkout's epilogue AST and its ancestor map for ownership assertions."""
     source = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "linear_attention" / "frost" / "kernel" / "kda_bprop_f16.py"
     tree = ast.parse(source.read_text())
     epilogue = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "epilogue_warp")
@@ -20,10 +21,12 @@ def _epilogue_tree():
 
 
 def _calls(epilogue, name):
+    """Find direct calls to the named helper in the epilogue AST."""
     return [node for node in ast.walk(epilogue) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name]
 
 
 def _is_inside_elect_one(node, parents):
+    """Check whether an elected-lane guard encloses this operation."""
     while node in parents:
         node = parents[node]
         if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "elect_one":
@@ -32,10 +35,12 @@ def _is_inside_elect_one(node, parents):
 
 
 def _contains_name(node, name):
+    """Recognize references to a particular shared-memory pointer in an expression."""
     return any(isinstance(child, ast.Name) and child.id == name for child in ast.walk(node))
 
 
 def test_kda_backward_tma_stores_are_elected_but_group_completion_is_warp_wide():
+    """Elect store issue once while preserving every completion-barrier participant."""
     epilogue, parents = _epilogue_tree()
 
     stores = _calls(epilogue, "tma_store_tile")
@@ -59,6 +64,7 @@ def test_kda_backward_tma_stores_are_elected_but_group_completion_is_warp_wide()
 
 @pytest.mark.parametrize("kernel", ["kda_bprop_f16.py", "kda_bprop_summary_f16.py"])
 def test_kda_backward_decay_scale_stage_waits_for_all_readers(kernel):
+    """Keep scale-slot reuse behind the independent CG1 reader acknowledgement."""
     source = (Path(__file__).resolve().parents[4] / "python" / "cudnn" / "linear_attention" / "frost" / "kernel" / kernel).read_text()
 
     assert "mb_decay_scale_done: MBarrier" in source
@@ -72,6 +78,7 @@ def test_kda_backward_decay_scale_stage_waits_for_all_readers(kernel):
 
 @pytest.mark.parametrize("kernel", ["kda_bprop_f16.py", "kda_bprop_summary_f16.py"])
 def test_kda_backward_in_place_gate_exchange_has_load_store_barrier(kernel):
+    """Require all aliased gate loads to finish before any in-place prefix stores."""
     source = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "linear_attention" / "frost" / "kernel" / kernel
     tree = ast.parse(source.read_text())
     compute0 = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "compute0_warp_group")

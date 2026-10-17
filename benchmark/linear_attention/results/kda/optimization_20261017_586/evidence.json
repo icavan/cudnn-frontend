@@ -351,6 +351,19 @@
     }
   },
   "integrated_native_summary": "================== 89 passed, 6 warnings in 106.34s (0:01:46) ==================",
+  "integrated_native_scope": "Historical pytest run: borrowed linear_attention/conftest.py redirects submodules to the original PR, so this summary does not establish coverage of the rolled kernel. Standalone timing/precision/NCU are unaffected. See REVIEW_COMMENTS.md for source-pinned follow-up verification.",
+  "review_comment_followup": {
+    "executor_sha256": "ebb01ed38721954f356d4403b6ab8f5ac0a9d8ddc0879f1defe3ff2a4e99129d",
+    "kernel_sha256": "37c2a1d53c800954d94295cb5a3eb6afdf9ba2341ab4eff9e1d5ed6d84f181d8",
+    "source_scope": "Collection hook verifies the actual fixed executor and rolled kernel after reifying the export's source-pinning conftest",
+    "red_summary": "10 failed, 2 passed, 6 warnings in 30.08s",
+    "green_summary": "101 passed, 6 warnings in 128.77s",
+    "raw_sha256": {
+      "red.log": "67a248b3473daa032b7fefa0c86364cedb7c6a27b6c560c886a608ff54c1fb95",
+      "green.log_invalid_import_scope": "97bebac8bf8fdd22774df2e3e53e0ad086dcdf14c66a3f45660b65b275fb7681",
+      "green-pinned.log": "f0bcf306191aac4c82efb6d1d8c7194453cdfee88b8f6f5aca4ebd6efdfe427a"
+    }
+  },
   "sanitizer": {
     "memcheck": [
       "======================== 8 passed, 6 warnings in 31.35s ========================",

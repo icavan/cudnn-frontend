@@ -267,6 +267,12 @@ the kernel that reads it).
 - **Consumers too, not just producers**: anything reading what the kernel
   wrote (`amax_o.div_()`, an O scratch copy-back) belongs on the launch
   stream for the same reason.
+- **Warm launches keep the cold stream contract, including postpasses.** A
+  direct graph call without a handle can carry `ctx.stream=None`. Normalize
+  it before either path branches if the executor defines it as stream 0;
+  converting only the cached kernel's argument leaves postpasses with `None`.
+  KDA's `test_kda_backward_without_handle_preserves_default_stream` covers
+  cold/warm graph calls with safe gates and folded heads.
 - The PyTorch-integration path launches on torch's current stream, where the
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work

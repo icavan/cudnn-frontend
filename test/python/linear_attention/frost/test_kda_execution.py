@@ -69,6 +69,42 @@ def execute(plan, values, outputs, workspace):
     assert all(torch.isfinite(t).all() for t in outputs.values())
 
 
+@pytest.mark.parametrize("total", [64, 512], ids=["uncut", "chain"])
+@pytest.mark.parametrize("heads", [(1, 1, 1), (1, 1, 2), (2, 2, 1)], ids=["equal", "fold_qk", "fold_v"])
+@pytest.mark.parametrize("safe_gate", [False, True])
+def test_kda_backward_without_handle_preserves_default_stream(total, heads, safe_gate):
+    """Cold and warm direct graph calls normalize absent streams before postpasses."""
+    from cudnn.linear_attention.ops.common import select_plan
+
+    hq, hk, hv = heads
+    with torch.cuda.stream(torch.cuda.default_stream()):
+        case = make_case("kda", torch.bfloat16, T=total, H=hq, HK=hk, HV=hv, K=64, V=64)
+        values = dict(zip(LEAF_NAMES["kda"], thd_tensors(case), strict=True))
+        values["cu_seqlens"] = case.cu
+        values["dO"] = torch.randn(total, max(hq, hv), 64, dtype=torch.bfloat16, device="cuda")
+        graph = cudnn.pygraph()
+        tensors = {name: graph.tensor(list(t.shape), data_type=CUDNN_DTYPE[t.dtype], name=name) for name, t in values.items()}
+        graph.kda_bwd(**tensors, safe_gate=safe_gate, batch_invariant=total == 64)
+        outputs = {}
+        for name, source in dict(dQ="q", dK="k", dV="v", dG="g", dBeta="beta").items():
+            tensor = graph.nodes[0].outputs[name]
+            tensor.set_output(True).set_data_type(CUDNN_DTYPE[values[source].dtype])
+            outputs[name] = torch.empty(tuple(tensor.dim), dtype=values[source].dtype, device="cuda")
+        graph.validate()
+        select_plan(graph, "kda_frost")
+        graph.build_plans()
+        workspace = torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        pack = {**{tensors[name]: value for name, value in values.items()}, **{graph.nodes[0].outputs[name]: value for name, value in outputs.items()}}
+        graph.execute(pack, workspace=workspace, handle=None)
+        expected = {name: value.clone() for name, value in outputs.items()}
+        for _ in range(2):
+            graph.execute(pack, workspace=workspace, handle=None)
+            for name, value in outputs.items():
+                assert torch.isfinite(value).all()
+                torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+        torch.cuda.current_stream().synchronize()
+
+
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("schedule", ["uncut", "chain"])
 def test_frost_native_cache_reuses_kda_across_shapes(monkeypatch, backward, schedule):
@@ -248,6 +284,7 @@ def test_kda_backward_only_changed_input_replay(dim, dtype, optional):
         )
 
     def call():
+        """Execute backward with caller checkpoints and the current live input contents."""
         return ops.kda_bwd(do, q, k, v, g, beta, cu, dim**-0.5, **options)
 
     call()

@@ -137,6 +137,14 @@ unsupported-driver/VMM capability probes in the Python runtime; device-memory
 instrumentation remains enabled. Thus this is a device-memcheck result, not a
 claim that every CUDA API probe succeeded.
 
+The tool's `--log-file` output and pytest stdout/stderr are separate artifacts.
+`evidence.json`'s `raw_log_sha256` refers only to the tool log. Both clean
+memcheck logs are the same 62 bytes (banner plus zero-error summary), so their
+equal hashes are valid; the different pytest durations are in the separate
+`final-{bwd,e2e}-mem-pytest.log` files. Their file names and distinct SHA256
+hashes are recorded alongside the tool-log identities after checking the
+original locally archived bytes, not reconstructing them from summaries.
+
 - Final backward-only memcheck: 8 cases passed, **0 errors**.
 - Final backward-only racecheck: 8 cases passed, **0 errors, 0 warnings**.
 - The same backward-only cases against exact upstream: pytest also passes,

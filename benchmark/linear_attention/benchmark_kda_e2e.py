@@ -71,6 +71,7 @@ def run_case(args, batch, tokens, heads, checkpoint):
     shape = (batch * tokens, heads, args.dim)
 
     def rand(shape, dtype):
+        """Draw reproducible CPU inputs, then upload outside the timed region."""
         return torch.randn(shape, dtype=dtype, generator=generator).cuda()
 
     inputs = [rand(shape, dtype) for _ in range(3)]
@@ -82,9 +83,11 @@ def run_case(args, batch, tokens, heads, checkpoint):
     opts = dict(use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True, safe_gate=True, plan_name="kda_frost")
 
     def forward():
+        """Run public KDA forward, retaining the requested state checkpoints."""
         return kimi_delta_attention(*inputs, cu, checkpoint_every_n_tokens=checkpoint, **opts)
 
     def e2e():
+        """Return the forward output and fresh gradients for all five input leaves."""
         out = forward()[0]
         return (out,) + torch.autograd.grad(out, inputs, do)
 
@@ -93,6 +96,7 @@ def run_case(args, batch, tokens, heads, checkpoint):
     detached = tuple(t.detach() for t in inputs)
 
     def backward():
+        """Measure complete backward using detached inputs and optional forward checkpoints."""
         return kda_bwd(do, *detached, cu, args.dim**-0.5, state_checkpoints=cp, checkpoint_every_n_tokens=checkpoint, **opts)
 
     for _ in range(5):
@@ -133,6 +137,7 @@ def run_case(args, batch, tokens, heads, checkpoint):
 
 
 def main():
+    """Measure the requested shape grid and save timings with import/source provenance."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", nargs="+", type=int, default=[1])
     parser.add_argument("--tokens", nargs="+", type=int, default=[2048])

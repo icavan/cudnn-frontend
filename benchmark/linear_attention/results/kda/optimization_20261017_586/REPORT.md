@@ -97,10 +97,14 @@ upstream-identical forward/recompute hazards remain outside this microtuning.
 Existing nanobind shutdown reference-leak diagnostics are retained in raw logs.
 No process was signaled or forcibly stopped.
 
-After the final timing run, canonical imports of the integrated source passed
-all 89 native/execution, warm-binding, dO-pipeline, elected-store, host-ABI and
-multistream-resource regressions. Ten source-only ABI/store-ownership checks
-also passed locally. Both pinned baseline/previous-PR exports were reverified
+An earlier post-timing pytest run reported 89 passing native/execution,
+binding, pipeline, ABI and resource cases. Follow-up review found that its
+borrowed linear-attention conftest could redirect submodules to the original
+PR despite the printed top-level package path. That run is not evidence of
+testing the integrated rolled kernel; see `REVIEW_COMMENTS.md` for the corrected
+source-pinned verification. The standalone performance, precision and NCU
+harnesses do not load this pytest conftest. Ten source-only ABI/store-ownership
+checks also passed locally. Both pinned baseline/previous-PR exports were reverified
 against all 1062 production/build Git blobs. Changed-file pre-commit, Python
 syntax and whitespace checks passed; no unrelated worktree was modified.
 

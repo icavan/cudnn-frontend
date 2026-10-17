@@ -74,6 +74,7 @@ def draw_case(lengths, heads, dim, dtype, distribution, seed, *, safe_gate, para
     shape = (total, heads, dim)
 
     def rand(shape):
+        """Draw CPU values from this case's private seeded generator."""
         return torch.randn(shape, generator=generator)
 
     q, k, v = (rand(shape) for _ in range(3))
@@ -162,6 +163,7 @@ def self_test():
 
 
 def run(args):
+    """Pair baseline/candidate backward errors against the same FP64 recurrence and rounded inputs."""
     import cudnn
     import cudnn.linear_attention.ops.kda as ops
     import cudnn.linear_attention.frost.kernel as package
