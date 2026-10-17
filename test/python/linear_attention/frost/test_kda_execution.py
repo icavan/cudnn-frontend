@@ -22,7 +22,7 @@ from cudnn.frost.workspace import Workspace
 from cudnn.linear_attention.frost.kda_engine import build_kda
 from cudnn.linear_attention.ops import kimi_delta_attention
 
-from linear_attention.test_la import CUDNN_DTYPE, LEAF_NAMES, make_case, thd_tensors
+from linear_attention.test_la import Backend, CUDNN_DTYPE, LEAF_NAMES, assert_bwd_parity, make_case, thd_tensors
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -159,6 +159,22 @@ def test_frost_native_kda_backward_respects_output_strides(total, heads):
     for name, reference in outputs.items():
         torch.testing.assert_close(strided[name], reference, rtol=0, atol=0)
         assert torch.isnan(padded[name][..., reference.shape[-1] :]).all(), f"{name} wrote into output padding"
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("inputs", ["ordinary", "small_norm", "cancellation"])
+def test_kda_bwd_l2norm_reference(dim, dtype, inputs):
+    """Compare output and every input gradient to the suite's FP64 recurrence."""
+    case = make_case("kda", dtype, T=65, H=2, K=dim, V=dim, seed=418)
+    if inputs == "small_norm":
+        case.q[:, ::3] *= 1e-6
+        case.k[:, 1::3] *= 1e-6
+    elif inputs == "cancellation":
+        # Correlated keys and opposite values stress the L2 projection's subtraction.
+        case.k.copy_(case.k[:, :1].clone().expand_as(case.k))
+        case.v[:, 1::2].copy_(-case.v[:, :-1:2])
+    assert_bwd_parity(Backend("frost"), case, l2norm=True)
 
 
 @pytest.mark.parametrize("dim", [64, 128])

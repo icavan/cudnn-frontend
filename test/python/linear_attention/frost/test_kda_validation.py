@@ -12,7 +12,7 @@ pytestmark = pytest.mark.L0
 ROOT = Path(__file__).resolve().parents[4]
 
 
-@pytest.mark.parametrize("script", ["benchmark_kda_e2e.py", "benchmark_kda_kernel_ab.py", "audit_kda_precision.py"])
+@pytest.mark.parametrize("script", ["benchmark_kda_e2e.py", "benchmark_kda_kernel_ab.py"])
 def test_benchmark_output_comparisons_reject_missing_slots(script):
     """Do not silently truncate validation if a candidate drops a result slot."""
     tree = ast.parse((ROOT / "benchmark/linear_attention" / script).read_text())

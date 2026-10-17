@@ -183,7 +183,6 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   fix. `test_sdpa_fwd_split_kv_sm120.py` covers this pattern.
 - **Every randomized SDPA input uses the per-test generator.** A seeded Q/K/V tuple is not a reproducible case if its block mask comes from the process-global CUDA RNG. Pass `generator=rng_data_gen` to auxiliary draws too; `test_block_mask_uses_the_per_test_data_generator` perturbs global RNG while holding the case seed fixed. Before attributing an order-dependent failure to an earlier engine, compare the actual masks as well as Q/K/V.
 - **Compiled DSL call arity excludes compile-time parameters.** A `cutlass.Constexpr` argument belongs to the compilation signature and disappears from the compiled runtime call. When checking positional launch sites against `_host`, exclude these annotations as well as the stream keyword; do not add a runtime argument to satisfy an unfiltered Python signature count. `test_every_combine_call_site_matches_the_compiled_arity` is the detector.
-- **Paired numerical validation must reject missing output slots.** Use `zip(..., strict=True)` when comparing result/gradient tuples, including benchmark and oracle checks. Plain `zip` can silently accept a candidate that returns fewer gradients. `linear_attention/frost/test_kda_validation.py::test_benchmark_output_comparisons_reject_missing_slots` guards the KDA validation scripts.
 - **A new architecture reuses the shared forward harness through `_ARCH`, not by copying it.** `sdpa/frost/test_sdpa_fwd_dsl_sm100.py` selects its engine architecture through a module-level `_ARCH` string fed to `engine_name(arch=...)`. A new row reuses its runners and assertions from a file carrying its **own** device gate:
 
   ```python
@@ -214,23 +213,6 @@ Signature tests should accept both `object` and `object | None` for an argument
 defaulting to `None`, while retaining argument order and default checks.
 
 ### Confirm you are testing the code you edited
-
-For a source export with symlinked tests, `linear_attention/conftest.py` resolves
-its own path to select the package tree. A borrowed conftest can redirect KDA
-submodules to the original checkout even when `cudnn.__file__` names the export.
-Copy that conftest into the export and assert the served executor's source path
-and kernel hash after collection; a top-level package-path print is insufficient.
-
-For KDA backward sanitizer runs, select both schedules in
-`test_kda_backward_only_changed_input_replay` and assert the actual plan family.
-Caller checkpoints avoid forward but chain still computes M through recompute;
-keep its reports separate from an uncut-only clean result. A racecheck log that
-reaches its hazard limit cannot establish that later kernels are clean: increase
-`NV_COMPUTE_SANITIZER_MAX_RACECHECK_HAZARDS` and rerun without kernel filters.
-Also use `--print-limit 0` for complete kernel attribution: the default prints
-only 100 reports even when the recording budget is not reached. Compare the
-displayed count with the error/warning totals before claiming later kernels
-are clean; retain limited runs separately from the complete rerun.
 
 Bind tensor views in the graph's declared axis order. A BSHD allocation and
 a BHSD declaration can have identical shapes when H == S; shape equality then

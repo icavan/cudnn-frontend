@@ -739,30 +739,6 @@ repository benchmark shapes or a documented target workload. A favorable
 synthetic shape establishes a local effect, not representative benefit; it does
 not by itself justify another compile-cache specialization.
 
-TMEM raw-slot reuse needs an explicit `tcgen05.wait::ld` before its reader-done
-handoff. A true register dependency orders the consuming arithmetic, not the
-anti-dependency against another warp's next store. The KDA detector is
-`linear_attention/frost/test_kda_do_pipeline.py::test_raw_qk_loads_complete_before_slot_release`;
-pair it with changed-input replay and racecheck rather than treating numerical
-agreement as a memory-order proof.
-
-When changing ring depth, derive SMEM sizes and TMA geometry from that depth
-and audit every optional reader and phase wrap. Compare with the current
-upstream defaults: a historical three-to-two-stage gain is not a new gain
-once upstream already uses two stages. Keep independent A/B provenance.
-
-Changing lane ownership must preserve the original reduction tree and rounded
-intermediates when bitwise numerical compatibility is required. Small-norm
-inputs expose differences hidden by ordinary half/bfloat16 output rounding;
-the KDA FP64 audit includes these alongside ordinary and cancellation inputs.
-
-Moving an MMA also moves its buffer-lifetime obligations. A ready wait must
-precede the first consumer, not just the rescheduled operation; reuse credits
-must include every asynchronous reader. KDA's dO barrier combines epilogue
-arrivals with CG1's acknowledgement of the committed dstate epoch (which follows
-the last dO MMA). `linear_attention/frost/test_kda_do_pipeline.py` guards both
-edges. A passing racecheck does not replace these ownership checks.
-
 ## The public function contract
 
 Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
