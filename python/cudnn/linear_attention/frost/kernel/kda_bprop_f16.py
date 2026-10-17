@@ -2937,18 +2937,18 @@ def compute2_warp_group(
                     stage_ptr = sDq_raw.data_ptr() if projection == 0 else sDk_raw.data_ptr()
                     raw_ptr = sQ_raw.data_ptr() if projection == 0 else sK_raw.data_ptr()
                     raw_base = raw_stage * (cfg.d_k * cfg.b_t)
-                    for token_pass in cutlass.range_constexpr(2):
-                        token = projection_warp + (subwarp_id + token_pass * 4) * 2
-                        norm_v = sNorm_raw[norm_base + inv_off + token]
+                    for token_pass in cutlass.range(2, unroll=1):
+                        proj_token = projection_warp + (subwarp_id + token_pass * 4) * 2
+                        proj_norm_v = sNorm_raw[norm_base + inv_off + proj_token]
                         grad_cache = cutlass.Array(cutlass.Float32, 16, alignment=16)
                         raw_cache = cutlass.Array(cutlass.Int32, 8, alignment=16)
                         warp_dots = cutlass.Array(cutlass.Float32, 2)
                         for group in cutlass.range_constexpr(2):
                             channel_base = group * 64 + lane8 * 8
-                            grad_vec = (sProj_raw.data_ptr() + grad_base + token * cfg.cg2_threads + channel_base).load(count=8, alignment=16)
+                            grad_vec = (sProj_raw.data_ptr() + grad_base + proj_token * cfg.cg2_threads + channel_base).load(count=8, alignment=16)
                             raw_seg = channel_base // 64
                             raw_dim = channel_base - raw_seg * 64
-                            raw_idx = raw_base + raw_seg * (cfg.b_t * 64) + token * 64 + swizzle_xor_128b(token, raw_dim, elem_bytes=2)
+                            raw_idx = raw_base + raw_seg * (cfg.b_t * 64) + proj_token * 64 + swizzle_xor_128b(proj_token, raw_dim, elem_bytes=2)
                             raw_vec = (raw_ptr + raw_idx).load(count=8, alignment=16)
                             raw_words = raw_vec.bitcast(cutlass.Int32)
                             for elem in cutlass.range_constexpr(8):
@@ -2960,18 +2960,18 @@ def compute2_warp_group(
                             gp4, gp5 = fmul2(grad_vec[4], grad_vec[5], raw_vec[4].to(cutlass.Float32), raw_vec[5].to(cutlass.Float32))
                             gp6, gp7 = fmul2(grad_vec[6], grad_vec[7], raw_vec[6].to(cutlass.Float32), raw_vec[7].to(cutlass.Float32))
                             # Match upstream's rounded (grad * raw) * norm terms.
-                            gp0, gp1 = fmul2(gp0, gp1, norm_v, norm_v)
-                            gp2, gp3 = fmul2(gp2, gp3, norm_v, norm_v)
-                            gp4, gp5 = fmul2(gp4, gp5, norm_v, norm_v)
-                            gp6, gp7 = fmul2(gp6, gp7, norm_v, norm_v)
+                            gp0, gp1 = fmul2(gp0, gp1, proj_norm_v, proj_norm_v)
+                            gp2, gp3 = fmul2(gp2, gp3, proj_norm_v, proj_norm_v)
+                            gp4, gp5 = fmul2(gp4, gp5, proj_norm_v, proj_norm_v)
+                            gp6, gp7 = fmul2(gp6, gp7, proj_norm_v, proj_norm_v)
                             pair01, pair23 = fadd2(gp0, gp2, gp1, gp3)
                             pair45, pair67 = fadd2(gp4, gp6, gp5, gp7)
                             quad03, quad47 = fadd2(pair01, pair45, pair23, pair67)
-                            part = quad03 + quad47
+                            proj_part = quad03 + quad47
                             for step in (1, 2):
-                                other = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, part, step, subwarp_mask_and_clamp, kind=nvvm.Shfl.BFLY))
-                                part = part + other
-                            warp_dots[group] = part
+                                other = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, proj_part, step, subwarp_mask_and_clamp, kind=nvvm.Shfl.BFLY))
+                                proj_part = proj_part + other
+                            warp_dots[group] = proj_part
                         # Reproduce the original four 32-channel warp sums and
                         # their left-to-right reduction, despite the new ownership.
                         base_lane = lane_idx - lane8
@@ -2979,41 +2979,41 @@ def compute2_warp_group(
                         dot1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[0], base_lane + 4, 31, kind=nvvm.Shfl.IDX))
                         dot2 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[1], base_lane, 31, kind=nvvm.Shfl.IDX))
                         dot3 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, warp_dots[1], base_lane + 4, 31, kind=nvvm.Shfl.IDX))
-                        dot_total = ((dot0 + dot1) + dot2) + dot3
+                        proj_dot_total = ((dot0 + dot1) + dot2) + dot3
 
                         for group in cutlass.range_constexpr(2):
                             channel_base = group * 64 + lane8 * 8
                             raw_seg = channel_base // 64
                             raw_dim = channel_base - raw_seg * 64
-                            out_idx = stage_base + raw_seg * (cfg.b_t * 64) + token * 64 + swizzle_xor_128b(token, raw_dim, elem_bytes=2)
+                            proj_out_idx = stage_base + raw_seg * (cfg.b_t * 64) + proj_token * 64 + swizzle_xor_128b(proj_token, raw_dim, elem_bytes=2)
                             grad_off = group * 8
                             raw_off = group * 4
                             raw_words = cutlass.Vector.from_elements(
                                 (raw_cache[raw_off], raw_cache[raw_off + 1], raw_cache[raw_off + 2], raw_cache[raw_off + 3]), cutlass.Int32
                             )
                             raw_vec = raw_words.bitcast(cfg.io_dtype)
-                            an0, an1 = fmul2(raw_vec[0].to(cutlass.Float32), raw_vec[1].to(cutlass.Float32), norm_v, norm_v)
-                            an2, an3 = fmul2(raw_vec[2].to(cutlass.Float32), raw_vec[3].to(cutlass.Float32), norm_v, norm_v)
-                            an4, an5 = fmul2(raw_vec[4].to(cutlass.Float32), raw_vec[5].to(cutlass.Float32), norm_v, norm_v)
-                            an6, an7 = fmul2(raw_vec[6].to(cutlass.Float32), raw_vec[7].to(cutlass.Float32), norm_v, norm_v)
-                            sub0 = grad_cache[grad_off] - an0 * dot_total
-                            sub1 = grad_cache[grad_off + 1] - an1 * dot_total
-                            sub2 = grad_cache[grad_off + 2] - an2 * dot_total
-                            sub3 = grad_cache[grad_off + 3] - an3 * dot_total
-                            sub4 = grad_cache[grad_off + 4] - an4 * dot_total
-                            sub5 = grad_cache[grad_off + 5] - an5 * dot_total
-                            sub6 = grad_cache[grad_off + 6] - an6 * dot_total
-                            sub7 = grad_cache[grad_off + 7] - an7 * dot_total
-                            sub0, sub1 = fmul2(sub0, sub1, norm_v, norm_v)
-                            sub2, sub3 = fmul2(sub2, sub3, norm_v, norm_v)
-                            sub4, sub5 = fmul2(sub4, sub5, norm_v, norm_v)
-                            sub6, sub7 = fmul2(sub6, sub7, norm_v, norm_v)
+                            an0, an1 = fmul2(raw_vec[0].to(cutlass.Float32), raw_vec[1].to(cutlass.Float32), proj_norm_v, proj_norm_v)
+                            an2, an3 = fmul2(raw_vec[2].to(cutlass.Float32), raw_vec[3].to(cutlass.Float32), proj_norm_v, proj_norm_v)
+                            an4, an5 = fmul2(raw_vec[4].to(cutlass.Float32), raw_vec[5].to(cutlass.Float32), proj_norm_v, proj_norm_v)
+                            an6, an7 = fmul2(raw_vec[6].to(cutlass.Float32), raw_vec[7].to(cutlass.Float32), proj_norm_v, proj_norm_v)
+                            sub0 = grad_cache[grad_off] - an0 * proj_dot_total
+                            sub1 = grad_cache[grad_off + 1] - an1 * proj_dot_total
+                            sub2 = grad_cache[grad_off + 2] - an2 * proj_dot_total
+                            sub3 = grad_cache[grad_off + 3] - an3 * proj_dot_total
+                            sub4 = grad_cache[grad_off + 4] - an4 * proj_dot_total
+                            sub5 = grad_cache[grad_off + 5] - an5 * proj_dot_total
+                            sub6 = grad_cache[grad_off + 6] - an6 * proj_dot_total
+                            sub7 = grad_cache[grad_off + 7] - an7 * proj_dot_total
+                            sub0, sub1 = fmul2(sub0, sub1, proj_norm_v, proj_norm_v)
+                            sub2, sub3 = fmul2(sub2, sub3, proj_norm_v, proj_norm_v)
+                            sub4, sub5 = fmul2(sub4, sub5, proj_norm_v, proj_norm_v)
+                            sub6, sub7 = fmul2(sub6, sub7, proj_norm_v, proj_norm_v)
                             packed01 = fp32_to_fp16(sub0, sub1, dtype=cfg.io_dtype)
                             packed23 = fp32_to_fp16(sub2, sub3, dtype=cfg.io_dtype)
                             packed45 = fp32_to_fp16(sub4, sub5, dtype=cfg.io_dtype)
                             packed67 = fp32_to_fp16(sub6, sub7, dtype=cfg.io_dtype)
                             out_vec = cutlass.Vector.from_elements((packed01, packed23, packed45, packed67), cutlass.Int32).bitcast(cfg.io_dtype)
-                            (stage_ptr + out_idx).store(out_vec, alignment=16)
+                            (stage_ptr + proj_out_idx).store(out_vec, alignment=16)
 
                     nvvm.fence_proxy("async.shared", space="cta")
                     bars.mb_raw_done[raw_stage].arrive()
