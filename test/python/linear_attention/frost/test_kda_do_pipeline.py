@@ -30,6 +30,17 @@ def calls(body, name):
     return [node for node in ast.walk(body) if isinstance(node, ast.Call) and ast.unparse(node.func) == name]
 
 
+def test_raw_qk_loads_complete_before_slot_release():
+    """A new raw-slot writer cannot overtake CG2's asynchronous TMEM reads."""
+    body = functions()["compute2_warp_group"]
+    loads = calls(body, "nvvm.tcgen05_ld")
+    drains = calls(body, "nvvm.tcgen05_wait")
+    drains = [node for node in drains if node.args[0].value == "load"]
+    release = calls(body, "bars.mb_qk_raw_done[qk_raw_stage].arrive")
+    assert loads and drains and len(release) == 1
+    assert max(node.lineno for node in loads) < max(node.lineno for node in drains) < release[0].lineno
+
+
 def test_do_ready_precedes_first_mma_read():
     """The late dQ placement must not move the ready guard past dU/dstate."""
     body = functions()["tcgen05_mma_warp"]

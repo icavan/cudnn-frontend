@@ -472,15 +472,11 @@ class CompiledKdaBwd:
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
         from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
-        from cuda.bindings.driver import CUstream
-        from .kernel.kda_chain_backward_f16 import CHAIN_BACKWARD_BUFFERS, build_chain_backward, run_chain_backward
-        from .kernel.kda_uncut_backward_f16 import UNCUT_BACKWARD_BUFFERS, build_uncut_backward, run_uncut_backward
+        from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
+        from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
 
         self.node = node
-        self.stream_type = CUstream
-        self.chain_buffer_names = CHAIN_BACKWARD_BUFFERS
-        self.uncut_buffer_names = UNCUT_BACKWARD_BUFFERS
         self.chain_rows_per_cta = chain_rows_per_cta
         self.build_chain_backward = build_chain_backward
         self.run_chain_backward = run_chain_backward
@@ -641,7 +637,6 @@ class CompiledKdaBwd:
         return self.workspace_size
 
     def bind(self, names) -> None:
-        """Prepare immutable slot indices/scalars in graph input and workspace order, without retaining operand storage."""
         pos = {name: i for i, name in enumerate(names)}
         self.index_q = pos["q"]
         self.index_k = pos["k"]
@@ -664,95 +659,7 @@ class CompiledKdaBwd:
         self.index_d_a_log = pos.get("d_a_log")
         self.index_d_dt_bias = pos.get("d_dt_bias")
 
-        # Compile the immutable binding recipe, not an operand frame. Every
-        # launch rebinds caller inputs, outputs, scratch and the current stream.
-        positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
-        if "state_checkpoints" in pos:
-            positions["input_checkpoints"] = pos["state_checkpoints"]
-        absent = len(names) + len(self.carve_names)
-        coarse, series = self.coarse_checkpoints, self.needs_recompute
-        aliases = {
-            "do": "dO",
-            "gate": "g",
-            "gate_main": "g" if not self.log_gate and not self.safe_gate else None,
-            "dq": "dq_ho" if self.fold_dq else "dQ",
-            "dk": "dk_ho" if self.fold_dk else "dK",
-            "dv": "dv_ho" if self.fold_dv else "dV",
-            "dgate": "dG",
-            "dbeta": "dBeta",
-            "dstate0": "d_initial_state",
-            "seed": "initial_state",
-            "dseed": "d_final_state",
-            "dstate_in": "d_final_state",
-            "seed_checkpoints": "input_checkpoints" if coarse else None,
-            "checkpoints": "state_checkpoints",
-            "a_log": "a_log" if self.safe_gate else None,
-            "dt_bias": "dt_bias" if self.safe_gate else None,
-            "bprop_words": "bwd_tensormaps",
-        }
-        if self.has_state_checkpoints and not coarse:
-            # The input and carved region share a name only on recompute paths.
-            positions["state_checkpoints"] = pos["state_checkpoints"]
-        if self.chain:
-            aliases.update(
-                {
-                    "series_items": "work_items_recompute",
-                    "series_count": "work_count_recompute",
-                    "summary_words": "fused_tensormaps",
-                    "recompute_m_words": "recompute_tensormaps_m",
-                    "series_words": "recompute_tensormaps_series",
-                    "bprop_summary_words": "summary_tensormaps",
-                    "state_h_summary": "state_h" if self.fused_h_m else None,
-                    "state_h_chain": "state_h" if self.fused_h_m else None,
-                    "state_x_chain": "state_x" if self.fused_h_m else None,
-                    "state_x_series": "state_x" if series and not coarse else None,
-                    "recompute_items": ("work_items_recompute" if coarse else "work_items") if series else None,
-                    "recompute_count": ("work_count_recompute" if coarse else "main_count") if series else None,
-                }
-            )
-            fields = self.chain_buffer_names
-            self.launch_scalars = (
-                int(self.pieces),
-                int(self.n_heads_out),
-                int(self.num_seqs),
-                int(self.recompute_span_tokens) // self.b_t if coarse else 0,
-                int(self.b_t),
-                int(self.checkpoint_cadence) if coarse else 0,
-                float(self.scale),
-            )
-        else:
-            aliases.update(
-                {
-                    "state_in": "initial_state" if series and not coarse else None,
-                    "series_items": ("work_items_recompute" if coarse else "work_items") if series else None,
-                    "series_count": ("work_count_recompute" if coarse else "work_count") if series else None,
-                    "scheduler_order_recompute": "scheduler_all" if series else None,
-                    "scheduler_order_bwd": "scheduler_all" if self.has_state_checkpoints else None,
-                    "recompute_words": "recompute_tensormaps" if series else None,
-                }
-            )
-            fields = self.uncut_buffer_names
-            self.launch_scalars = (
-                int(self.b_t),
-                int(self.recompute_span_tokens or self.checkpoint_cadence) // self.b_t if coarse else 0,
-                int(self.checkpoint_cadence) if coarse else 0,
-                float(self.scale),
-            )
-        self.launch_buffers = itemgetter(*(positions.get(aliases.get(name, name), absent) for name in fields))
-        self.gate_buffers = itemgetter(
-            *(positions.get(name, absent) for name in ("dG", "g", "a_log", "dt_bias", "d_a_log", "d_dt_bias", "gate_part_a", "gate_part_dt"))
-        )
-        self.fold_pairs = tuple((positions[f"d{port}_ho"], pos[f"d{port.upper()}"]) for port in ("q", "k", "v") if getattr(self, f"fold_d{port}"))
-
     def run(self, views, workspace, stream) -> None:
-        """Launch backward and its postpasses on ``stream``; ``None`` means legacy stream 0."""
-        stream = stream if stream is not None else 0
-        launch = self.chain_launch if self.chain else self.uncut_launch
-        if launch is not None:
-            frame = (*views, *workspace.carve(self.carve), None)
-            launch(*self.launch_scalars, *self.launch_buffers(frame), self.stream_type(int(stream)))
-            self.finish(frame, stream)
-            return
         q = views[self.index_q]
         k = views[self.index_k]
         v = views[self.index_v]
@@ -773,6 +680,8 @@ class CompiledKdaBwd:
         dt_bias = views[self.index_dt_bias] if self.index_dt_bias is not None else None
         d_a_log = views[self.index_d_a_log] if self.index_d_a_log is not None else None
         d_dt_bias = views[self.index_d_dt_bias] if self.index_d_dt_bias is not None else None
+        stream = stream if stream is not None else 0
+
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         work_items = region["work_items"]
         work_count = region["work_count"]
@@ -864,15 +773,15 @@ class CompiledKdaBwd:
                 )
             self.run_uncut_backward(self.uncut_launch, **buffers, **schedule, stream=stream)
 
-        self.finish((*views, *region.values(), None), stream)
-        return None
-
-    def finish(self, frame, stream) -> None:
-        """Apply the original safe-gate and grouped-head gradients on this stream."""
         if self.safe_gate:
-            self.channel_gate_bwd(*self.gate_buffers(frame), self.gate_lower_bound, stream=stream)
-        for source, destination in self.fold_pairs:
-            self.head_group_reduce(frame[source], frame[destination], stream=stream)
+            self.channel_gate_bwd(
+                dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), self.gate_lower_bound, stream=stream
+            )
+        if self.fold_dq or self.fold_dk or self.fold_dv:
+            for src_ho, dst in ((dq_out, dq), (dk_out, dk), (dv_out, dv)):
+                if src_ho is not dst:
+                    self.head_group_reduce(src_ho, dst, stream=stream)
+        return None
 
     def run_chain(
         self,

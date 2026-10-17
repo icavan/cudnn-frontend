@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Same-input alternating KDA backward control after the host migration.
+"""Same-input alternating KDA backward control with shared host plumbing.
 
 The baseline directory must contain the exact exported bprop source and config
 snapshot. Both variants use the candidate host path, isolating GPU changes.

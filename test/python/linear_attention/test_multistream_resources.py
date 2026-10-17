@@ -14,65 +14,6 @@ from cudnn.linear_attention.ops import common
 pytestmark = pytest.mark.L0
 
 
-def test_ordered_execution_rebinds_current_buffers_and_preserves_map_fallback():
-    """Only immutable UID order is retained; changed order still uses the map."""
-    first, second = common.Tensor(uid=7), common.Tensor(uid=11)
-    calls = []
-
-    class Graph:
-        def execute(self, bindings, **kwargs):
-            """Record fresh operands and resource arguments without launching a kernel."""
-            calls.append((bindings, kwargs))
-
-    graph = Graph()
-    workspace, handle = object(), object()
-    common.execute_graph(graph, {first: object(), second: object()}, workspace, handle)
-    values = (object(), object())
-    common.execute_graph(graph, dict(zip((first, second), values)), workspace, handle)
-    assert calls[-1] == (values, {"workspace": workspace, "handle": handle, "tensor_uids": (7, 11)})
-    reversed_pack = {second: object(), first: object()}
-    common.execute_graph(graph, reversed_pack, workspace, handle)
-    assert calls[-1] == (reversed_pack, {"workspace": workspace, "handle": handle})
-
-
-def test_ordered_resources_preserve_backend_capture_and_rebinding():
-    """The shared host optimization also serves a native backend graph unchanged."""
-    torch, cudnn = common.torch, common.cudnn
-    graph = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    shape, strides = (1, 8, 8, 16), (1024, 1, 128, 8)
-    a = graph.tensor(list(shape), stride=list(strides), data_type=cudnn.data_type.HALF)
-    b = graph.tensor(list(shape), stride=list(strides), data_type=cudnn.data_type.HALF)
-    output = graph.add(a, b)
-    output.set_output(True).set_stride(list(strides)).set_data_type(cudnn.data_type.HALF)
-    graph.validate()
-    graph.create_execution_plans()
-    graph.build()
-    assert graph.selected_engine is None, "this control must exercise the native backend"
-    stream = torch.cuda.Stream()
-    captured = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        x = torch.full(shape, 1.0, dtype=torch.float16, device="cuda").contiguous(memory_format=torch.channels_last)
-        y, result = torch.full_like(x, 2.0), torch.empty_like(x)
-        workspace, handle = common.make_execution_resources(graph, x.device)
-        pack = {a: x, b: y, output: result}
-        common.execute_graph(graph, pack, workspace, handle)
-        common.execute_graph(graph, pack, workspace, handle)
-        try:
-            with torch.cuda.graph(captured, stream=stream):
-                common.execute_graph(graph, pack, workspace, handle)
-            x.fill_(4.0)
-            captured.replay()
-            stream.synchronize()
-            torch.testing.assert_close(result, x + y, rtol=0, atol=0)
-            fresh = torch.full_like(x, 9.0)
-            common.execute_graph(graph, {a: fresh, b: y, output: result}, workspace, handle)
-            stream.synchronize()
-            torch.testing.assert_close(result, fresh + y, rtol=0, atol=0)
-        finally:
-            stream.synchronize()
-            captured.reset()
-
-
 class _Graph:
     """Minimal built graph exposing only the workspace-size contract."""
 
@@ -105,8 +46,6 @@ def test_graph_workspace_is_caller_owned_per_execution(monkeypatch):
     monkeypatch.setattr(common.torch.cuda, "current_stream", lambda unused_device: current[0])
     monkeypatch.setattr(common.torch.cuda, "device", lambda unused_device: contextlib.nullcontext())
     monkeypatch.setattr(common.torch.cuda, "stream", lambda unused_stream: contextlib.nullcontext())
-    monkeypatch.setattr(common, "device_context", lambda unused_device: contextlib.nullcontext())
-    monkeypatch.setattr(common, "stream_context", lambda unused_stream, unused_device: contextlib.nullcontext())
 
     def allocate(size, *, dtype, device):
         """Record each workspace allocation."""
