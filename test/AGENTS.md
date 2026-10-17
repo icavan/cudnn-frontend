@@ -221,6 +221,13 @@ submodules to the original checkout even when `cudnn.__file__` names the export.
 Copy that conftest into the export and assert the served executor's source path
 and kernel hash after collection; a top-level package-path print is insufficient.
 
+For KDA backward sanitizer runs, select both schedules in
+`test_kda_backward_only_changed_input_replay` and assert the actual plan family.
+Caller checkpoints avoid forward but chain still computes M through recompute;
+keep its reports separate from an uncut-only clean result. A racecheck log that
+reaches its hazard limit cannot establish that later kernels are clean: increase
+`NV_COMPUTE_SANITIZER_MAX_RACECHECK_HAZARDS` and rerun without kernel filters.
+
 Bind tensor views in the graph's declared axis order. A BSHD allocation and
 a BHSD declaration can have identical shapes when H == S; shape equality then
 preserves the producer's strides and cannot infer the intended transpose.

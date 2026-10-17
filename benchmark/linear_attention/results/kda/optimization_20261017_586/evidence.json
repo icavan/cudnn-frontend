@@ -364,7 +364,29 @@
       "green-pinned.log": "f0bcf306191aac4c82efb6d1d8c7194453cdfee88b8f6f5aca4ebd6efdfe427a"
     }
   },
+  "formal_chain_regression": {
+    "comparator": "3218f25f6c6aee769c23dfaad5a021944f04f31c",
+    "test_sha256": "f001eef15f8563778e75987d6f0633a242a7f68b9e121529cbc784ad8a84d0eb",
+    "source_scope": "Exact formal test, no AST transformation; post-collection executor/kernel provenance guard",
+    "production_changed": false,
+    "regression_summary": "109 passed, 6 warnings in 189.63s",
+    "memcheck_summary": "16 passed; ERROR SUMMARY: 0 errors; exit 0",
+    "uncut_racecheck_summary": "8 passed; 0 hazards (0 errors, 0 warnings); exit 0",
+    "chain_racecheck_summary": "8 passed; 30 hazards (8 errors, 22 warnings); exit 99",
+    "chain_reported_kernel_family": "kda_recompute",
+    "racecheck_hazard_budget": 1000000,
+    "hazard_limit_reached": false,
+    "kernel_filters": false,
+    "recompute_fix_included": false,
+    "raw_sha256": {
+      "regressions.log": "d143e5b5b8a11a267b9ce63525a92c72b3eb5b2593eba9b72ec6a4757824e453",
+      "memcheck.log": "cedda8f85be75cdad060e9e9c6d8acd83bb02e21de215a12672882b7f488aaf6",
+      "racecheck-uncut.log": "7e7852a7756add2ed7095cc867bbc953ab20c291d7bbc2bc37d39b5342b67c6a",
+      "racecheck-chain.log": "c468a3a2fa0c84b829355cf72bded8af2b965947432c246e3bb33708a8f05105"
+    }
+  },
   "sanitizer": {
+    "scope": "Historical uncut-only caller-checkpoint runs; see formal_chain_regression for the expanded test",
     "memcheck": [
       "======================== 8 passed, 6 warnings in 31.35s ========================",
       "See https://nanobind.readthedocs.io/en/latest/refleaks.html========= ERROR SUMMARY: 0 errors"

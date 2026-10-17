@@ -257,12 +257,18 @@ def test_uncut_bwd_raw_ring_wraps_and_changed_input_replay(monkeypatch, dim, dty
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("optional", [False, True])
-def test_kda_backward_only_changed_input_replay(dim, dtype, optional):
-    """Caller checkpoints isolate backward stage reuse from forward kernels."""
+@pytest.mark.parametrize("schedule", ["uncut", "chain"])
+def test_kda_backward_only_changed_input_replay(monkeypatch, dim, dtype, optional, schedule):
+    """Exercise both backward schedules without forward checkpoint generation.
+
+    Chain still builds its M summary through recompute. Sanitizer reports from
+    that auxiliary kernel must remain visible, not counted as a clean backward.
+    """
     from cudnn.linear_attention.ops import kda as ops
 
+    monkeypatch.setattr(ops, "bprop_cache", {})
     generator = torch.Generator().manual_seed(419)
-    shape = (65, 2, dim)
+    shape = (65 if schedule == "uncut" else 513, 2, dim)
     q, k, v, do = [(torch.randn(shape, generator=generator) * 0.1).to(dtype).cuda() for _ in range(4)]
     g = torch.full(shape, -4.0, device="cuda")
     beta = torch.zeros(shape[:2], device="cuda")
@@ -274,7 +280,7 @@ def test_kda_backward_only_changed_input_replay(dim, dtype, optional):
         use_qk_l2norm_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
         safe_gate=True,
-        batch_invariant=True,
+        batch_invariant=schedule == "uncut",
         plan_name="kda_frost",
     )
     if optional:
@@ -288,6 +294,9 @@ def test_kda_backward_only_changed_input_replay(dim, dtype, optional):
         return ops.kda_bwd(do, q, k, v, g, beta, cu, dim**-0.5, **options)
 
     call()
+    assert len(ops.bprop_cache) == 1
+    host_graph, _ = next(iter(ops.bprop_cache.values()))
+    assert host_graph._compiled_plans[host_graph._plan_index].compiled.chain == (schedule == "chain")
     expected = tuple(t.clone() for t in call())
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

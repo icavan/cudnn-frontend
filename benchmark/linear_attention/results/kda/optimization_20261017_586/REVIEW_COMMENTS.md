@@ -72,3 +72,53 @@ regressions. Docstring audit: passed for changed runtime contracts and helpers.
 No GPU arithmetic, reduction tree, synchronization or compile-key change is
 introduced here; no new performance or sanitizer result is claimed. The prior
 full-E2E racecheck limitation remains unchanged. No process was forcibly stopped.
+
+## Formal chain sanitizer regression
+
+The caller-checkpoint replay test now parameterizes uncut (65 tokens) and chain
+(513 tokens), preserving D64/D128, FP16/BF16 and optional state/gate parameters:
+16 cases total. Each case isolates the graph cache and asserts the actual
+compiled schedule after the first execution. The test retains exact eager vs
+CUDA-graph comparisons before and after input mutation; it has no xfail or
+kernel filters. No production or recompute code changes accompany it.
+
+Run from `test/python` with the intended source package selected. The same test
+is used directly, without the earlier diagnostic AST transformation:
+
+```bash
+export CUDNN_TEST_TIMEOUT=0 CUDNN_TEST_NO_ISOLATION=1
+export NV_COMPUTE_SANITIZER_MAX_RACECHECK_HAZARDS=1000000
+compute-sanitizer --tool memcheck --report-api-errors no --launch-timeout 0 --target-processes application-only --error-exitcode 99 \
+  python -m pytest -s -p no:timeout linear_attention/frost/test_kda_execution.py::test_kda_backward_only_changed_input_replay
+compute-sanitizer --tool racecheck --launch-timeout 0 --target-processes application-only --error-exitcode 99 \
+  python -m pytest -s -p no:timeout linear_attention/frost/test_kda_execution.py::test_kda_backward_only_changed_input_replay -k uncut
+compute-sanitizer --tool racecheck --launch-timeout 0 --target-processes application-only --error-exitcode 99 \
+  python -m pytest -s -p no:timeout linear_attention/frost/test_kda_execution.py::test_kda_backward_only_changed_input_replay -k chain
+```
+
+Chain still builds its M summary through the upstream-identical recompute
+kernel. Its known racecheck reports are a separate issue, not a clean result
+or a reason to filter kernels from these runs. The raised hazard budget avoids
+the earlier truncated diagnostic; check that the log does not hit that limit.
+
+Fresh runs of this exact formal test (test-file SHA256
+`f001eef15f8563778e75987d6f0633a242a7f68b9e121529cbc784ad8a84d0eb`):
+
+| Run | Pytest result | Tool result / exit code |
+| --- | --- | --- |
+| Six-file regression suite | 109 passed | 0 |
+| Both schedules, memcheck | 16 passed | 0 errors / 0 |
+| Uncut, racecheck | 8 passed | 0 hazards / 0 |
+| Chain, racecheck | 8 passed | 30 hazards (8 errors, 22 warnings) / 99 |
+
+The chain report names only `kda_recompute`; no hazard-limit warning occurs.
+This is not a clean chain racecheck claim. The recompute fix remains separate
+from the performance branch. `evidence.json` records all four raw-log hashes;
+logs are retained under `formal-chain/` in the validation artifacts. Runtime
+source provenance was checked after collection, with unchanged executor and
+kernel hashes. No kernel filters or test AST transformations were used.
+
+Compatibility audit: passed for the test-only extension's cold/warm execution,
+both schedules, dtypes, dimensions, optional inputs and changed-input replay.
+Docstring audit: passed; the test explicitly describes the auxiliary recompute
+scope. Changed-file pre-commit, whitespace and ten source-only checks passed.
