@@ -18,9 +18,9 @@
 """Stable interval-decay operands for KDA's 16-token tiles.
 
 The fast specialization preserves the original MMA operands and atomically
-flags unsafe channels. Its exact twin, on the same stream, replaces them with
-bounded prefix/suffix factors and repairs the triangular products. Interval
-logs are summed directly, never recovered by subtracting large FP32 prefixes.
+flags unsafe channels. Its exact twin repairs only those channels with bounded
+prefix/suffix factors. Safe-gate replay sums token logs directly; non-safe
+replay follows FLA and forms intervals as ``prefix[i] - prefix[j]``.
 
 KDA's beta is scalar and multiplies the triangular KK matrix after correction.
 The saved backward dM matrix already includes that row beta. Consequently the
@@ -56,8 +56,9 @@ def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
 def scan_gate_prefixes(cfg: cutlass.Constexpr, gate_raw, chunk_start, batch_seqlen, cg0_a_log_exp, cg0_dt_bias_value):
     """Condition a channel's gates and scan in the original pairwise order.
 
-    Exact kernels retain token logs in gate_raw. The caller owns the exchange
-    stores, scan ballots and publication barriers.
+    Safe exact kernels retain token logs in ``gate_raw``. Non-safe exact kernels
+    keep cumulative prefixes. The caller owns exchange stores, scan ballots and
+    publication barriers.
     """
     g_prefix_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
     if cutlass.const_expr(cfg.safe_gate):
@@ -334,9 +335,11 @@ def encode_gate_exchange(
     """Classify a channel and encode its exchange registers and scan metadata.
 
     ``values`` holds log prefixes when ``exponentiate`` is true, otherwise their
-    exponentials. Exact steep channels retain token logs except in the last row,
-    which always holds the state-decay exponential. Callers own exchange stores,
-    stage selection and publication barriers; this helper never synchronizes.
+    exponentials. Safe-gate replay retains token logs; non-safe replay retains
+    cumulative prefixes, so every direct decay is one prefix subtraction and
+    one ``exp2``. The last exchange row always holds the state-decay
+    exponential. Callers own exchange stores, stage selection and publication
+    barriers; this helper never synchronizes.
     """
     channel_steep, word = classify_steep_channel(cfg, prefix, raw_k_ptr, channel, channel_rows, flag_slot, lane_idx)
     if cutlass.const_expr(has_exact_path(cfg)):
@@ -344,16 +347,22 @@ def encode_gate_exchange(
             (words_ptr + scan_warp).store(word)
         if word != 0:
             if channel_steep:
-                # DK=64 duplicates scan lanes to transpose two row halves.
-                # The last-token log has one cell per channel, not per half.
+                # DK=64 duplicates scan lanes to transpose two row halves. The
+                # final log/prefix has one cell per channel, not per half.
                 if channel_active and lane_idx < cutlass.Int32(channel_rows):
-                    (log_last_ptr + channel).store(token_logs[cfg.b_t - 1])
+                    last = values[cfg.b_t - 1]
+                    if cutlass.const_expr(cfg.safe_gate):
+                        last = token_logs[cfg.b_t - 1]
+                    (log_last_ptr + channel).store(last)
     for row in cutlass.range_constexpr(cfg.b_t):
-        if cutlass.const_expr(exponentiate):
-            values[row] = cute.math.exp2(values[row], fastmath=True)
         if cutlass.const_expr(has_exact_path(cfg) and row < cfg.b_t - 1):
             if channel_steep:
-                values[row] = token_logs[row]
+                if cutlass.const_expr(cfg.safe_gate):
+                    values[row] = token_logs[row]
+            elif cutlass.const_expr(exponentiate):
+                values[row] = cute.math.exp2(values[row], fastmath=True)
+        elif cutlass.const_expr(exponentiate):
+            values[row] = cute.math.exp2(values[row], fastmath=True)
     return word
 
 
@@ -396,6 +405,15 @@ def steep_token_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, cha
 
 
 @cute.jit
+def direct_prefix(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, channel):
+    """Read a non-safe channel's cumulative log2 prefix for one token."""
+    value = (log_last_ptr + channel).load()
+    if row < cfg.b_t - 1:
+        value = (exchange_ptr + exchange_offset(cfg, row, channel)).load()
+    return value
+
+
+@cute.jit
 def steep_interval_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, start, end, channel):
     """Sum [start, end) directly: prefix subtraction loses mild gates after large spikes."""
     total = cutlass.Float32(0.0)
@@ -407,13 +425,21 @@ def steep_interval_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, start
 @cute.jit
 def steep_decay_scale(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, channel):
     """A steep channel's K decay / Q decay scale on ``row``, ``exp2(g[row])``, at most 1 (may underflow to zero)."""
-    return cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, 0, row + 1, channel), fastmath=True)
+    if cutlass.const_expr(not cfg.safe_gate):
+        log_scale = direct_prefix(cfg, exchange_ptr, log_last_ptr, row, channel)
+    else:
+        log_scale = steep_interval_log(cfg, exchange_ptr, log_last_ptr, 0, row + 1, channel)
+    return cute.math.exp2(log_scale, fastmath=True)
 
 
 @cute.jit
 def steep_restore_scale(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, channel):
     """A steep channel's K inv / K restore scale on ``row``, ``exp2(g[BT - 1] - g[row])``, at most 1."""
-    return cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, row + 1, cfg.b_t, channel), fastmath=True)
+    if cutlass.const_expr(not cfg.safe_gate):
+        log_scale = (log_last_ptr + channel).load() - direct_prefix(cfg, exchange_ptr, log_last_ptr, row, channel)
+    else:
+        log_scale = steep_interval_log(cfg, exchange_ptr, log_last_ptr, row + 1, cfg.b_t, channel)
+    return cute.math.exp2(log_scale, fastmath=True)
 
 
 @cute.jit
@@ -501,12 +527,19 @@ def steep_row_corrections(
                 z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
                 z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
             interval = cutlass.Float32(0.0)
-            # Grow an interval backward from its destination. Never subtract prefixes.
+            destination_prefix = cutlass.Float32(0.0)
+            if cutlass.const_expr(not cfg.safe_gate):
+                destination_prefix = direct_prefix(cfg, exchange_ptr, log_last_ptr, row, channel)
+            # Safe replay grows an interval backward without subtracting
+            # prefixes. Non-safe follows FLA and subtracts cumulative prefixes.
             for step in cutlass.range_constexpr(cfg.b_t):
                 source_row = cfg.b_t - 1 - step
                 if source_row <= row:
                     if source_row < row:
-                        interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, channel)
+                        if cutlass.const_expr(cfg.safe_gate):
+                            interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, channel)
+                        else:
+                            interval = destination_prefix - direct_prefix(cfg, exchange_ptr, log_last_ptr, source_row, channel)
                     k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     if cutlass.const_expr(k_norm_ptr is not None):
                         k_s = k_s * (k_norm_ptr + source_row).load()
@@ -575,7 +608,11 @@ def steep_grad_corrections(cfg: cutlass.Constexpr, channel, t, scale, exchange_p
                 k_s = k_s * (k_norm_ptr + s).load()
             if s < t:
                 k_inv_s = (k_s * steep_restore_scale(cfg, exchange_ptr, log_last_ptr, s, channel)).to(cfg.io_dtype).to(cutlass.Float32)
-                decay = cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, s + 1, t + 1, channel), fastmath=True)
+                if cutlass.const_expr(not cfg.safe_gate):
+                    log_decay = direct_prefix(cfg, exchange_ptr, log_last_ptr, t, channel) - direct_prefix(cfg, exchange_ptr, log_last_ptr, s, channel)
+                else:
+                    log_decay = steep_interval_log(cfg, exchange_ptr, log_last_ptr, s + 1, t + 1, channel)
+                decay = cute.math.exp2(log_decay, fastmath=True)
                 da = (dadm_ptr + t * cfg.b_t + s).load().to(cutlass.Float32)
                 dm = (dadm_ptr + tile + t * cfg.b_t + s).load().to(cutlass.Float32)
                 dq_attn = dq_attn + da * (k_s * decay)
@@ -586,7 +623,11 @@ def steep_grad_corrections(cfg: cutlass.Constexpr, channel, t, scale, exchange_p
                 q_s = (raw_q_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
                 if cutlass.const_expr(cfg.l2norm):
                     q_s = q_s * (q_norm_ptr + s).load()
-                decay = cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, t + 1, s + 1, channel), fastmath=True)
+                if cutlass.const_expr(not cfg.safe_gate):
+                    log_decay = direct_prefix(cfg, exchange_ptr, log_last_ptr, s, channel) - direct_prefix(cfg, exchange_ptr, log_last_ptr, t, channel)
+                else:
+                    log_decay = steep_interval_log(cfg, exchange_ptr, log_last_ptr, t + 1, s + 1, channel)
+                decay = cute.math.exp2(log_decay, fastmath=True)
                 da = (dadm_ptr + s * cfg.b_t + t).load().to(cutlass.Float32)
                 dm = (dadm_ptr + tile + s * cfg.b_t + t).load().to(cutlass.Float32)
                 dk_inv = dk_inv + ((q_s * scale) * da - (k_s) * dm) * decay
