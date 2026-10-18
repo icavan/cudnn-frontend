@@ -203,7 +203,10 @@ class CompiledKda:
             )
         )
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
-        self.prep = (self.dv_split or not self.safe_gate) and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
+        # Non-safe QK/KK is formed directly per chunk, so always stage it in
+        # the chunk-parallel prep grid instead of serializing that CUDA-core
+        # work inside a long per-head recurrence.
+        self.prep = not self.safe_gate or (self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm))
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         self.length_rule = self.chain and self.batch_invariant
 
@@ -523,12 +526,7 @@ class CompiledKdaBwd:
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
-        # Direct non-safe backward has enough per-piece parallelism to recover
-        # otherwise idle SMs, but short pieces only add summary/transition work
-        # once the natural (batch, head) grid already fills the device.
-        self.length_rule_piece_tokens = (
-            NONSAFE_BWD_PIECE_TOKENS if not self.safe_gate and B * HO < self.num_sm else LENGTH_RULE_PIECE_TOKENS
-        )
+        self.length_rule_piece_tokens = NONSAFE_BWD_PIECE_TOKENS if not self.safe_gate else LENGTH_RULE_PIECE_TOKENS
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
