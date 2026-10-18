@@ -186,6 +186,11 @@ class CompiledKda:
             batch_invariant=self.batch_invariant,
             expand_num=1,
         )
+        # The non-safe gate needs direct intra-chunk QK/KK products.  Keep the
+        # recurrent pass uncut and let the prep kernel compute those products
+        # over the independent (chunk, head) records in parallel.
+        if not self.safe_gate:
+            self.pieces = 0
         self.chain = self.pieces > 0
         self.dv_split = (
             not self.chain
