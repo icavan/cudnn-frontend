@@ -198,6 +198,7 @@ class KdaBpropBars(NamedTuple):
     mb_k_decay_inv_ready: MBarrier
     mb_q_decay_ready: MBarrier
     mb_decay_done: MBarrier
+    mb_decay_cg2_done: MBarrier
     mb_decay_scale_ready: MBarrier
     mb_t_inv_ready: MBarrier
     mb_t_inv_done: MBarrier
@@ -280,8 +281,11 @@ def make_bars(cfg) -> KdaBpropBars:
             alloc(cfg.smem_decay_stages),
             try_wait=True,
             stages=cfg.smem_decay_stages,
-            init_count=MMA + (CG2 if not cfg.safe_gate else 0),
+            init_count=MMA,
             producer=Producer.MMA_COMMIT,
+        ),
+        mb_decay_cg2_done=MBarrier(
+            alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG2, producer=Producer.THREAD
         ),
         mb_decay_scale_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
         mb_t_inv_ready=MBarrier(
@@ -1903,6 +1907,8 @@ def compute0_warp_group(
             # ---- decay-slot guard ----------------------------------------------------
             operand_done_phase = ((chunk_serial // cfg.smem_decay_stages) + 1) % 2
             bars.mb_decay_done[decay_stage].wait(operand_done_phase)
+            if cutlass.const_expr(not cfg.safe_gate):
+                bars.mb_decay_cg2_done[decay_stage].wait(operand_done_phase)
 
             # ---- decay scale: exp2(g last) per key channel ---------------------------
             if channel_active:
@@ -3094,9 +3100,9 @@ def compute2_warp_group(
                 bars.mb_raw_done[raw_stage].arrive()
             if cutlass.const_expr(not cfg.safe_gate):
                 # The direct backward correction reuses the rounded K-inverse
-                # operand. Join its generic readers with the MMA consumer before
-                # CG0 is allowed to overwrite this decay stage.
-                bars.mb_decay_done[decay_stage].arrive()
+                # operand. Keep its generic-reader lifetime separate from the
+                # asynchronous MMA consumer tracked by mb_decay_done.
+                bars.mb_decay_cg2_done[decay_stage].arrive()
             bars.mb_da_diag_done[da_diag_stage].arrive()
 
             # ---- dGate finalize ------------------------------------------------------
@@ -3979,6 +3985,7 @@ def frost_kda_bprop(
                 bars.mb_k_decay_inv_ready[stage].init()
                 bars.mb_q_decay_ready[stage].init()
                 bars.mb_decay_done[stage].init()
+                bars.mb_decay_cg2_done[stage].init()
                 bars.mb_decay_scale_ready[stage].init()
             for stage in cutlass.range_constexpr(cfg.tmem_qk_raw_stages):
                 bars.mb_qk_raw_ready[stage].init()
