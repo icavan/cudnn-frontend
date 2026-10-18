@@ -72,6 +72,7 @@ from ..common.kda_decay import (
     encode_gate_exchange,
     lane_steep_bits,
     steep_launch_cfg,
+    steep_tile_all,
     steep_tile_mask,
     steep_exit_unless_flagged,
     steep_row_corrections,
@@ -384,6 +385,7 @@ def compute_warp_group(
                 tma_store_wait(RECS - 1)
         nvvm.barrier_cta_sync(barrier_id, thread_count=cfg.threads_per_cta)
         steep_any = steep_tile_mask(cfg, steep_scan_ptr)
+        steep_all = steep_tile_all(cfg, steep_scan_ptr)
         steep_bits = cutlass.Int32(0)
         if steep_any != 0:
             steep_bits = lane_steep_bits(cfg, steep_scan_ptr, lane_in_row_group, channel_rows)
@@ -647,21 +649,22 @@ def compute_warp_group(
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr((cfg.d_k // 16)):
-                k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
-                k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
-                mma_step(
-                    kk_acc,
-                    (k_decay_frag[0], k_decay_frag[1], k_decay_frag[2], k_decay_frag[3]),
-                    (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
+            if not steep_all:
+                for i in cutlass.range_constexpr((cfg.d_k // 16)):
+                    k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
+                    k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
+                    mma_step(
+                        kk_acc,
+                        (k_decay_frag[0], k_decay_frag[1], k_decay_frag[2], k_decay_frag[3]),
+                        (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
+                        k_step=0,
+                        M=16,
+                        N=16,
+                        ab_dtype=cfg.io_dtype,
+                    )
 
             if steep_any != 0:
-                add_steep_corrections(cfg, kk_acc, sSteepCorr.data_ptr(), lane_idx)
+                add_steep_corrections(cfg, kk_acc, sSteepCorr.data_ptr(), lane_idx, steep_all)
 
             # ---- L = Beta * tril(KK, -1) ---------------------------------------------
             beta_lo = (sBetaG_ptr + row_lo).load()
@@ -704,21 +707,22 @@ def compute_warp_group(
         for accum_idx in cutlass.range_constexpr(8):
             a_acc[accum_idx] = cutlass.Float32(0.0)
         if warp_local == 2:
-            for i in cutlass.range_constexpr((cfg.d_k // 16)):
-                k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
-                q_decay_frag = nvvm.ldmatrix(sQ_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
-                mma_step(
-                    a_acc,
-                    (q_decay_frag[0], q_decay_frag[1], q_decay_frag[2], q_decay_frag[3]),
-                    (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
-                    k_step=0,
-                    M=16,
-                    N=16,
-                    ab_dtype=cfg.io_dtype,
-                )
+            if not steep_all:
+                for i in cutlass.range_constexpr((cfg.d_k // 16)):
+                    k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
+                    q_decay_frag = nvvm.ldmatrix(sQ_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
+                    mma_step(
+                        a_acc,
+                        (q_decay_frag[0], q_decay_frag[1], q_decay_frag[2], q_decay_frag[3]),
+                        (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
+                        k_step=0,
+                        M=16,
+                        N=16,
+                        ab_dtype=cfg.io_dtype,
+                    )
             # ---- steep key channels: exact A entries -----------------------------------------
             if steep_any != 0:
-                add_steep_corrections(cfg, a_acc, sSteepCorr.data_ptr() + cfg.b_t * cfg.b_t, lane_idx)
+                add_steep_corrections(cfg, a_acc, sSteepCorr.data_ptr() + cfg.b_t * cfg.b_t, lane_idx, steep_all)
             for accum_idx in cutlass.range_constexpr(8):
                 row_coord = row_lo
                 if cutlass.const_expr(accum_idx % 4 >= 2):
