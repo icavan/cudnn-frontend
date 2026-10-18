@@ -102,7 +102,6 @@ from ..common.kda_decay import (
     flag_inverse_max,
     steep_ticket,
     pack_dstate_operand,
-    steep_tile_all,
     steep_tile_mask,
 )
 from ..common.thd import TENSOR_MAP_QWORDS, emit_seq_descs
@@ -305,50 +304,36 @@ def epilogue_warp(
             bars.mb_q_decay_ready[decay_stage].wait((chunk_serial // cfg.smem_decay_stages) % 2)
             steep_tile_ptr = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
             steep_any = steep_tile_mask(cfg, steep_tile_ptr)
-            steep_all = steep_tile_all(cfg, steep_tile_ptr)
             a_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 a_acc[accum_idx] = cutlass.Float32(0.0)
-            if not steep_all:
-                for i in cutlass.range_constexpr(cfg.d_k // 16):
-                    a_col = i * 16 + a_col_offset
-                    a_seg = a_col // 64
-                    q_decay_frag = nvvm.ldmatrix(
-                        sQ_decay_ptr
-                        + a_seg * (cfg.b_t * 64)
-                        + a_row_coord * 64
-                        + swizzle_xor_128b(a_row_coord, a_col - a_seg * 64, elem_bytes=2),
-                        4,
-                        nvvm.MMALayout.ROW,
-                    )
-                    b_col = i * 16 + b_col_offset
-                    b_seg = b_col // 64
-                    k_inv_frag = nvvm.ldmatrix(
-                        sK_inv_ptr
-                        + b_seg * (cfg.b_t * 64)
-                        + b_row_coord * 64
-                        + swizzle_xor_128b(b_row_coord, b_col - b_seg * 64, elem_bytes=2),
-                        4,
-                        nvvm.MMALayout.ROW,
-                    )
-                    mma_step(
-                        a_acc,
-                        (q_decay_frag[0], q_decay_frag[1], q_decay_frag[2], q_decay_frag[3]),
-                        (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
-                        k_step=0,
-                        M=16,
-                        N=16,
-                        ab_dtype=cfg.io_dtype,
-                    )
+            for i in cutlass.range_constexpr(cfg.d_k // 16):
+                a_col = i * 16 + a_col_offset
+                a_seg = a_col // 64
+                q_decay_frag = nvvm.ldmatrix(
+                    sQ_decay_ptr + a_seg * (cfg.b_t * 64) + a_row_coord * 64 + swizzle_xor_128b(a_row_coord, a_col - a_seg * 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.ROW,
+                )
+                b_col = i * 16 + b_col_offset
+                b_seg = b_col // 64
+                k_inv_frag = nvvm.ldmatrix(
+                    sK_inv_ptr + b_seg * (cfg.b_t * 64) + b_row_coord * 64 + swizzle_xor_128b(b_row_coord, b_col - b_seg * 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.ROW,
+                )
+                mma_step(
+                    a_acc,
+                    (q_decay_frag[0], q_decay_frag[1], q_decay_frag[2], q_decay_frag[3]),
+                    (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
+                    k_step=0,
+                    M=16,
+                    N=16,
+                    ab_dtype=cfg.io_dtype,
+                )
             # ---- steep key channels: exact A entries (common/kda_decay.py) -------
             if steep_any != 0:
-                add_steep_corrections(
-                    cfg,
-                    a_acc,
-                    sSteepCorr_ptr + decay_stage * (2 * cfg.b_t * cfg.b_t) + cfg.b_t * cfg.b_t,
-                    lane_idx,
-                    steep_all,
-                )
+                add_steep_corrections(cfg, a_acc, sSteepCorr_ptr + decay_stage * (2 * cfg.b_t * cfg.b_t) + cfg.b_t * cfg.b_t, lane_idx)
             for accum_idx in cutlass.range_constexpr(8):
                 a_acc[accum_idx] = a_acc[accum_idx] if (tril_incl_mask >> accum_idx) & 1 else cutlass.Float32(0.0)
             nvvm.stmatrix(
@@ -439,46 +424,38 @@ def register_mma_warp(
             bars.mb_k_decay_inv_ready[decay_stage].wait((chunk_serial // cfg.smem_decay_stages) % 2)
             steep_tile_ptr = sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids)
             steep_any = steep_tile_mask(cfg, steep_tile_ptr)
-            steep_all = steep_tile_all(cfg, steep_tile_ptr)
             kk_a_row = a_row_coord
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
-            if not steep_all:
-                for i in cutlass.range_constexpr(cfg.d_k // 16):
-                    a_col = i * 16 + a_col_offset
-                    a_seg = a_col // 64
-                    k_decay_frag = nvvm.ldmatrix(
-                        sK_decay_ptr
-                        + a_seg * (cfg.b_t * 64)
-                        + kk_a_row * 64
-                        + swizzle_xor_128b(kk_a_row, a_col - a_seg * 64, elem_bytes=2),
-                        4,
-                        nvvm.MMALayout.ROW,
-                    )
-                    b_col = i * 16 + b_col_offset
-                    b_seg = b_col // 64
-                    k_inv_frag = nvvm.ldmatrix(
-                        sK_inv_ptr
-                        + b_seg * (cfg.b_t * 64)
-                        + b_row_coord * 64
-                        + swizzle_xor_128b(b_row_coord, b_col - b_seg * 64, elem_bytes=2),
-                        4,
-                        nvvm.MMALayout.ROW,
-                    )
+            for i in cutlass.range_constexpr(cfg.d_k // 16):
+                a_col = i * 16 + a_col_offset
+                a_seg = a_col // 64
+                k_decay_frag = nvvm.ldmatrix(
+                    sK_decay_ptr + a_seg * (cfg.b_t * 64) + kk_a_row * 64 + swizzle_xor_128b(kk_a_row, a_col - a_seg * 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.ROW,
+                )
+                b_col = i * 16 + b_col_offset
+                b_seg = b_col // 64
+                k_inv_frag = nvvm.ldmatrix(
+                    sK_inv_ptr + b_seg * (cfg.b_t * 64) + b_row_coord * 64 + swizzle_xor_128b(b_row_coord, b_col - b_seg * 64, elem_bytes=2),
+                    4,
+                    nvvm.MMALayout.ROW,
+                )
 
-                    mma_step(
-                        kk_acc,
-                        (k_decay_frag[0], k_decay_frag[1], k_decay_frag[2], k_decay_frag[3]),
-                        (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
-                        k_step=0,
-                        M=16,
-                        N=16,
-                        ab_dtype=cfg.io_dtype,
-                    )
+                mma_step(
+                    kk_acc,
+                    (k_decay_frag[0], k_decay_frag[1], k_decay_frag[2], k_decay_frag[3]),
+                    (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
+                    k_step=0,
+                    M=16,
+                    N=16,
+                    ab_dtype=cfg.io_dtype,
+                )
 
             if steep_any != 0:
-                add_steep_corrections(cfg, kk_acc, sSteepCorr_ptr + decay_stage * (2 * cfg.b_t * cfg.b_t), lane_idx, steep_all)
+                add_steep_corrections(cfg, kk_acc, sSteepCorr_ptr + decay_stage * (2 * cfg.b_t * cfg.b_t), lane_idx)
 
             # ---- L = Beta * tril(KK, -1) ---------------------------------------------
             bars.mb_beta_ready[chunk_serial % cfg.smem_beta_stages].wait((chunk_serial // cfg.smem_beta_stages) % 2)

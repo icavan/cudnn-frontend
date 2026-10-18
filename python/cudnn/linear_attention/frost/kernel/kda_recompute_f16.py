@@ -100,7 +100,6 @@ from ..common.kda_decay import (
     steep_exit_unless_flagged,
     steep_row_corrections,
     steep_ticket,
-    steep_tile_all,
     steep_tile_mask,
 )
 from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_descs
@@ -420,28 +419,26 @@ def register_mma_warp(
             # ---- KK = K decay @ K inv^T ----------------------------------------------
             steep_tile_ptr = sSteepTile.data_ptr() + decay_stage * cfg.cg0_warps_per_group
             steep_tile = steep_tile_mask(cfg, steep_tile_ptr)
-            steep_all = steep_tile_all(cfg, steep_tile_ptr)
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
 
-            if not steep_all:
-                for i in cutlass.range_constexpr((cfg.d_k // 16)):
-                    k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
-                    k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + k_decay_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
+            for i in cutlass.range_constexpr((cfg.d_k // 16)):
+                k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
+                k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + k_decay_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
 
-                    mma_step(
-                        kk_acc,
-                        (k_decay_frag[0], k_decay_frag[1], k_decay_frag[2], k_decay_frag[3]),
-                        (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
-                        k_step=0,
-                        M=16,
-                        N=16,
-                        ab_dtype=cfg.io_dtype,
-                    )
+                mma_step(
+                    kk_acc,
+                    (k_decay_frag[0], k_decay_frag[1], k_decay_frag[2], k_decay_frag[3]),
+                    (k_inv_frag[0], k_inv_frag[1], k_inv_frag[2], k_inv_frag[3]),
+                    k_step=0,
+                    M=16,
+                    N=16,
+                    ab_dtype=cfg.io_dtype,
+                )
 
             if steep_tile != 0:
-                add_steep_corrections(cfg, kk_acc, sSteepCorr.data_ptr() + decay_stage * (2 * cfg.b_t * cfg.b_t), lane_idx, steep_all)
+                add_steep_corrections(cfg, kk_acc, sSteepCorr.data_ptr() + decay_stage * (2 * cfg.b_t * cfg.b_t), lane_idx)
 
             # ---- L = Beta * tril(KK, -1) ---------------------------------------------
             bars.mb_beta_ready[raw_stage].wait(raw_parity)

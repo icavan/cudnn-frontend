@@ -376,19 +376,6 @@ def steep_tile_mask(cfg: cutlass.Constexpr, words_ptr):
 
 
 @cute.jit
-def steep_tile_all(cfg: cutlass.Constexpr, words_ptr):
-    """Whether every active key channel in an exact non-safe tile needs replay."""
-    result = cutlass.Boolean(False)
-    if cutlass.const_expr(has_exact_path(cfg) and not cfg.safe_gate):
-        channel_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_0_warp_ids))
-        active_mask = cutlass.Int32(-1 if channel_rows == 32 else (1 << channel_rows) - 1)
-        result = cutlass.Boolean(True)
-        for scan_warp in cutlass.range_constexpr(len(cfg.compute_group_0_warp_ids)):
-            result = result & (((words_ptr + scan_warp).load() & active_mask) == active_mask)
-    return result
-
-
-@cute.jit
 def lane_steep_bits(cfg: cutlass.Constexpr, words_ptr, lane_in_row_group, channel_rows: cutlass.Constexpr[int]):
     """The steep channels a row-stage lane owns: bit ``h * 8 + j`` is channel ``h * 64 + lane_in_row_group * 8 + j``.
 
@@ -577,8 +564,8 @@ def steep_row_corrections(
 
 
 @cute.jit
-def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx, replace=False):
-    """Merge a ``[BT, BT]`` direct/correction tile into an MMA accumulator fragment."""
+def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
+    """Add a ``[BT, BT]`` fp32 correction tile to an m16n16 register-MMA accumulator fragment (8 values per lane)."""
     for accum_idx in cutlass.range_constexpr(8):
         row = lane_idx // 4
         if cutlass.const_expr(accum_idx % 4 >= 2):
@@ -586,11 +573,7 @@ def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx, repla
         col = (accum_idx // 4) * 8 + 2 * (lane_idx % 4)
         if cutlass.const_expr(accum_idx % 2 == 1):
             col = col + cutlass.Int32(1)
-        value = (corr_ptr + row * cfg.b_t + col).load()
-        if replace:
-            acc[accum_idx] = value
-        else:
-            acc[accum_idx] = acc[accum_idx] + value
+        acc[accum_idx] = acc[accum_idx] + (corr_ptr + row * cfg.b_t + col).load()
     # Callers release this stage through an elected lane. Join every reader
     # before that lane can let the producer overwrite the correction tile.
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
