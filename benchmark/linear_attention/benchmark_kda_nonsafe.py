@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=40)
     parser.add_argument("--dangerous", action="store_true")
     parser.add_argument("--batch-invariant", action="store_true")
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
 
     torch.manual_seed(1644)
@@ -81,6 +82,10 @@ def main():
         f"bwd_median_us={statistics.median(backward_us):.2f} finite={finite}",
         flush=True,
     )
+    if args.profile:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as prof:
+            backward()
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30), flush=True)
 
 
 if __name__ == "__main__":
