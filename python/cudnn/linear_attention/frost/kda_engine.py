@@ -202,7 +202,7 @@ class CompiledKda:
             )
         )
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
-        self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
+        self.prep = (self.dv_split or not self.safe_gate) and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         self.length_rule = self.chain and self.batch_invariant
 
