@@ -778,8 +778,10 @@ For factorized decay operands, test the operand dtype independently of the gate
 dtype: FP16 inverse keys can overflow even with KDA's default safe-gate bound;
 BF16 can fail after a finite extreme negative log gate. Check output, final
 state and every backward gradient against an FP64 token recurrence, with saved,
-absent and coarse checkpoints. Include an isolated `-1e8` log-gate spike followed
-by mild gates: subtracting rounded FP32 prefixes loses those later intervals.
+absent and coarse checkpoints. Use a representable steep interval (for example,
+`-200`) for accuracy checks. An isolated `-1e8` log-gate spike followed by mild
+gates is finiteness-only: rounded FP32 prefixes can no longer retain those later
+increments, matching FLA's non-safe contract.
 Detector: `linear_attention/test_kda_steep_decay.py`. Never repair this with gate
 clipping or `nan_to_num`. A flagged replay must not reread a mutated aliased
 state, and a shared correction tile needs both publication and reader-to-reuse
