@@ -186,13 +186,13 @@ def test_kda_steep_decay_schedules(pattern, route, monkeypatch):
 
 
 @pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
-def test_kda_steep_decay_replay(pattern):
-    """No initial state selects the flagged replay; also exercise 16-bit gates."""
+def test_kda_steep_decay_precision_paths(pattern):
+    """Exercise safe-gate replay and static non-safe direct decay with 16-bit gates."""
     _check_forward_backward(pattern, 64, True, 16, length=97, use_initial=False, gate_io_dtype=True)
 
 
-def test_kda_steep_decay_replay_flag_resets():
-    """Reusing a cached plan must reset the flag and exact scheduler together."""
+def test_kda_steep_decay_cached_plan_changes_gate_range():
+    """A cached direct plan must read current non-safe prefixes on every call."""
     for pattern in ("bf16_spike", "bf16_mild", "bf16_spike"):
         _check_forward_backward(pattern, 64, True, 16, length=97, use_initial=False, gate_io_dtype=True)
 
@@ -207,11 +207,12 @@ def test_kda_steep_decay_static_bounds():
     assert default_steep_mode(cutlass.BFloat16, False, True, -5 * 1.4426950408889634, 16) == STEEP_FAST
     assert default_steep_mode(cutlass.Float16, True, True, -5 * 1.4426950408889634, 16) == STEEP_FAST
     assert default_steep_mode(cutlass.Float16, True, True, -5 * 1.4426950408889634, 16, state_alias=True) == STEEP_INLINE
+    assert default_steep_mode(cutlass.BFloat16, True, False, 0.0, 16) == STEEP_INLINE
 
 
 @pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_mild"])
 def test_kda_steep_decay_large_unnormalized_keys(pattern):
-    """Actual inverse overflow must replay even above the prefix-only threshold."""
+    """Large keys must remain finite on the safe replay and non-safe direct paths."""
     actual, _, _ = _case(pattern, 64, 16)
     q, k, v, g, beta, state, a, bias = actual
     fp16 = q.dtype == torch.float16
@@ -403,8 +404,8 @@ def test_kda_state_overlap_native_bounds():
 
 
 @pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
-def test_kda_steep_decay_cuda_graph_flag_reset(pattern):
-    """Captured forward/backward must reevaluate and reset the device replay flag."""
+def test_kda_steep_decay_cuda_graph_changed_gate(pattern):
+    """Captured forward/backward must read changed gates on both precision paths."""
     module = importlib.import_module("cudnn.linear_attention.ops.kda")
     actual, _, kw = _case(pattern, 64, 97)
     q, k, v, g, beta, _, a, bias = (t.detach() for t in actual)
