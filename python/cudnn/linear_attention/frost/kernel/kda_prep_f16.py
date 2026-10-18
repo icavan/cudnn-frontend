@@ -175,7 +175,8 @@ def _direct_qk_rows(cfg, row, lane_in_row_group, q_norm, k_norm, prefix_ptr, raw
     for source in cutlass.range_constexpr(cfg.b_t):
         kk_value = kk[source]
         qk_value = qk[source]
-        for distance in (4, 2, 1):
+        for step in cutlass.range_constexpr(3):
+            distance = 4 >> step
             kk_value = kk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kk_value, distance, 31, kind=nvvm.Shfl.BFLY))
             qk_value = qk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qk_value, distance, 31, kind=nvvm.Shfl.BFLY))
         if lane_in_row_group == 0:
