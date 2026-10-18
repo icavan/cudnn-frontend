@@ -72,7 +72,7 @@ def scan_gate_prefixes(cfg: cutlass.Constexpr, gate_raw, chunk_start, batch_seql
         for row in cutlass.range_constexpr(cfg.b_t):
             g_prefix_regs[row] = cutlass.Float32(0.0) if chunk_start + cutlass.Int32(row) >= batch_seqlen else g_prefix_regs[row]
 
-    if cutlass.const_expr(has_exact_path(cfg)):
+    if cutlass.const_expr(has_exact_path(cfg) and cfg.safe_gate):
         for row in cutlass.range_constexpr(cfg.b_t):
             gate_raw[row] = g_prefix_regs[row]
 
@@ -349,15 +349,24 @@ def encode_gate_exchange(
         if word != 0:
             if channel_steep:
                 # DK=64 duplicates scan lanes to transpose two row halves.
-                # The last-token log has one cell per channel, not per half.
+                # The final log has one cell per channel, not per half. The
+                # non-safe direct path keeps FP32 prefixes like FLA; safe-gate
+                # fallbacks retain per-token logs for their bounded sum.
                 if channel_active and lane_idx < cutlass.Int32(channel_rows):
-                    (log_last_ptr + channel).store(token_logs[cfg.b_t - 1])
+                    last_log = token_logs[cfg.b_t - 1]
+                    if cutlass.const_expr(not cfg.safe_gate):
+                        last_log = values[cfg.b_t - 1]
+                    (log_last_ptr + channel).store(last_log)
     for row in cutlass.range_constexpr(cfg.b_t):
+        prefix_log = values[row]
         if cutlass.const_expr(exponentiate):
             values[row] = cute.math.exp2(values[row], fastmath=True)
         if cutlass.const_expr(has_exact_path(cfg) and row < cfg.b_t - 1):
             if channel_steep:
-                values[row] = token_logs[row]
+                if cutlass.const_expr(cfg.safe_gate):
+                    values[row] = token_logs[row]
+                else:
+                    values[row] = prefix_log
     return word
 
 
@@ -401,7 +410,17 @@ def steep_token_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, cha
 
 @cute.jit
 def steep_interval_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, start, end, channel):
-    """Sum [start, end) directly: prefix subtraction loses mild gates after large spikes."""
+    """Return the log2 decay over ``[start, end)``.
+
+    Non-safe KDA follows FLA's token-parallel path and subtracts the two
+    FP32 prefixes. Safe-gate range fallbacks retain the token logs and sum the
+    short 16-token interval directly.
+    """
+    if cutlass.const_expr(not cfg.safe_gate):
+        total = steep_token_log(cfg, exchange_ptr, log_last_ptr, end - 1, channel)
+        if start > 0:
+            total = total - steep_token_log(cfg, exchange_ptr, log_last_ptr, start - 1, channel)
+        return total
     total = cutlass.Float32(0.0)
     for token in cutlass.range(start, end, unroll=1):
         total = total + steep_token_log(cfg, exchange_ptr, log_last_ptr, token, channel)
@@ -500,26 +519,37 @@ def steep_row_corrections(
         if ((bits >> j) & 1) != 0:
             channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
             x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
-            x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
+            if cutlass.const_expr(cfg.safe_gate):
+                x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
             if cutlass.const_expr(with_a):
                 z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
-                z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
+                if cutlass.const_expr(cfg.safe_gate):
+                    z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
             interval = cutlass.Float32(0.0)
-            # Grow an interval backward from its destination. Never subtract prefixes.
             for step in cutlass.range_constexpr(cfg.b_t):
                 source_row = cfg.b_t - 1 - step
                 if source_row <= row:
                     if source_row < row:
-                        interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, channel)
+                        if cutlass.const_expr(cfg.safe_gate):
+                            interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, channel)
+                        else:
+                            interval = steep_interval_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, row + 1, channel)
                     k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     if cutlass.const_expr(k_norm_ptr is not None):
                         k_s = k_s * (k_norm_ptr + source_row).load()
-                    k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     k_decayed = k_s * cute.math.exp2(interval, fastmath=True)
                     if source_row < row:
-                        kk_regs[source_row] = kk_regs[source_row] + (x * k_decayed - x_decay * k_inv_s)
+                        value = x * k_decayed
+                        if cutlass.const_expr(cfg.safe_gate):
+                            k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
+                            value = value - x_decay * k_inv_s
+                        kk_regs[source_row] = kk_regs[source_row] + value
                     if cutlass.const_expr(with_a):
-                        attn_regs[source_row] = attn_regs[source_row] + (z * k_decayed - z_decay * k_inv_s)
+                        value = z * k_decayed
+                        if cutlass.const_expr(cfg.safe_gate):
+                            k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
+                            value = value - z_decay * k_inv_s
+                        attn_regs[source_row] = attn_regs[source_row] + value
     for source_row in cutlass.range_constexpr(cfg.b_t):
         kk = kk_regs[source_row]
         attn = attn_regs[source_row]
@@ -536,7 +566,7 @@ def steep_row_corrections(
 
 @cute.jit
 def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
-    """Add a ``[BT, BT]`` fp32 correction tile to an m16n16 register-MMA accumulator fragment (8 values per lane)."""
+    """Merge the direct/correction tile into an m16n16 accumulator fragment."""
     for accum_idx in cutlass.range_constexpr(8):
         row = lane_idx // 4
         if cutlass.const_expr(accum_idx % 4 >= 2):
@@ -544,7 +574,11 @@ def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
         col = (accum_idx // 4) * 8 + 2 * (lane_idx % 4)
         if cutlass.const_expr(accum_idx % 2 == 1):
             col = col + cutlass.Int32(1)
-        acc[accum_idx] = acc[accum_idx] + (corr_ptr + row * cfg.b_t + col).load()
+        value = (corr_ptr + row * cfg.b_t + col).load()
+        if cutlass.const_expr(cfg.safe_gate):
+            acc[accum_idx] = acc[accum_idx] + value
+        else:
+            acc[accum_idx] = value
     # Callers release this stage through an elected lane. Join every reader
     # before that lane can let the producer overwrite the correction tile.
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
