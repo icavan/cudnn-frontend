@@ -265,22 +265,18 @@ def steep_restore_scale(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row,
 
 
 @cute.jit
-def gradient_operand_scales(cfg: cutlass.Constexpr, channel_steep, row, channel, value, exchange_ptr, log_last_ptr):
-    """Return decay, inverse-gradient and restore scales before gradient assembly.
+def gradient_operand_scales(cfg: cutlass.Constexpr, row, channel, value, exchange_ptr, log_last_ptr):
+    """Return decay and restore scales before direct gradient assembly.
 
-    Steep channels use bounded prefix/suffix factors. Their inverse-gradient
-    contribution comes from the exact intra-tile correction, so its scale is zero.
+    Direct plans use bounded prefix/suffix factors. Their intra-tile inverse
+    contribution is computed explicitly, so no inverse operand scale is needed.
     """
     decay = value
-    inverse = cutlass.Float32(0.0)
     restore = cutlass.Float32(0.0)
     if cutlass.const_expr(uses_direct_decay(cfg)):
         decay = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
         restore = steep_restore_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
-    else:
-        inverse = cute.math.rcp(value, approx=True, ftz=True)
-        restore = inverse
-    return decay, inverse, restore
+    return decay, restore
 
 
 @cute.jit

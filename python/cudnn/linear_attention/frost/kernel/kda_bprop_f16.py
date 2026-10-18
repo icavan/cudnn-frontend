@@ -246,6 +246,7 @@ def make_bars(cfg) -> KdaBpropBars:
     CG2 = len(cfg.compute_group_2_warp_ids) * WARP
     CG1 = len(cfg.compute_group_1_warp_ids) * WARP
     MMA = 1
+    INTRA_PRODUCER = Producer.THREAD if uses_direct_decay(cfg) else Producer.MMA_COMMIT
 
     return KdaBpropBars(
         mb_raw_ready=MBarrier(alloc(cfg.smem_raw_stages), try_wait=True, stages=cfg.smem_raw_stages, init_count=1, producer=Producer.TMA_LOAD),
@@ -263,7 +264,7 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_dy_acc_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA, producer=Producer.MMA_COMMIT),
         mb_dq_acc_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA, producer=Producer.MMA_COMMIT),
         mb_dk_decay_part_acc_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA, producer=Producer.MMA_COMMIT),
-        mb_dk_inv_part_acc_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA, producer=Producer.MMA_COMMIT),
+        mb_dk_inv_part_acc_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA, producer=INTRA_PRODUCER),
         mb_dk_restore_part_acc_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=MMA, producer=Producer.MMA_COMMIT),
         mb_dqk_acc_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG2, producer=Producer.THREAD),
         mb_qk_raw_ready=MBarrier(alloc(cfg.tmem_qk_raw_stages), try_wait=True, stages=cfg.tmem_qk_raw_stages, init_count=CG0, producer=Producer.THREAD),
@@ -291,9 +292,7 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_da_ready=MBarrier(
             alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=WARP, producer=Producer.THREAD
         ),
-        mb_da_done=MBarrier(
-            alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=MMA, producer=Producer.MMA_COMMIT
-        ),
+        mb_da_done=MBarrier(alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=MMA, producer=INTRA_PRODUCER),
         mb_da_diag_ready=MBarrier(
             alloc(cfg.smem_da_diag_stages),
             try_wait=True,
@@ -305,9 +304,7 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_dm_ready=MBarrier(
             alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=WARP, producer=Producer.THREAD
         ),
-        mb_dm_done=MBarrier(
-            alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=MMA, producer=Producer.MMA_COMMIT
-        ),
+        mb_dm_done=MBarrier(alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=MMA, producer=INTRA_PRODUCER),
         mb_u_smem_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_dy_smem_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_dbeta_m_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=WARP, producer=Producer.THREAD),
@@ -2763,15 +2760,11 @@ def compute2_warp_group(
             if cutlass.const_expr(split_channels):
                 eg_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
                 if cutlass.const_expr(has_exact_path(cfg)):
-                    inv_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
                     restore_frag = cutlass.Array(cutlass.Float32, 8, alignment=16)
-                    steep_channels = cutlass.Array(cutlass.Int32, 2, alignment=8)
                 for cs in cutlass.range_constexpr(2):
                     channel_cs = channel_lo if cs == 0 else channel_hi
                     seg_cs = channel_cs // 32
                     dim_cs = channel_cs - seg_cs * 32
-                    if cutlass.const_expr(has_exact_path(cfg)):
-                        steep_channels[cs] = steep_channel_bit(steep_scan_ptr, channel_cs, steep_channel_rows)
                     for rep in cutlass.range_constexpr(2):
                         for n in cutlass.range_constexpr(2):
                             token = fragment_quad * 2 + cutlass.Int32(rep * 8 + n)
@@ -2779,9 +2772,7 @@ def compute2_warp_group(
                             value = (sGate_exchange_ptr + seg_cs * (cfg.b_t * 32) + token * 32 + swizzle_xor_128b(token ^ seg_cs, dim_cs, elem_bytes=4)).load()
                             eg_frag[k] = value
                             if cutlass.const_expr(has_exact_path(cfg)):
-                                eg_frag[k], inv_frag[k], restore_frag[k] = gradient_operand_scales(
-                                    cfg, steep_channels[cs], token, channel_cs, value, sGate_exchange_ptr, steep_last_ptr
-                                )
+                                eg_frag[k], restore_frag[k] = gradient_operand_scales(cfg, token, channel_cs, value, sGate_exchange_ptr, steep_last_ptr)
             else:
                 f32_seg = channel // 32
                 f32_dim = channel - f32_seg * 32
@@ -2789,14 +2780,12 @@ def compute2_warp_group(
                 f16_dim = channel - f16_seg * 64
                 eg = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
                 if cutlass.const_expr(has_exact_path(cfg)):
-                    inv = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
                     restore = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
-                    steep_channel = steep_channel_bit(steep_scan_ptr, channel, steep_channel_rows)
                 for t in cutlass.range_constexpr(cfg.b_t):
                     value = (sGate_exchange_ptr + f32_seg * (cfg.b_t * 32) + t * 32 + swizzle_xor_128b(t ^ f32_seg, f32_dim, elem_bytes=4)).load()
                     eg[t] = value
                     if cutlass.const_expr(has_exact_path(cfg)):
-                        eg[t], inv[t], restore[t] = gradient_operand_scales(cfg, steep_channel, t, channel, value, sGate_exchange_ptr, steep_last_ptr)
+                        eg[t], restore[t] = gradient_operand_scales(cfg, t, channel, value, sGate_exchange_ptr, steep_last_ptr)
 
             nvvm.fence_proxy("async.shared", space="cta")
             if steep_any == 0:
@@ -2879,12 +2868,10 @@ def compute2_warp_group(
                 if cutlass.const_expr(has_exact_path(cfg)):
                     if cutlass.const_expr(split_channels):
                         for cs in cutlass.range_constexpr(2):
-                            if steep_channels[cs] != 0:
-                                channel_cs = channel_lo if cs == 0 else channel_hi
-                                dgate_last_frag[cs] = dgate_last_frag[cs] * (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel_cs)).load()
+                            channel_cs = channel_lo if cs == 0 else channel_hi
+                            dgate_last_frag[cs] = dgate_last_frag[cs] * (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel_cs)).load()
                     else:
-                        if steep_channel != 0:
-                            dgate_last_val = dgate_last_val * (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel)).load()
+                        dgate_last_val = dgate_last_val * (sGate_exchange_ptr + exchange_offset(cfg, cfg.b_t - 1, channel)).load()
                 bars.mb_dstate_smem_cg2_done.arrive()
             bars.mb_state_input_cg2_done[chunk_serial % 2].arrive()
 
