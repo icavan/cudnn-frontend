@@ -132,39 +132,38 @@ def _load_direct_tile(cfg, accum, tile_ptr, lane_idx):
 @cute.jit
 def _direct_qk_rows(cfg, row, lane_in_row_group, q_norm, k_norm, prefix_ptr, raw_q_ptr, raw_k_ptr, norm_ptr, direct_ptr):
     """FLA-style non-safe QK/KK rows using bounded ``exp2(g[row] - g[source])``."""
-    kk = cutlass.Array(cutlass.Float32, cfg.b_t)
-    qk = cutlass.Array(cutlass.Float32, cfg.b_t)
+    kk_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
+    qk_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
     for source in cutlass.range_constexpr(cfg.b_t):
-        kk[source] = cutlass.Float32(0.0)
-        qk[source] = cutlass.Float32(0.0)
+        kk_regs[source] = cutlass.Float32(0.0)
+        qk_regs[source] = cutlass.Float32(0.0)
 
-    for owned in cutlass.range(cfg.d_k // 64 * 8, unroll=1):
-        channel = (owned // 8) * 64 + lane_in_row_group * 8 + (owned % 8)
-        row_prefix = (prefix_ptr + _gate_offset(cfg, row, channel)).load()
+    for j in cutlass.range(cfg.d_k // 64 * 8, unroll=1):
+        channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
+        destination_prefix = (prefix_ptr + _gate_offset(cfg, row, channel)).load()
         k_row = (raw_k_ptr + _raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
         q_row = (raw_q_ptr + _raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_norm
-        for source in cutlass.range_constexpr(cfg.b_t):
+        for step in cutlass.range_constexpr(cfg.b_t):
+            source = cfg.b_t - 1 - step
             if source <= row:
                 source_norm = cutlass.Float32(1.0)
                 if cutlass.const_expr(cfg.l2norm):
                     source_norm = (norm_ptr + source).load()
                 k_source = (raw_k_ptr + _raw_offset(cfg, source, channel)).load().to(cutlass.Float32) * source_norm
                 source_prefix = (prefix_ptr + _gate_offset(cfg, source, channel)).load()
-                decayed_key = k_source * cute.math.exp2(row_prefix - source_prefix, fastmath=True)
-                qk[source] = qk[source] + q_row * decayed_key
+                decayed_key = k_source * cute.math.exp2(destination_prefix - source_prefix, fastmath=True)
+                qk_regs[source] = qk_regs[source] + q_row * decayed_key
                 if source < row:
-                    kk[source] = kk[source] + k_row * decayed_key
+                    kk_regs[source] = kk_regs[source] + k_row * decayed_key
 
     tile = cutlass.const_expr(cfg.b_t * cfg.b_t)
     for source in cutlass.range_constexpr(cfg.b_t):
-        kk_value = kk[source]
-        qk_value = qk[source]
-        kk_value = kk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kk_value, 4, 31, kind=nvvm.Shfl.BFLY))
-        kk_value = kk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kk_value, 2, 31, kind=nvvm.Shfl.BFLY))
-        kk_value = kk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kk_value, 1, 31, kind=nvvm.Shfl.BFLY))
-        qk_value = qk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qk_value, 4, 31, kind=nvvm.Shfl.BFLY))
-        qk_value = qk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qk_value, 2, 31, kind=nvvm.Shfl.BFLY))
-        qk_value = qk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qk_value, 1, 31, kind=nvvm.Shfl.BFLY))
+        kk_value = kk_regs[source]
+        qk_value = qk_regs[source]
+        for shuffle_step in cutlass.range_constexpr(3):
+            distance = 4 >> shuffle_step
+            kk_value = kk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kk_value, distance, 31, kind=nvvm.Shfl.BFLY))
+            qk_value = qk_value + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, qk_value, distance, 31, kind=nvvm.Shfl.BFLY))
         if lane_in_row_group == 0:
             (direct_ptr + row * cfg.b_t + source).store(kk_value)
             (direct_ptr + tile + row * cfg.b_t + source).store(qk_value)
