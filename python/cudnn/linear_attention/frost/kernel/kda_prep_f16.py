@@ -66,6 +66,7 @@ from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.kda_decay_scratch import SteepScratchLayout, steep_scratch_layout
 from ..common.kda_decay import (
+    STEEP_FAST,
     has_exact_path,
     uses_direct_decay,
     add_steep_corrections,
