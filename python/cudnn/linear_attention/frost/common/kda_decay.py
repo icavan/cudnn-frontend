@@ -128,6 +128,8 @@ STEEP_INLINE: int = 2
 
 def default_steep_mode(io_dtype, l2norm, safe_gate, gate_scale_log2, b_t, *, state_alias=False):
     """Omit checks only when the declared gate and normalized-key bounds prove safety."""
+    if not safe_gate:
+        return STEEP_INLINE
     if io_dtype == cutlass.BFloat16 and l2norm and safe_gate and gate_scale_log2 * b_t >= STEEP_LOG2_PREFIX:
         return STEEP_DISABLED
     return STEEP_INLINE if state_alias else STEEP_FAST
@@ -190,7 +192,7 @@ def launch_decay_kernel(
     retain the small fast kernel and its flag-gated twin; this decision must not
     be cached from warmup pointers. Statically bounded plans still launch once.
     """
-    if cutlass.const_expr(cfg.steep_mode == STEEP_INLINE):
+    if cutlass.const_expr(cfg.steep_mode == STEEP_INLINE and cfg.safe_gate):
         if may_alias:
             kernel(cfg, *args).launch(grid=grid, block=(cfg.threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl, min_blocks_per_mp=min_blocks_per_mp)
         else:
@@ -303,7 +305,9 @@ def classify_steep_channel(cfg: cutlass.Constexpr, prefix, raw_k_ptr, channel, c
     Callers retain ownership of stage offsets, scratch stores and barriers.
     """
     channel_steep = cutlass.Boolean(False)
-    if cutlass.const_expr(cfg.steep_mode != STEEP_DISABLED):
+    if cutlass.const_expr(has_exact_path(cfg) and not cfg.safe_gate):
+        channel_steep = cutlass.Boolean(True)
+    elif cutlass.const_expr(cfg.steep_mode != STEEP_DISABLED):
         channel_steep = channel_needs_exact_decay(cfg, prefix, raw_k_ptr, channel)
     word = cutlass.Int32(0)
     if cutlass.const_expr(cfg.steep_mode != STEEP_DISABLED):
