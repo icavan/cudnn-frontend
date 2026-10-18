@@ -207,7 +207,9 @@ class CompiledKda:
             )
         )
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
-        self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
+        # Non-safe decay is formed directly from FP32 prefix differences inside
+        # the production kernel; the factorized prep records are safe-gate only.
+        self.prep = self.safe_gate and self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
         self.length_rule = self.chain and self.batch_invariant
 

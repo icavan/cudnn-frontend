@@ -170,7 +170,7 @@ def _check_forward_backward(
 
 
 @pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
-@pytest.mark.parametrize("route", ["prep", "chain"])
+@pytest.mark.parametrize("route", ["split", "chain"])
 def test_kda_steep_decay_schedules(pattern, route, monkeypatch):
     """Force the production split schedules on small ragged, ring-wrapping inputs."""
     engine = importlib.import_module("cudnn.linear_attention.frost.common.piece_chain")
