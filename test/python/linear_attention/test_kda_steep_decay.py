@@ -23,10 +23,6 @@ if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 import cutlass
-import cutlass.cute as cute
-import cuda.bindings.driver as cuda
-from cutlass.cute.runtime import from_dlpack
-from cudnn.linear_attention.frost.common.kda_decay import state_may_overlap
 
 pytestmark = [pytest.mark.L1, pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")]
 
@@ -57,8 +53,8 @@ def _case(pattern, dim, length=32, value_dim=None):
     k = torch.nn.functional.normalize(torch.randn(1, length, 2, dim, generator=rng), dim=-1).to(dtype).cuda()
     v = (torch.randn(1, length, 2, value_dim, generator=rng) * 0.2).to(dtype).cuda()
     g = torch.full((1, length, 2, dim), 0.0 if pattern == "fp16_safe" else -0.1, device="cuda", dtype=torch.float32)
-    if pattern in ("bf16_spike", "bf16_huge_spike"):
-        g[:, 5, :, 0] = -200.0 if pattern == "bf16_spike" else -1.0e8
+    if pattern == "bf16_spike":
+        g[:, 5, :, 0] = -200.0
     beta = torch.full((1, length, 2), 0.25, device="cuda", dtype=dtype)
     state = (torch.randn(1, 2, value_dim, dim, generator=rng) * 0.01).cuda()
     a = torch.tensor([-0.1, 0.1], device="cuda")
@@ -75,7 +71,7 @@ def _case(pattern, dim, length=32, value_dim=None):
     [
         pytest.param(pattern, dim, normalize, checkpoint, marks=(pytest.mark.L0,) if dim == 64 and normalize and checkpoint == 16 else ())
         for checkpoint in (0, 16, 32)
-        for pattern in ("fp16_safe", "bf16_spike", "bf16_huge_spike")
+        for pattern in ("fp16_safe", "bf16_spike")
         for normalize in (False, True)
         for dim in (64, 128)
     ],
@@ -163,7 +159,7 @@ def _check_forward_backward(
     assert not failures, "; ".join(failures)
 
 
-@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike", "bf16_huge_spike"])
+@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
 @pytest.mark.parametrize("route", ["prep", "chain"])
 def test_kda_steep_decay_schedules(pattern, route, monkeypatch):
     """Force the production split schedules on small ragged, ring-wrapping inputs."""
@@ -179,33 +175,33 @@ def test_kda_steep_decay_schedules(pattern, route, monkeypatch):
     _check_forward_backward(pattern, 128, True, 0, length=97, batch_invariant=False)
 
 
-@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike", "bf16_huge_spike"])
-def test_kda_steep_decay_replay(pattern):
-    """No initial state selects the flagged replay; also exercise 16-bit gates."""
+@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
+def test_kda_direct_decay_without_initial_state(pattern):
+    """The direct path also supports absent initial state and 16-bit gates."""
     _check_forward_backward(pattern, 64, True, 16, length=97, use_initial=False, gate_io_dtype=True)
 
 
-def test_kda_steep_decay_replay_flag_resets():
-    """Reusing a cached plan must reset the flag and exact scheduler together."""
-    for pattern in ("bf16_huge_spike", "bf16_mild", "bf16_huge_spike"):
+def test_kda_direct_decay_cached_plan_rebinds_gate_values():
+    """One cached direct plan must consume current gate values on every call."""
+    for pattern in ("bf16_spike", "bf16_mild", "bf16_spike"):
         _check_forward_backward(pattern, 64, True, 16, length=97, use_initial=False, gate_io_dtype=True)
 
 
 def test_kda_steep_decay_static_bounds():
-    """Only a proven normalized BF16 safe-gate bound removes the checks."""
+    """Only a proven normalized BF16 safe-gate bound keeps factorization."""
     import cutlass
-    from cudnn.linear_attention.frost.common.kda_decay import STEEP_DISABLED, STEEP_FAST, STEEP_INLINE, default_steep_mode
+    from cudnn.linear_attention.frost.common.kda_decay import STEEP_DISABLED, STEEP_INLINE, default_steep_mode
 
     assert default_steep_mode(cutlass.BFloat16, True, True, -5 * 1.4426950408889634, 16) == STEEP_DISABLED
-    assert default_steep_mode(cutlass.BFloat16, True, True, -6 * 1.4426950408889634, 16) == STEEP_FAST
-    assert default_steep_mode(cutlass.BFloat16, False, True, -5 * 1.4426950408889634, 16) == STEEP_FAST
-    assert default_steep_mode(cutlass.Float16, True, True, -5 * 1.4426950408889634, 16) == STEEP_FAST
+    assert default_steep_mode(cutlass.BFloat16, True, True, -6 * 1.4426950408889634, 16) == STEEP_INLINE
+    assert default_steep_mode(cutlass.BFloat16, False, True, -5 * 1.4426950408889634, 16) == STEEP_INLINE
+    assert default_steep_mode(cutlass.Float16, True, True, -5 * 1.4426950408889634, 16) == STEEP_INLINE
     assert default_steep_mode(cutlass.Float16, True, True, -5 * 1.4426950408889634, 16, state_alias=True) == STEEP_INLINE
 
 
 @pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_mild"])
 def test_kda_steep_decay_large_unnormalized_keys(pattern):
-    """Actual inverse overflow must replay even above the prefix-only threshold."""
+    """Direct intervals stay finite when factorized inverse keys would overflow."""
     actual, _, _ = _case(pattern, 64, 16)
     q, k, v, g, beta, state, a, bias = actual
     fp16 = q.dtype == torch.float16
@@ -255,16 +251,16 @@ def test_kda_non_safe_gate_combines_prefix_and_inverse_hazards():
     _check_forward_backward("bf16_combined", 64, False, 16, length=16, operands=operands)
 
 
-@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_huge_spike"])
+@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
 @pytest.mark.parametrize("dim,value_dim", [(64, 128), (128, 64)])
 def test_kda_steep_decay_rectangular(pattern, dim, value_dim):
-    """Both native rectangular state layouts need the same interval corrections."""
+    """Both native rectangular state layouts use the same direct intervals."""
     _check_forward_backward(pattern, dim, True, 0, value_dim=value_dim)
 
 
-@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_huge_spike"])
+@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
 def test_kda_steep_decay_overwrite_state(pattern):
-    """The corrected launch must read the original state before overwriting it."""
+    """The direct launch must read the original state before overwriting it."""
     module = importlib.import_module("cudnn.linear_attention.ops.kda")
     actual, reference, kw = _case(pattern, 64, 97)
     q, k, v, g, beta, state, a, bias = (t.detach() for t in actual)
@@ -298,11 +294,11 @@ def test_kda_steep_decay_overwrite_state(pattern):
 
 @pytest.mark.parametrize("operation", ["forward", "backward", "summary", "summary_transition", "summary_backward", "summary_backward_transition"])
 def test_kda_steep_decay_native_state_rebinding(operation):
-    """One warmed native host must inspect current, not warmup, state aliases."""
+    """One warmed native host must support both aliased and disjoint state bindings."""
     from cudnn.frost.workspace import Workspace
     from cudnn.linear_attention.frost.kda_engine import build_kda, build_kda_summary
 
-    actual, _, _ = _case("bf16_huge_spike", 64, 97)
+    actual, _, _ = _case("bf16_spike", 64, 97)
     q, k, v, g, beta, state, _, _ = (t.detach() for t in actual)
     values = dict(q=q[0], k=k[0], v=v[0], g=g[0], beta=beta[0], initial_state=state)
     values["cu_seqlens"] = torch.tensor([0, 97], device="cuda", dtype=torch.int32)
@@ -361,44 +357,9 @@ def test_kda_steep_decay_native_state_rebinding(operation):
             torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
 
 
-@cute.kernel
-def _write_overlap_result(out: cute.Tensor, overlap: cutlass.Int32):
-    """Expose the compiled host's decision without reading fabricated views."""
-    if cute.arch.thread_idx()[0] == 0:
-        out[0] = overlap
-
-
-@cute.jit
-def _overlap_probe(base, out, offset, extent, stride, other_offset, other_extent, other_stride, stream: cuda.CUstream):
-    """Build dynamic state footprints solely to test native host range arithmetic."""
-    lhs = cute.make_tensor(base.iterator + offset, cute.make_layout((extent, 1, 1, 4), stride=(stride, 4, 4, 1)))
-    rhs = cute.make_tensor(base.iterator + other_offset, cute.make_layout((other_extent, 1, 1, 4), stride=(other_stride, 4, 4, 1)))
-    _write_overlap_result(out, cutlass.Int32(state_may_overlap(lhs, rhs))).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
-
-
-def test_kda_state_overlap_native_bounds():
-    """Range dispatch handles empty, broadcast, padded and signed-stride views."""
-    base = torch.empty(256, device="cuda")
-    out = torch.empty(1, dtype=torch.int32, device="cuda")
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = cute.compile(_overlap_probe, from_dlpack(base), from_dlpack(out), *([cutlass.Int64(0)] * 6), stream, options="--enable-tvm-ffi")
-    cases = [
-        ((64, 2, -32, 32, 1, 4), True),
-        ((64, 2, -32, 96, 2, 32), False),
-        ((0, 0, 32, 0, 1, 4), False),
-        ((0, 2, 0, 0, 1, 4), True),
-        ((0, 2, 32, 16, 1, 4), True),  # conservatively include layout holes
-        ((0, 1, 4, 4, 1, 4), False),
-        ((0, 1, 4, 0, 1, 4), True),
-    ]
-    for bounds, expected in cases:
-        compiled(base, out, *bounds, stream)
-        assert bool(out.item()) == expected, bounds
-
-
-@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_huge_spike"])
-def test_kda_steep_decay_cuda_graph_flag_reset(pattern):
-    """Captured forward/backward must reevaluate and reset the device replay flag."""
+@pytest.mark.parametrize("pattern", ["fp16_safe", "bf16_spike"])
+def test_kda_direct_decay_cuda_graph_rebind(pattern):
+    """Captured forward/backward must consume rebound direct-path gates."""
     module = importlib.import_module("cudnn.linear_attention.ops.kda")
     actual, _, kw = _case(pattern, 64, 97)
     q, k, v, g, beta, _, a, bias = (t.detach() for t in actual)

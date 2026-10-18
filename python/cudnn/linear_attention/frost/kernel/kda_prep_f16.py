@@ -67,11 +67,10 @@ from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.kda_decay_scratch import SteepScratchLayout, steep_scratch_layout
 from ..common.kda_decay import (
     has_exact_path,
-    STEEP_FAST,
+    uses_direct_decay,
     add_steep_corrections,
     encode_gate_exchange,
     lane_steep_bits,
-    steep_launch_cfg,
     steep_tile_mask,
     steep_exit_unless_flagged,
     steep_row_corrections,
@@ -647,7 +646,7 @@ def compute_warp_group(
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
-            if cutlass.const_expr(cfg.safe_gate):
+            if cutlass.const_expr(not uses_direct_decay(cfg)):
                 for i in cutlass.range_constexpr((cfg.d_k // 16)):
                     k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                     k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
@@ -705,7 +704,7 @@ def compute_warp_group(
         for accum_idx in cutlass.range_constexpr(8):
             a_acc[accum_idx] = cutlass.Float32(0.0)
         if warp_local == 2:
-            if cutlass.const_expr(cfg.safe_gate):
+            if cutlass.const_expr(not uses_direct_decay(cfg)):
                 for i in cutlass.range_constexpr((cfg.d_k // 16)):
                     k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                     q_decay_frag = nvvm.ldmatrix(sQ_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
@@ -944,30 +943,29 @@ def host(
     cfg.tma_gate_bytes = cfg.d_k * cfg.b_t * gate_bytes_per_element
 
     # ---- launch ----------------------------------------------------------------------
-    for launch_idx in cutlass.range_constexpr(2 if cfg.steep_mode == STEEP_FAST else 1):
-        frost_kda_prep(
-            steep_launch_cfg(cfg, launch_idx),
-            cute.FastDivmodDivisorV2(heads_out),
-            q_ratio,
-            k_ratio,
-            cute.FastDivmodDivisorV2(num_ctas),
-            desc_words,
-            a_log,
-            dt_bias,
-            beta,
-            rows,
-            row_count,
-            a,
-            diag,
-            cutlass.Int32(cu_seqlens.shape[0] - 1),
-            steep_slot,
-        ).launch(
-            grid=(num_ctas, 1, 1),
-            block=(cfg.threads_per_cta, 1, 1),
-            stream=stream,
-            use_pdl=USE_PDL,
-            min_blocks_per_mp=cfg.ctas_per_sm,
-        )
+    frost_kda_prep(
+        cfg,
+        cute.FastDivmodDivisorV2(heads_out),
+        q_ratio,
+        k_ratio,
+        cute.FastDivmodDivisorV2(num_ctas),
+        desc_words,
+        a_log,
+        dt_bias,
+        beta,
+        rows,
+        row_count,
+        a,
+        diag,
+        cutlass.Int32(cu_seqlens.shape[0] - 1),
+        steep_slot,
+    ).launch(
+        grid=(num_ctas, 1, 1),
+        block=(cfg.threads_per_cta, 1, 1),
+        stream=stream,
+        use_pdl=USE_PDL,
+        min_blocks_per_mp=cfg.ctas_per_sm,
+    )
 
 
 @cute.kernel

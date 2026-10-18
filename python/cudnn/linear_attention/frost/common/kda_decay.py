@@ -15,20 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stable interval-decay operands for KDA's 16-token tiles.
+"""Stable interval decay for KDA's 16-token tiles.
 
-The fast specialization preserves the original MMA operands and atomically
-flags unsafe channels. Its exact twin, on the same stream, replaces them with
-bounded prefix/suffix factors and repairs the triangular products. Interval
-logs are summed directly, never recovered by subtracting large FP32 prefixes.
+Normalized BF16 safe-gate plans whose declared lower bound proves the
+factorized operands finite retain the original Tensor Core path. Every other
+plan follows FLA's non-safe organization: one statically selected launch uses
+FP32 prefix differences to form all intra-tile intervals directly. There is no
+data-dependent detection, host decision, or replay.
 
 KDA's beta is scalar and multiplies the triangular KK matrix after correction.
 The saved backward dM matrix already includes that row beta. Consequently the
 channel corrections here do not apply an additional per-channel beta factor.
 Kernel schedules own publication, acquire waits and scratch reuse barriers.
 """
-
-import dataclasses
 
 import cutlass
 import cutlass.cute as cute
@@ -54,11 +53,7 @@ def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
 
 @cute.jit
 def scan_gate_prefixes(cfg: cutlass.Constexpr, gate_raw, chunk_start, batch_seqlen, cg0_a_log_exp, cg0_dt_bias_value):
-    """Condition a channel's gates and scan in the original pairwise order.
-
-    Exact kernels retain token logs in gate_raw. The caller owns the exchange
-    stores, scan ballots and publication barriers.
-    """
+    """Condition a channel's gates and scan in the original pairwise order."""
     g_prefix_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
     if cutlass.const_expr(cfg.safe_gate):
         for row in cutlass.range_constexpr(cfg.b_t):
@@ -71,10 +66,6 @@ def scan_gate_prefixes(cfg: cutlass.Constexpr, gate_raw, chunk_start, batch_seql
     if chunk_start + cutlass.Int32(cfg.b_t) > batch_seqlen:
         for row in cutlass.range_constexpr(cfg.b_t):
             g_prefix_regs[row] = cutlass.Float32(0.0) if chunk_start + cutlass.Int32(row) >= batch_seqlen else g_prefix_regs[row]
-
-    if cutlass.const_expr(has_exact_path(cfg) and cfg.safe_gate):
-        for row in cutlass.range_constexpr(cfg.b_t):
-            gate_raw[row] = g_prefix_regs[row]
 
     prefix_acc = cutlass.Float32(0.0)
     for row_pair in cutlass.range_constexpr(cfg.b_t // 2):
@@ -97,82 +88,31 @@ STEEP_LOG2_PREFIX: float = -120.0
 """bf16 operands: a key channel whose inclusive log2 gate prefix inside a tile falls below this is steep for the tile.
 ``exp2`` of the prefix reaches the fp32 (and bf16) normal floor, ``2^-126``, six binades further down."""
 
-STEEP_LOG2_PREFIX_FP16: float = -14.0
-"""fp16 operands: K inv = k * 2^-g reaches the fp16 maximum, ``65504 ~ 2^16``, two binades further down."""
-
-
-def steep_log2_prefix(io_dtype) -> float:
-    """The steep threshold for the operand dtype (a trace-time constant)."""
-    return STEEP_LOG2_PREFIX_FP16 if io_dtype == cutlass.Float16 else STEEP_LOG2_PREFIX
-
-
 STEEP_DISABLED: int = -1
-"""A statically bounded BF16 plan needs neither checks nor replay."""
+"""A statically bounded BF16 plan uses the original factorized path."""
 
 STEEP_FAST: int = 0
-"""Kernel ``cfg.steep_mode``: the original arithmetic plus the steep vote; a steep tile raises the call's steep flag.
-``host`` follows the launch with a ``STEEP_EXACT`` launch of the same kernel."""
-
-STEEP_EXACT: int = 1
-"""The exact kernel of a ``STEEP_FAST`` launch: every thread exits on entry unless the flag is raised, else it redoes
-the whole launch with the steep path, pulling tiles from its own ticket."""
-
-STEEP_FLAG_SLOT: int = 1
-"""The steep flag and the exact launch's ticket share the second int32 of the kernel's scheduler slot, which the
-prologue zeroes with the first: 0 means no steep tile, and the exact launch's tickets start at the 1 the fast launch
-stored."""
+"""Legacy dataclass default; builders replace it with disabled or direct mode."""
 
 STEEP_INLINE: int = 2
-"""Single-launch exact specialization for plans whose state may alias their input."""
+"""A single-launch direct-interval specialization for every other plan."""
 
 
 def default_steep_mode(io_dtype, l2norm, safe_gate, gate_scale_log2, b_t, *, state_alias=False):
-    """Omit checks only when the declared gate and normalized-key bounds prove safety."""
-    if not safe_gate:
-        return STEEP_INLINE
+    """Use Tensor Cores only when declared bounds prove both operands finite."""
     if io_dtype == cutlass.BFloat16 and l2norm and safe_gate and gate_scale_log2 * b_t >= STEEP_LOG2_PREFIX:
         return STEEP_DISABLED
-    return STEEP_INLINE if state_alias else STEEP_FAST
+    return STEEP_INLINE
 
 
 def has_exact_path(cfg) -> bool:
-    """Whether the specialization includes interval corrections (a trace-time constant)."""
-    return cfg.steep_mode in (STEEP_EXACT, STEEP_INLINE)
+    """Whether the specialization computes direct intervals (a trace-time constant)."""
+    return uses_direct_decay(cfg)
 
 
-def steep_launch_cfg(cfg, launch_idx):
-    """Compile-time launch order: the requested specialization, then its exact twin."""
-    return cfg if launch_idx == 0 else dataclasses.replace(cfg, steep_mode=STEEP_EXACT)
-
-
-@cute.jit
-def state_may_overlap(lhs, rhs):
-    """Conservative address-range overlap for native strided states.
-
-    This runs in the compiled host, not on the GPU or in Python execute(). It
-    examines current bindings, includes layout holes, and treats empty views as
-    disjoint. No tensor data or device flag is read.
-    """
-    overlap = cutlass.Boolean(False)
-    if cutlass.const_expr(lhs is not None and rhs is not None):
-        lhs_lo, rhs_lo = cutlass.Int64(0), cutlass.Int64(0)
-        lhs_hi, rhs_hi = cutlass.Int64(1), cutlass.Int64(1)
-        nonempty = cutlass.Boolean(True)
-        for axis in cutlass.range_constexpr(4):
-            lhs_span = (cutlass.Int64(lhs.shape[axis]) - 1) * cutlass.Int64(lhs.stride[axis])
-            rhs_span = (cutlass.Int64(rhs.shape[axis]) - 1) * cutlass.Int64(rhs.stride[axis])
-            lhs_lo += cutlass.min(lhs_span, cutlass.Int64(0))
-            rhs_lo += cutlass.min(rhs_span, cutlass.Int64(0))
-            lhs_hi += cutlass.max(lhs_span, cutlass.Int64(0))
-            rhs_hi += cutlass.max(rhs_span, cutlass.Int64(0))
-            nonempty = nonempty & (lhs.shape[axis] > 0) & (rhs.shape[axis] > 0)
-        lhs_base, rhs_base = lhs.iterator.toint(), rhs.iterator.toint()
-        lhs_start = lhs_base + lhs_lo * (lhs.element_type.width // 8)
-        rhs_start = rhs_base + rhs_lo * (rhs.element_type.width // 8)
-        lhs_end = lhs_base + lhs_hi * (lhs.element_type.width // 8)
-        rhs_end = rhs_base + rhs_hi * (rhs.element_type.width // 8)
-        overlap = nonempty & (lhs_start < rhs_end) & (rhs_start < lhs_end)
-    return overlap
+def uses_direct_decay(cfg) -> bool:
+    """Whether this specialization computes every 16-token interval directly."""
+    return cfg.steep_mode == STEEP_INLINE
 
 
 @cute.jit
@@ -183,66 +123,21 @@ def launch_decay_kernel(
     grid,
     stream: cuda.CUstream,
     use_pdl: cutlass.Constexpr,
-    may_alias,
     min_blocks_per_mp: cutlass.Constexpr = 1,
 ):
-    """Choose precision launches from current state bindings in the native host.
-
-    Overlapping state views require one inline corrected launch. Disjoint views
-    retain the small fast kernel and its flag-gated twin; this decision must not
-    be cached from warmup pointers. Statically bounded plans still launch once.
-    """
-    if cutlass.const_expr(cfg.steep_mode == STEEP_INLINE and cfg.safe_gate):
-        if may_alias:
-            kernel(cfg, *args).launch(grid=grid, block=(cfg.threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl, min_blocks_per_mp=min_blocks_per_mp)
-        else:
-            for launch_idx in cutlass.range_constexpr(2):
-                kernel(steep_launch_cfg(dataclasses.replace(cfg, steep_mode=STEEP_FAST), launch_idx), *args).launch(
-                    grid=grid, block=(cfg.threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl, min_blocks_per_mp=min_blocks_per_mp
-                )
-    else:
-        for launch_idx in cutlass.range_constexpr(2 if cfg.steep_mode == STEEP_FAST else 1):
-            kernel(steep_launch_cfg(cfg, launch_idx), *args).launch(
-                grid=grid, block=(cfg.threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl, min_blocks_per_mp=min_blocks_per_mp
-            )
+    """Launch the statically selected Tensor-Core or direct-decay kernel once."""
+    kernel(cfg, *args).launch(grid=grid, block=(cfg.threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl, min_blocks_per_mp=min_blocks_per_mp)
 
 
 @cute.jit
 def steep_exit_unless_flagged(cfg: cutlass.Constexpr, flag_slot):
-    """``STEEP_EXACT`` kernel entry, after the grid-dependency wait: leave unless the fast launch raised the flag.
-
-    Do not trigger dependents here: the exact grid must complete before later
-    kernels can use its corrected outputs. This also applies to the empty grid."""
-    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-        # Other CTAs may already be atomically incrementing this same word as
-        # their replay ticket. Use a strong load, not a racing ordinary load.
-        flag = nvvm.inline_ptx(
-            "ld.relaxed.gpu.global.u32 {$w0}, [{$r0}];",
-            write_only_types=[cutlass.Int32],
-            read_only_args=[flag_slot.iterator + STEEP_FLAG_SLOT],
-        )
-        if flag == cutlass.Int32(0):
-            nvvm.exit()
-
-
-@cute.jit
-def steep_raise_flag(cfg: cutlass.Constexpr, flag_slot, steep_word, lane_idx):
-    """``STEEP_FAST`` scan: a warp whose ballot found a steep channel raises the flag (idempotent, never read back)."""
-    if cutlass.const_expr(cfg.steep_mode == STEEP_FAST):
-        if steep_word != 0:
-            if lane_idx == 0:
-                nvvm.atomicrmw("or", flag_slot.iterator + STEEP_FLAG_SLOT, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu")
+    """Compatibility no-op: direct-decay plans no longer launch a replay grid."""
 
 
 @cute.jit
 def steep_ticket(cfg: cutlass.Constexpr, mScheduler):
-    """The next ticket off the scheduler slot: the first int32, or under ``STEEP_EXACT`` the flag slot past its 1."""
-    fetched = cutlass.Int32(0)
-    if cutlass.const_expr(cfg.steep_mode == STEEP_EXACT):
-        fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator + STEEP_FLAG_SLOT, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu")) - 1
-    else:
-        fetched = cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
-    return fetched
+    """Take the next work ticket from the ordinary scheduler word."""
+    return cutlass.Int32(nvvm.atomicrmw("add", mScheduler.iterator, cutlass.Int32(1), mem_order="relaxed", syncscope="gpu"))
 
 
 @cute.jit
@@ -260,61 +155,27 @@ def raw_offset(cfg: cutlass.Constexpr, row, channel):
 
 
 @cute.jit
-def channel_needs_exact_decay(cfg: cutlass.Constexpr, prefix, raw_k_ptr, channel):
-    """Bound the inverse operand over a channel before selecting its decay path.
-
-    Normalized keys have magnitude at most one. Exact/inline kernels otherwise
-    scan the raw tile and reserve one binade for reciprocal rounding. FAST uses
-    the prefix bound here and checks its actual inverse registers later.
-    The last prefix is the minimum, so the exact bound covers every row.
-    """
-    threshold = cutlass.Float32(steep_log2_prefix(cfg.io_dtype))
-    # FAST checks the actual inverse values while they are already in registers.
-    # Only a replay/inline launch needs this channel-wise conservative bound.
-    if cutlass.const_expr(not cfg.l2norm and has_exact_path(cfg)):
-        max_key = cutlass.Float32(1.0)
-        for row in cutlass.range(cfg.b_t, unroll=1):
-            key = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
-            max_key = cute.math.max(max_key, cute.math.abs(key))
-        limit = cutlass.Float32(15.0 if cfg.io_dtype == cutlass.Float16 else 127.0)
-        threshold = cute.math.max(threshold, cute.math.log2(max_key) - limit)
-    return prefix < threshold
-
-
-@cute.jit
 def track_inverse_max(cfg: cutlass.Constexpr, maximum, x, y):
-    """Track unnormalized FAST operands without loading the raw key tile again."""
-    if cutlass.const_expr(cfg.steep_mode == STEEP_FAST and not cfg.l2norm):
-        maximum = cute.math.max(maximum, cute.math.max(cute.math.abs(x), cute.math.abs(y)))
+    """Compatibility passthrough for operand builders shared with the old replay path."""
     return maximum
 
 
 @cute.jit
 def flag_inverse_max(cfg: cutlass.Constexpr, maximum, flag_slot, lane_idx):
-    """Request replay before returning any inverse operand outside its dtype range."""
-    if cutlass.const_expr(cfg.steep_mode == STEEP_FAST and not cfg.l2norm):
-        limit = cutlass.Float32(65504.0 if cfg.io_dtype == cutlass.Float16 else 3.3895313892515355e38)
-        word = cutlass.Int32(nvvm.vote_sync(0xFFFFFFFF, maximum > limit, nvvm.VoteSync.BALLOT))
-        steep_raise_flag(cfg, flag_slot, word, lane_idx)
+    """Compatibility no-op: direct-decay selection is static per plan."""
 
 
 @cute.jit
 def classify_steep_channel(cfg: cutlass.Constexpr, prefix, raw_k_ptr, channel, channel_rows: cutlass.Constexpr, flag_slot, lane_idx):
-    """Classify a scan lane, mask duplicate lanes, and flag a FAST relaunch.
-
-    Callers retain ownership of stage offsets, scratch stores and barriers.
-    """
+    """Mark every channel in a direct-interval plan and mask duplicate lanes."""
     channel_steep = cutlass.Boolean(False)
-    if cutlass.const_expr(has_exact_path(cfg) and not cfg.safe_gate):
+    if cutlass.const_expr(uses_direct_decay(cfg)):
         channel_steep = cutlass.Boolean(True)
-    elif cutlass.const_expr(cfg.steep_mode != STEEP_DISABLED):
-        channel_steep = channel_needs_exact_decay(cfg, prefix, raw_k_ptr, channel)
     word = cutlass.Int32(0)
-    if cutlass.const_expr(cfg.steep_mode != STEEP_DISABLED):
+    if cutlass.const_expr(uses_direct_decay(cfg)):
         word = cutlass.Int32(nvvm.vote_sync(0xFFFFFFFF, channel_steep, nvvm.VoteSync.BALLOT))
     if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
         word = word & cutlass.Int32((1 << channel_rows) - 1)
-    steep_raise_flag(cfg, flag_slot, word, lane_idx)
     return channel_steep, word
 
 
@@ -335,12 +196,10 @@ def encode_gate_exchange(
     exponentiate: cutlass.Constexpr,
     channel_active=True,
 ):
-    """Classify a channel and encode its exchange registers and scan metadata.
+    """Encode exponentials for the factorized path or FP32 prefixes for the direct path.
 
-    ``values`` holds log prefixes when ``exponentiate`` is true, otherwise their
-    exponentials. Exact steep channels retain token logs except in the last row,
-    which always holds the state-decay exponential. Callers own exchange stores,
-    stage selection and publication barriers; this helper never synchronizes.
+    Callers own exchange stores, stage selection, and publication barriers;
+    this helper never synchronizes.
     """
     channel_steep, word = classify_steep_channel(cfg, prefix, raw_k_ptr, channel, channel_rows, flag_slot, lane_idx)
     if cutlass.const_expr(has_exact_path(cfg)):
@@ -348,31 +207,23 @@ def encode_gate_exchange(
             (words_ptr + scan_warp).store(word)
         if word != 0:
             if channel_steep:
-                # DK=64 duplicates scan lanes to transpose two row halves.
-                # The final log has one cell per channel, not per half. The
-                # non-safe direct path keeps FP32 prefixes like FLA; safe-gate
-                # fallbacks retain per-token logs for their bounded sum.
+                # DK=64 duplicates scan lanes to transpose two row halves. The
+                # final prefix has one cell per channel, not per half.
                 if channel_active and lane_idx < cutlass.Int32(channel_rows):
-                    last_log = token_logs[cfg.b_t - 1]
-                    if cutlass.const_expr(not cfg.safe_gate):
-                        last_log = values[cfg.b_t - 1]
-                    (log_last_ptr + channel).store(last_log)
+                    (log_last_ptr + channel).store(values[cfg.b_t - 1])
     for row in cutlass.range_constexpr(cfg.b_t):
         prefix_log = values[row]
         if cutlass.const_expr(exponentiate):
             values[row] = cute.math.exp2(values[row], fastmath=True)
         if cutlass.const_expr(has_exact_path(cfg) and row < cfg.b_t - 1):
             if channel_steep:
-                if cutlass.const_expr(cfg.safe_gate):
-                    values[row] = token_logs[row]
-                else:
-                    values[row] = prefix_log
+                values[row] = prefix_log
     return word
 
 
 @cute.jit
 def steep_tile_mask(cfg: cutlass.Constexpr, words_ptr):
-    """Read the tile's four scan-warp ballots; FAST never reads exact-path scratch."""
+    """Read the tile's scan-warp ballots; every direct-path channel is set."""
     mask = cutlass.Int32(0)
     if cutlass.const_expr(has_exact_path(cfg)):
         mask = (words_ptr.load() | (words_ptr + 1).load()) | ((words_ptr + 2).load() | (words_ptr + 3).load())
@@ -410,20 +261,10 @@ def steep_token_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, cha
 
 @cute.jit
 def steep_interval_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, start, end, channel):
-    """Return the log2 decay over ``[start, end)``.
-
-    Non-safe KDA follows FLA's token-parallel path and subtracts the two
-    FP32 prefixes. Safe-gate range fallbacks retain the token logs and sum the
-    short 16-token interval directly.
-    """
-    if cutlass.const_expr(not cfg.safe_gate):
-        total = steep_token_log(cfg, exchange_ptr, log_last_ptr, end - 1, channel)
-        if start > 0:
-            total = total - steep_token_log(cfg, exchange_ptr, log_last_ptr, start - 1, channel)
-        return total
-    total = cutlass.Float32(0.0)
-    for token in cutlass.range(start, end, unroll=1):
-        total = total + steep_token_log(cfg, exchange_ptr, log_last_ptr, token, channel)
+    """Return the log2 decay over ``[start, end)`` from FP32 prefixes."""
+    total = steep_token_log(cfg, exchange_ptr, log_last_ptr, end - 1, channel)
+    if start > 0:
+        total = total - steep_token_log(cfg, exchange_ptr, log_last_ptr, start - 1, channel)
     return total
 
 
@@ -495,20 +336,20 @@ def steep_row_corrections(
     q_decay_ptr,
     corr_ptr,
 ):
-    """Add the steep channels' KK and A entries of tile row ``row`` to ``corr_ptr``.
+    """Form the direct path's KK and A entries for tile row ``row`` in ``corr_ptr``.
 
-    Called by all lanes of the row stage after its K inv / K decay stores.  ``bits`` is the lane's
-    :func:`lane_steep_bits`; ``k_norm`` / ``q_scale`` the row's K inverse norm and Q factor (the inverse norm, times
-    the attention scale where the A tile carries it); ``raw_q_ptr`` is ``None`` without an A tile.  Every operand is
-    read from the raw and operand tiles. ``corr_ptr`` is ``[2, BT, BT]`` fp32, the KK rows then the A rows.
+    Called by all lanes of the row stage. ``bits`` is the lane's
+    :func:`lane_steep_bits`; ``k_norm`` / ``q_scale`` are the row's K
+    normalization and Q factor (normalization times attention scale where the
+    A tile carries it); ``raw_q_ptr`` is ``None`` without an A tile.
+    ``corr_ptr`` is ``[2, BT, BT]`` FP32, the KK rows then the A rows.
     Each row group reduces in a fixed order and one lane stores each entry, for
-    ``s <= row`` and each steep channel,
+    ``s <= row`` and every channel,
 
-        A[row, s]  += q_n[row] k_n[s] 2^(g[row] - g[s]) - Q decay[row] K inv[s]
-        KK[row, s] += k_n[row] k_n[s] 2^(g[row] - g[s]) - K decay[row] K inv[s]   (s < row)
+        A[row, s]  = sum_d q_n[row, d] k_n[s, d] 2^(g[row, d] - g[s, d])
+        KK[row, s] = sum_d k_n[row, d] k_n[s, d] 2^(g[row, d] - g[s, d])  (s < row)
 
-    using the stored K decay / Q decay / K inv values for the second terms. The correction does not duplicate
-    operand rounding. The row-stage barrier must make all operand rows visible before this call."""
+    The row-stage barrier must make all raw operand rows visible before this call."""
     with_a = cutlass.const_expr(raw_q_ptr is not None)
     kk_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
     attn_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
@@ -519,37 +360,22 @@ def steep_row_corrections(
         if ((bits >> j) & 1) != 0:
             channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
             x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
-            if cutlass.const_expr(cfg.safe_gate):
-                x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
             if cutlass.const_expr(with_a):
                 z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
-                if cutlass.const_expr(cfg.safe_gate):
-                    z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
-            interval = cutlass.Float32(0.0)
             for step in cutlass.range_constexpr(cfg.b_t):
                 source_row = cfg.b_t - 1 - step
                 if source_row <= row:
+                    interval = cutlass.Float32(0.0)
                     if source_row < row:
-                        if cutlass.const_expr(cfg.safe_gate):
-                            interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, channel)
-                        else:
-                            interval = steep_interval_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, row + 1, channel)
+                        interval = steep_interval_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, row + 1, channel)
                     k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     if cutlass.const_expr(k_norm_ptr is not None):
                         k_s = k_s * (k_norm_ptr + source_row).load()
                     k_decayed = k_s * cute.math.exp2(interval, fastmath=True)
                     if source_row < row:
-                        value = x * k_decayed
-                        if cutlass.const_expr(cfg.safe_gate):
-                            k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
-                            value = value - x_decay * k_inv_s
-                        kk_regs[source_row] = kk_regs[source_row] + value
+                        kk_regs[source_row] = kk_regs[source_row] + x * k_decayed
                     if cutlass.const_expr(with_a):
-                        value = z * k_decayed
-                        if cutlass.const_expr(cfg.safe_gate):
-                            k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
-                            value = value - z_decay * k_inv_s
-                        attn_regs[source_row] = attn_regs[source_row] + value
+                        attn_regs[source_row] = attn_regs[source_row] + z * k_decayed
     for source_row in cutlass.range_constexpr(cfg.b_t):
         kk = kk_regs[source_row]
         attn = attn_regs[source_row]
@@ -575,10 +401,7 @@ def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
         if cutlass.const_expr(accum_idx % 2 == 1):
             col = col + cutlass.Int32(1)
         value = (corr_ptr + row * cfg.b_t + col).load()
-        if cutlass.const_expr(cfg.safe_gate):
-            acc[accum_idx] = acc[accum_idx] + value
-        else:
-            acc[accum_idx] = value
+        acc[accum_idx] = value
     # Callers release this stage through an elected lane. Join every reader
     # before that lane can let the producer overwrite the correction tile.
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)

@@ -1284,13 +1284,10 @@ def kimi_delta_attention(
     and ``final_state`` and the state gradients (``d_final_state``,
     ``d_initial_state``) follow it.
 
-    FROST uses bounded interval-decay operands when a tile's inverse keys would
-    exceed the operand range; it does not clip the gate. Unsafe tiles can cause
-    a device-flagged replay, without a host read or synchronization. Normalized
-    BF16 plans with the default safe-gate bound omit these checks and replay.
-    To preserve supported in-place state updates, potentially overlapping state
-    bindings use one corrected launch when range checks are needed. Disjoint
-    bindings keep the fast path even after warming up a plan with aliased buffers.
+    FROST uses the factorized Tensor-Core path only when normalized BF16 keys
+    and the declared safe-gate bound prove both operands finite. Other plans
+    compute each 16-token interval directly from FP32 gate prefixes, without
+    clipping, host synchronization, or a data-dependent replay.
 
     Args:
         g: per-key-channel decay: log-space by default (``alpha = exp(g) in

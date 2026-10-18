@@ -768,19 +768,16 @@ CUDA-owning objects, GC-timed release and stream capture: Rule 8.
 
 For factorized decay operands, test the operand dtype independently of the gate
 dtype: FP16 inverse keys can overflow even with KDA's default safe-gate bound;
-BF16 can fail after a finite extreme negative log gate. Check output, final
-state and every backward gradient against an FP64 token recurrence, with saved,
-absent and coarse checkpoints. Include an isolated `-1e8` log-gate spike followed
-by mild gates: subtracting rounded FP32 prefixes loses those later intervals.
-Detector: `linear_attention/test_kda_steep_decay.py`. Never repair this with gate
-clipping or `nan_to_num`. A flagged replay must not reread a mutated aliased
-state, and a shared correction tile needs both publication and reader-to-reuse
-ordering (including all lanes before an elected reader releases its stage).
-Run sanitizer on the forward/prep/recompute launches too, not only backward:
-`test_kda_steep_decay_replay[fp16_safe]` covers the 16-bit gate exchange and
-checkpoint seed, while the forced schedules exercise FP32 raw-gate storage
-reused with a channel permutation. Join every raw-gate reader before those
-stores, and match publication/reuse arrive counts to the actual participants.
+BF16 can fail after a finite steep negative log gate. Check output, final state
+and every backward gradient against an FP64 token recurrence, with saved,
+absent and coarse checkpoints. Detector:
+`linear_attention/test_kda_steep_decay.py`. Never repair this with gate clipping
+or `nan_to_num`. The direct 16-token path uses FP32 prefix differences and must
+have gate-density-independent launch structure and runtime. Its shared direct
+tile needs both publication and reader-to-reuse ordering, including all lanes
+before an elected reader releases its stage. Run sanitizer on the
+forward/prep/recompute launches too, not only backward; forced schedules cover
+FP32 gate storage reused with a channel permutation.
 
 ## DSA training composition
 

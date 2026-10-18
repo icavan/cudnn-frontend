@@ -108,6 +108,7 @@ from ..common.kda_decay_scratch import SteepScratchLayout, steep_scratch_layout
 from ..common.kda_decay import (
     has_exact_path,
     default_steep_mode,
+    uses_direct_decay,
     encode_gate_exchange,
     steep_channel_bit,
     STEEP_FAST,
@@ -117,7 +118,6 @@ from ..common.kda_decay import (
     lane_steep_bits,
     gradient_operand_scales,
     launch_decay_kernel,
-    state_may_overlap,
     steep_exit_unless_flagged,
     steep_grad_corrections,
     pack_dstate_operand,
@@ -510,7 +510,7 @@ def epilogue_warp(
                 a_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
                 for accum_idx in cutlass.range_constexpr(8):
                     a_acc[accum_idx] = cutlass.Float32(0.0)
-                for i in cutlass.range_constexpr(cfg.d_k // 16 if cfg.safe_gate else 0):
+                for i in cutlass.range_constexpr(cfg.d_k // 16 if not uses_direct_decay(cfg) else 0):
                     a_col = i * 16 + a_col_offset
                     a_seg = a_col // 64
                     q_decay_frag = nvvm.ldmatrix(
@@ -748,7 +748,7 @@ def register_mma_warp(
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(cfg.d_k // 16 if cfg.safe_gate else 0):
+            for i in cutlass.range_constexpr(cfg.d_k // 16 if not uses_direct_decay(cfg) else 0):
                 a_col = i * 16 + a_col_offset
                 a_seg = a_col // 64
                 k_decay_frag = nvvm.ldmatrix(
@@ -3703,7 +3703,6 @@ def host(
         grid_shape,
         stream,
         USE_PDL,
-        state_may_overlap(d_final_state, d_initial_state),
     )
 
 

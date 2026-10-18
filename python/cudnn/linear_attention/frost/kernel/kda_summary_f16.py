@@ -90,6 +90,7 @@ from ..common.kda_operands import load_key_row, key_operand_half
 from ..common.kda_decay_scratch import SteepScratchLayout, steep_scratch_layout
 from ..common.kda_decay import (
     has_exact_path,
+    uses_direct_decay,
     default_steep_mode,
     scan_gate_prefixes,
     flag_inverse_max,
@@ -98,7 +99,6 @@ from ..common.kda_decay import (
     encode_gate_exchange,
     lane_steep_bits,
     launch_decay_kernel,
-    state_may_overlap,
     steep_exit_unless_flagged,
     steep_row_corrections,
     steep_ticket,
@@ -343,7 +343,7 @@ def register_mma_warp(
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
 
-            for i in cutlass.range_constexpr((cfg.d_k // 16) if cfg.safe_gate else 0):
+            for i in cutlass.range_constexpr((cfg.d_k // 16) if not uses_direct_decay(cfg) else 0):
                 k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                 k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + k_decay_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
 
@@ -2009,7 +2009,6 @@ def host(
         grid_shape,
         stream,
         USE_PDL,
-        state_may_overlap(initial_state, final_state) | state_may_overlap(initial_state, transition),
     )
 
 
