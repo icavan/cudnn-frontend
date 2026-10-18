@@ -91,7 +91,20 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
     return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
 
 
-def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False):
+def choose_pieces(
+    *,
+    num_seqs,
+    heads_out,
+    num_sm,
+    total_tokens,
+    b_t,
+    cadence_tokens,
+    batch_invariant,
+    expand_num,
+    reverse=False,
+    compose_tail=False,
+    length_rule_piece_tokens=LENGTH_RULE_PIECE_TOKENS,
+):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
     Boundaries are multiples of ``unit_chunks = lcm(expand_num, cadence_chunks)`` chunks.  Without ``batch_invariant`` the
@@ -108,7 +121,7 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
     cadence_chunks = max(1, int(cadence_tokens) // b_t)
     unit_chunks = math.lcm(expand_num, cadence_chunks)
     if batch_invariant:
-        pieces = min(max(1, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS)), CHAIN_MAX_PIECES)
+        pieces = min(max(1, -(-int(total_tokens) // int(length_rule_piece_tokens))), CHAIN_MAX_PIECES)
         if pieces == 1 and not compose_tail:
             return 0, unit_chunks
         return pieces, unit_chunks
@@ -175,11 +188,12 @@ def piece_count(
     length_rule: cutlass.Constexpr[bool],
     length,
     span_chunks,
+    length_rule_piece_tokens: cutlass.Constexpr[int] = LENGTH_RULE_PIECE_TOKENS,
 ):
     """Slots a sequence of ``length`` real tokens takes: ``ceil(chunks / span_chunks)`` (the length rule:
     ``clamp(ceil(length / LENGTH_RULE_PIECE_TOKENS), 1, pieces)``), at least one."""
     if cutlass.const_expr(length_rule):
-        count = (length + cutlass.Int32(LENGTH_RULE_PIECE_TOKENS - 1)) // cutlass.Int32(LENGTH_RULE_PIECE_TOKENS)
+        count = (length + cutlass.Int32(length_rule_piece_tokens - 1)) // cutlass.Int32(length_rule_piece_tokens)
         count = count if count < cutlass.Int32(pieces) else cutlass.Int32(pieces)
     else:
         chunks = (length * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
@@ -196,12 +210,13 @@ def piece_span(
     length_rule: cutlass.Constexpr[bool],
     length,
     span_chunks,
+    length_rule_piece_tokens: cutlass.Constexpr[int] = LENGTH_RULE_PIECE_TOKENS,
 ):
     """``(span_tokens, last)`` of a sequence of ``length`` real tokens taking ``piece_count`` slots: the piece span in
     real tokens (Int64, the sequence's chunks spread evenly over its slots and rounded up to units) and the index of its
     last filled slot (0 when empty)."""
     chunks = (length * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
-    count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks)
+    count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks, length_rule_piece_tokens)
     own_span = (chunks + count - cutlass.Int32(1)) // count
     own_span = own_span if own_span > cutlass.Int32(1) else cutlass.Int32(1)
     span_units = (own_span + cutlass.Int32(unit_chunks - 1)) // cutlass.Int32(unit_chunks)
@@ -227,6 +242,7 @@ def piece_table_body(
     mCuPieces: cute.Tensor,
     mMainRows: cute.Tensor,
     mSummaryRows: cute.Tensor,
+    length_rule_piece_tokens: cutlass.Constexpr[int] = LENGTH_RULE_PIECE_TOKENS,
 ):
     """Piece table of one CTA (every thread calls; CTA barriers inside).  The wave is ``num_seqs * pieces`` slots and every
     slot spans ``span = ceil(total_chunks / wave)`` chunks (units rounded up); thread ``b`` owns sequence ``b``, taking
@@ -265,7 +281,7 @@ def piece_table_body(
                 if probe_start > cutlass.Int32(0):
                     b_read = b if valid else num_seqs - cutlass.Int32(1)
                     length = cutlass.Int32(mCu[b_read + 1]) - cutlass.Int32(mCu[b_read])
-                count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks)
+                count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks, length_rule_piece_tokens)
                 # ---- CTA sum of the counts: warp scan, lane 31 parks the warp total, every thread adds the words ----
                 inclusive = count if valid else cutlass.Int32(0)
                 for offset in [1, 2, 4, 8, 16]:
@@ -296,7 +312,7 @@ def piece_table_body(
             start = cutlass.Int32(mCu[b_read])
             end = cutlass.Int32(mCu[b_read + 1])
         length = end - start
-        span_tokens, last = piece_span(pieces, unit_chunks, b_t, expand_num, length_rule, length, span_chunks)
+        span_tokens, last = piece_span(pieces, unit_chunks, b_t, expand_num, length_rule, length, span_chunks, length_rule_piece_tokens)
         rows = (last + cutlass.Int32(1)) * cutlass.Int32(heads_out)
         rows_main = rows if valid else cutlass.Int32(0)
         rows_summary = rows if (valid and last > cutlass.Int32(0)) else cutlass.Int32(0)

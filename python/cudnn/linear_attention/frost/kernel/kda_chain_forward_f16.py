@@ -34,7 +34,7 @@ from cutlass.cute.runtime import from_dlpack
 from cudnn.frost.buffers import DeviceView
 
 from ..common.host import get_dtype
-from ..common.piece_chain import dtype_name, launch_state_chain
+from ..common.piece_chain import LENGTH_RULE_PIECE_TOKENS, dtype_name, launch_state_chain
 from . import kda_chain_prologue_f16, kda_prefill_f16, kda_summary_f16
 
 CHAIN_FORWARD_BUFFERS = (
@@ -132,6 +132,7 @@ def chain_forward_host(
         unit_chunks,
         b_t,
         length_rule,
+        LENGTH_RULE_PIECE_TOKENS,
         heads_out,
         cutlass.Int32(0),
         checkpoint_every_n,

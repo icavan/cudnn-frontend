@@ -21,6 +21,7 @@ from .engine import FrostLaPlan, frost_la_gate, summary_support_gates
 
 # the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
 PREP_TILE_FRACTION = 0.475
+NONSAFE_BWD_PIECE_TOKENS = 128
 
 
 def build_kda(graph):
@@ -471,7 +472,7 @@ class CompiledKdaBwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import LENGTH_RULE_PIECE_TOKENS, chain_rows_per_cta, choose_pieces, piece_table_layout
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -522,6 +523,7 @@ class CompiledKdaBwd:
         self.dim_k, self.dim_v = K, V
         self.num_sm = multiprocessor_count(self.device)
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
+        self.length_rule_piece_tokens = NONSAFE_BWD_PIECE_TOKENS if not self.safe_gate else LENGTH_RULE_PIECE_TOKENS
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
         self.pieces, self.unit_chunks = choose_pieces(
@@ -534,6 +536,7 @@ class CompiledKdaBwd:
             batch_invariant=self.batch_invariant,
             reverse=True,
             expand_num=1,
+            length_rule_piece_tokens=self.length_rule_piece_tokens,
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
@@ -863,6 +866,7 @@ class CompiledKdaBwd:
             heads_out=self.n_heads_out,
             num_seqs=self.num_seqs,
             b_t=self.b_t,
+            length_rule_piece_tokens=self.length_rule_piece_tokens,
             fused_h_m=self.fused_h_m,
             series=series,
             coarse=coarse,

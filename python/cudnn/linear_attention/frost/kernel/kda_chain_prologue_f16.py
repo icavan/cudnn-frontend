@@ -44,6 +44,7 @@ def frost_kda_chain_prologue(
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
+    length_rule_piece_tokens: cutlass.Constexpr[int],
     heads_out: cutlass.Int32,
     base_q: cutlass.GridConstant[tma.TensorMap],
     base_k: cutlass.GridConstant[tma.TensorMap],
@@ -111,6 +112,7 @@ def frost_kda_chain_prologue(
         cu_pieces,
         main_rows,
         summary_rows,
+        length_rule_piece_tokens,
     )
     nvvm.barrier_cta_sync()
     n_pieces = num_seqs * cutlass.Int32(pieces)
@@ -251,6 +253,7 @@ def chain_prologue(
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
+    length_rule_piece_tokens: cutlass.Constexpr[int],
     heads_out: cutlass.Int32,
     series_span_chunks: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
@@ -364,6 +367,7 @@ def chain_prologue(
         unit_chunks,
         b_t,
         length_rule,
+        length_rule_piece_tokens,
         heads_out,
         base_q,
         base_k,
@@ -418,6 +422,7 @@ def run_chain_prologue(
     unit_chunks,
     b_t,
     length_rule,
+    length_rule_piece_tokens,
     heads_out,
     series_span_tokens=0,
     checkpoint_every_n_tokens=0,
@@ -474,6 +479,7 @@ def run_chain_prologue(
             int(unit_chunks),
             int(b_t),
             bool(length_rule),
+            int(length_rule_piece_tokens),
             cutlass.Int32(int(heads_out)),
             cutlass.Int32(series_span_chunks),
             cutlass.Int32(checkpoint_every_n_tokens),
