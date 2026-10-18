@@ -354,7 +354,7 @@ def compute_warp_group(
         steep_last_ptr = sSteepLast.data_ptr()
         if cutlass.const_expr(cfg.gate_dtype == cutlass.Float32):
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-        steep_word = encode_gate_exchange(
+        encode_gate_exchange(
             cfg,
             prefix_acc,
             sK_ptr,
@@ -1035,7 +1035,9 @@ def frost_kda_prep(
     sW_raw = cutlass.Array(cfg.io_dtype, RECS * cfg.d_k * cfg.b_t, space=SMEM, alignment=cfg.buffer_align_bytes)
     # steep key channels (common/kda_decay.py): the scan's ballot words, last-token log2 gates, k inverse norms and the
     # KK / A corrections of the CTA's current item
-    sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scratch.scan.elements, space=SMEM, alignment=16)
+    # Static direct selection no longer stores scan ballots; this legacy
+    # pointer argument is never dereferenced.
+    sSteepScan = sBetaG_raw
     sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_scratch.last.elements, space=SMEM, alignment=16)
     sSteepNorm = cutlass.Array(cutlass.Float32, cfg.steep_scratch.norm.elements, space=SMEM, alignment=16)
     sSteepCorr = cutlass.Array(cutlass.Float32, cfg.steep_scratch.corr.elements, space=SMEM, alignment=16)

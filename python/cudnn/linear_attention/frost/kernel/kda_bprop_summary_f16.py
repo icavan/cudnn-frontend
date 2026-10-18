@@ -1065,7 +1065,7 @@ def compute0_warp_group(
                     exp_g_last = exp_g1
                 steep_scan_ptr = sSteepScan_ptr + raw_stage * len(cfg.compute_group_0_warp_ids)
                 steep_last_ptr = sSteepLast_ptr + raw_stage * cfg.d_k
-                channel_steep, steep_word = classify_steep_channel(cfg, prefix_acc, sK_ptr, channel_dim, channel_rows, mSteepSlot, lane_idx)
+                channel_steep, _ = classify_steep_channel(cfg, prefix_acc, sK_ptr, channel_dim, channel_rows, mSteepSlot, lane_idx)
             else:
                 gate_conditioned = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
                 g_prefix_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
@@ -1107,7 +1107,7 @@ def compute0_warp_group(
                 # prefix, so the last row holds its minimum) ----
                 steep_scan_ptr = sSteepScan_ptr + raw_stage * len(cfg.compute_group_0_warp_ids)
                 steep_last_ptr = sSteepLast_ptr + raw_stage * cfg.d_k
-                steep_word = encode_gate_exchange(
+                encode_gate_exchange(
                     cfg,
                     prefix_acc,
                     sK_ptr,
@@ -1136,9 +1136,6 @@ def compute0_warp_group(
             # ---- decay scale: exp2(g last) per key channel ---------------------------
             if channel_active:
                 (sDecay_scale_ptr + channel_dim).store(exp_g_last)
-            if cutlass.const_expr(has_exact_path(cfg)):
-                if lane_idx == 0:
-                    (sSteepTile_ptr + decay_stage * len(cfg.compute_group_0_warp_ids) + cg0_warp).store(steep_word)
             bars.mb_decay_scale_ready[decay_stage].arrive()
 
             nvvm.barrier_cta_sync(cfg.cg0_sync_barrier_id, thread_count=cfg.cg0_threads)
@@ -1854,13 +1851,11 @@ def frost_kda_bprop_summary(
     sDo_raw = cutlass.Array(cfg.io_dtype, cfg.raw_v_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sSteepCorr = cutlass.Array(cutlass.Float32, cfg.steep_scratch.corr.elements, space=SMEM, alignment=16)
     sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_scratch.last.elements, space=SMEM, alignment=16)
-    sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scratch.scan.elements, space=SMEM, alignment=16)
-    sSteepTile = cutlass.Array(cutlass.Int32, cfg.steep_scratch.tile.elements, space=SMEM, alignment=16)
     sSteepNorm = cutlass.Array(cutlass.Float32, cfg.steep_scratch.norm.elements, space=SMEM, alignment=16)
     sSteepCorr_ptr = sSteepCorr.data_ptr()
     sSteepLast_ptr = sSteepLast.data_ptr()
-    sSteepScan_ptr = sSteepScan.data_ptr()
-    sSteepTile_ptr = sSteepTile.data_ptr()
+    sSteepScan_ptr = sScheduler.data_ptr()
+    sSteepTile_ptr = sScheduler.data_ptr()
     sSteepNorm_ptr = sSteepNorm.data_ptr()
     sQ_raw = cutlass.Array(cfg.io_dtype, cfg.raw_qk_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sK_raw = cutlass.Array(cfg.io_dtype, cfg.raw_qk_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)

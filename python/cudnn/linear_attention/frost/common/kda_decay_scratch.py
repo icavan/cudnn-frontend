@@ -57,7 +57,8 @@ def steep_scratch_layout(
     corr = region(decay_stages * 2 * b_t * b_t)
     dadm = region(dadm_stages * 2 * b_t * b_t, io_bytes)
     last = region(last_stages * d_k)
-    scan = region(scan_stages * scan_warps)
-    tile = region(decay_stages * scan_warps)
+    # Direct-vs-factorized selection is static; no per-tile ballot metadata.
+    scan = region(0)
+    tile = region(0)
     norm = region(norm_stages * b_t)
     return SteepScratchLayout(corr, dadm, last, scan, tile, norm, (offset + 15) // 16 * 16)

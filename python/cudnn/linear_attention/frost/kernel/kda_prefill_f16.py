@@ -1180,7 +1180,7 @@ def compute0_warp_group(
             steep_scan_stage = (local_chunk_idx // cfg.cg0_group_count) % 2
             steep_scan_ptr = sSteepScan.data_ptr() + (cg0_group_id * 2 + steep_scan_stage) * cfg.cg0_warps_per_group
             steep_last_ptr = sSteepLast.data_ptr() + cg0_group_id * cfg.d_k
-            steep_word = encode_gate_exchange(
+            encode_gate_exchange(
                 cfg,
                 prefix_acc,
                 sK_ptr,
@@ -1346,10 +1346,7 @@ def compute0_warp_group(
                 (sK_decay_ptr + decay_swizzled_idx).store(k_decay_vec, alignment=16)
 
             flag_inverse_max(cfg, inverse_max, mSteepSlot, lane_idx)
-            # ---- steep key channels: publish the tile flags, exact KK / A corrections ---------
-            if cutlass.const_expr(has_exact_path(cfg)):
-                if lane_idx == 0:
-                    (sSteepTile.data_ptr() + decay_stage * cfg.cg0_warps_per_group + cg0_local_warp).store((steep_scan_ptr + cg0_local_warp).load())
+            # ---- direct key channels: exact KK / A tiles -------------------------------
             if steep_any == 0:
                 nvvm.fence_proxy("async.shared", space="cta")
                 bars.mb_k_decay_inv_cg0_ready[decay_stage].arrive()
@@ -2626,10 +2623,12 @@ def frost_kda_prefill(
     bars = make_bars(cfg)
     tmem_base_slot = cutlass.Array(cutlass.Int32, 1, space=SMEM, alignment=4)
     sScheduler = cutlass.Array(cutlass.Int32, cfg.scheduler_stages, space=SMEM, alignment=16)
-    sSteepScan = cutlass.Array(cutlass.Int32, cfg.steep_scratch.scan.elements, space=SMEM, alignment=16)
+    # Direct-vs-factorized is a compile-time specialization.  Legacy scan/tile
+    # pointer parameters alias scheduler storage but are never dereferenced.
+    sSteepScan = sScheduler
     sSteepLast = cutlass.Array(cutlass.Float32, cfg.steep_scratch.last.elements, space=SMEM, alignment=16)
     sSteepNorm = cutlass.Array(cutlass.Float32, cfg.steep_scratch.norm.elements, space=SMEM, alignment=16)
-    sSteepTile = cutlass.Array(cutlass.Int32, cfg.steep_scratch.tile.elements, space=SMEM, alignment=16)
+    sSteepTile = sScheduler
     sSteepCorr = cutlass.Array(cutlass.Float32, cfg.steep_scratch.corr.elements, space=SMEM, alignment=16)
     sK_decay_raw = cutlass.Array(cfg.io_dtype, cfg.k_decay_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)
     sQ_decay_raw = cutlass.Array(cfg.io_dtype, cfg.q_decay_cosize, space=SMEM, alignment=cfg.buffer_align_bytes)

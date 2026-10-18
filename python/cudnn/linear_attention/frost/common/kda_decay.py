@@ -167,16 +167,15 @@ def flag_inverse_max(cfg: cutlass.Constexpr, maximum, flag_slot, lane_idx):
 
 @cute.jit
 def classify_steep_channel(cfg: cutlass.Constexpr, prefix, raw_k_ptr, channel, channel_rows: cutlass.Constexpr, flag_slot, lane_idx):
-    """Mark every channel in a direct-interval plan and mask duplicate lanes."""
-    channel_steep = cutlass.Boolean(False)
+    """Return the compile-time direct-path channel mask.
+
+    Direct plans cover every channel; bounded plans compile all consumers of
+    this value away.  Do not issue a runtime ballot for a static property.
+    """
     if cutlass.const_expr(uses_direct_decay(cfg)):
-        channel_steep = cutlass.Boolean(True)
-    word = cutlass.Int32(0)
-    if cutlass.const_expr(uses_direct_decay(cfg)):
-        word = cutlass.Int32(nvvm.vote_sync(0xFFFFFFFF, channel_steep, nvvm.VoteSync.BALLOT))
-    if cutlass.const_expr(channel_rows < cfg.threads_per_warp):
-        word = word & cutlass.Int32((1 << channel_rows) - 1)
-    return channel_steep, word
+        valid = (1 << min(channel_rows, cfg.threads_per_warp)) - 1
+        return cutlass.Boolean(True), cutlass.Int32(valid)
+    return cutlass.Boolean(False), cutlass.Int32(0)
 
 
 @cute.jit
@@ -203,14 +202,10 @@ def encode_gate_exchange(
     """
     channel_steep, word = classify_steep_channel(cfg, prefix, raw_k_ptr, channel, channel_rows, flag_slot, lane_idx)
     if cutlass.const_expr(has_exact_path(cfg)):
-        if lane_idx == 0:
-            (words_ptr + scan_warp).store(word)
-        if word != 0:
-            if channel_steep:
-                # DK=64 duplicates scan lanes to transpose two row halves. The
-                # final prefix has one cell per channel, not per half.
-                if channel_active and lane_idx < cutlass.Int32(channel_rows):
-                    (log_last_ptr + channel).store(values[cfg.b_t - 1])
+        if channel_active and lane_idx < cutlass.Int32(channel_rows):
+            # DK=64 duplicates scan lanes to transpose two row halves. The
+            # final prefix has one cell per channel, not per half.
+            (log_last_ptr + channel).store(values[cfg.b_t - 1])
     for row in cutlass.range_constexpr(cfg.b_t):
         prefix_log = values[row]
         if cutlass.const_expr(exponentiate):
@@ -223,31 +218,20 @@ def encode_gate_exchange(
 
 @cute.jit
 def steep_tile_mask(cfg: cutlass.Constexpr, words_ptr):
-    """Read the tile's scan-warp ballots; every direct-path channel is set."""
-    mask = cutlass.Int32(0)
-    if cutlass.const_expr(has_exact_path(cfg)):
-        mask = (words_ptr.load() | (words_ptr + 1).load()) | ((words_ptr + 2).load() | (words_ptr + 3).load())
-    return mask
+    """Return whether this compile-time specialization uses direct intervals."""
+    return cutlass.Int32(1 if has_exact_path(cfg) else 0)
 
 
 @cute.jit
 def lane_steep_bits(cfg: cutlass.Constexpr, words_ptr, lane_in_row_group, channel_rows: cutlass.Constexpr[int]):
-    """The steep channels a row-stage lane owns: bit ``h * 8 + j`` is channel ``h * 64 + lane_in_row_group * 8 + j``.
-
-    ``words_ptr`` holds one ballot word per scan warp; channel ``c`` is bit ``c % channel_rows`` of word
-    ``c // channel_rows``."""
-    bits = cutlass.Int32(0)
-    for dim_half in cutlass.range_constexpr(cfg.d_k // 64):
-        first = dim_half * 64 + lane_in_row_group * 8
-        word = (words_ptr + first // channel_rows).load()
-        bits = bits | (((word >> (first % channel_rows)) & 0xFF) << (dim_half * 8))
-    return bits
+    """Return all channel bits owned by a row-stage lane in a direct plan."""
+    return cutlass.Int32((1 << (cfg.d_k // 8)) - 1 if has_exact_path(cfg) else 0)
 
 
 @cute.jit
 def steep_channel_bit(words_ptr, channel, channel_rows: cutlass.Constexpr[int]):
-    """1 if ``channel`` is steep in the ballot words at ``words_ptr`` (one word per scan warp of ``channel_rows`` channels), else 0."""
-    return ((words_ptr + channel // channel_rows).load() >> (channel % channel_rows)) & 1
+    """Every channel reaching this helper belongs to the direct specialization."""
+    return cutlass.Int32(1)
 
 
 @cute.jit
@@ -290,7 +274,7 @@ def gradient_operand_scales(cfg: cutlass.Constexpr, channel_steep, row, channel,
     decay = value
     inverse = cutlass.Float32(0.0)
     restore = cutlass.Float32(0.0)
-    if channel_steep != 0:
+    if cutlass.const_expr(uses_direct_decay(cfg)):
         decay = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
         restore = steep_restore_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
     else:
@@ -310,11 +294,10 @@ def row_operand_scales(cfg: cutlass.Constexpr, bits, reg_idx, row, channel, valu
     decay = value
     inverse = cute.math.rcp(value, approx=True, ftz=True)
     restore_multiplier = last_value
-    if cutlass.const_expr(has_exact_path(cfg)):
-        if ((bits >> reg_idx) & 1) != 0:
-            decay = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
-            inverse = steep_restore_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
-            restore_multiplier = cutlass.Float32(1.0)
+    if cutlass.const_expr(uses_direct_decay(cfg)):
+        decay = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
+        inverse = steep_restore_scale(cfg, exchange_ptr, log_last_ptr, row, channel)
+        restore_multiplier = cutlass.Float32(1.0)
     return decay, inverse, restore_multiplier
 
 
@@ -357,25 +340,24 @@ def steep_row_corrections(
         kk_regs[source_row] = cutlass.Float32(0.0)
         attn_regs[source_row] = cutlass.Float32(0.0)
     for j in cutlass.range(cfg.d_k // 64 * 8, unroll=1):
-        if ((bits >> j) & 1) != 0:
-            channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
-            x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
-            if cutlass.const_expr(with_a):
-                z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
-            for step in cutlass.range_constexpr(cfg.b_t):
-                source_row = cfg.b_t - 1 - step
-                if source_row <= row:
-                    interval = cutlass.Float32(0.0)
-                    if source_row < row:
-                        interval = steep_interval_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, row + 1, channel)
-                    k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
-                    if cutlass.const_expr(k_norm_ptr is not None):
-                        k_s = k_s * (k_norm_ptr + source_row).load()
-                    k_decayed = k_s * cute.math.exp2(interval, fastmath=True)
-                    if source_row < row:
-                        kk_regs[source_row] = kk_regs[source_row] + x * k_decayed
-                    if cutlass.const_expr(with_a):
-                        attn_regs[source_row] = attn_regs[source_row] + z * k_decayed
+        channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
+        x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
+        if cutlass.const_expr(with_a):
+            z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
+        for step in cutlass.range_constexpr(cfg.b_t):
+            source_row = cfg.b_t - 1 - step
+            if source_row <= row:
+                interval = cutlass.Float32(0.0)
+                if source_row < row:
+                    interval = steep_interval_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, row + 1, channel)
+                k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
+                if cutlass.const_expr(k_norm_ptr is not None):
+                    k_s = k_s * (k_norm_ptr + source_row).load()
+                k_decayed = k_s * cute.math.exp2(interval, fastmath=True)
+                if source_row < row:
+                    kk_regs[source_row] = kk_regs[source_row] + x * k_decayed
+                if cutlass.const_expr(with_a):
+                    attn_regs[source_row] = attn_regs[source_row] + z * k_decayed
     for source_row in cutlass.range_constexpr(cfg.b_t):
         kk = kk_regs[source_row]
         attn = attn_regs[source_row]
@@ -408,25 +390,23 @@ def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
 
 
 @cute.jit
-def steep_grad_corrections(cfg: cutlass.Constexpr, channel, t, scale, exchange_ptr, log_last_ptr, raw_q_ptr, raw_k_ptr, q_norm_ptr, k_norm_ptr, dadm_ptr):
-    """The backward's intra-tile terms of steep channel ``channel`` at token ``t`` (bprop compute group 2).
+def direct_grad_terms(cfg: cutlass.Constexpr, channel, t, scale, exchange_ptr, log_last_ptr, raw_q_ptr, raw_k_ptr, q_norm_ptr, k_norm_ptr, dadm_ptr):
+    """The direct path's complete intra-tile gradients for one channel and token.
 
     ``dadm_ptr`` holds the chunk's strict-lower dA and dM tiles, ``[2, BT, BT]`` in the io dtype, exactly as the
     tcgen05 GEMMs read them.  With ``F(t, s) = 2^(g[t] - g[s])`` and ``K inv[s] = k_n[s] * 2^(g[BT - 1] - g[s])``
-    rounded to the io dtype (the steep column of the K inv operand), forms
+    forms
 
-        dq_attn  = sum_{s<t} dA[t, s] k_n[s] F(t, s)          dq_mma  = sum_{s<t} dA[t, s] K inv[s]
-        dkd_attn = sum_{s<t} dM[t, s] k_n[s] F(t, s)          dkd_mma = sum_{s<t} dM[t, s] K inv[s]
+        dq_attn  = sum_{s<t} dA[t, s] k_n[s] F(t, s)
+        dk_decay = -sum_{s<t} dM[t, s] k_n[s] F(t, s)
         dk_inv   = sum_{s>t} (scale q_n[s] dA[s, t] - k_n[s] dM[s, t]) F(s, t)
 
-    every exponent of F at most 0. ``*_mma`` are the steep column's products that the dQ attn and dK decay GEMMs
-    already accumulated. Return the dQ correction, the inverse-side dK term and the
-    decay-side dK correction (also used for dgate). Callers only map these onto their register layouts;
-    they add the two dK terms in their original accumulation order."""
+    Every exponent of F is at most zero.  The direct specialization skips the
+    four factorized intra-tile Tensor-Core GEMMs, so this helper returns the
+    complete terms, not corrections against work that was already done.
+    Callers add the two dK terms in their original accumulation order."""
     dq_attn = cutlass.Float32(0.0)
-    dq_mma = cutlass.Float32(0.0)
     dkd_attn = cutlass.Float32(0.0)
-    dkd_mma = cutlass.Float32(0.0)
     dk_inv = cutlass.Float32(0.0)
     tile = cutlass.const_expr(cfg.b_t * cfg.b_t)
     for s in cutlass.range(cfg.b_t, unroll=1):
@@ -435,14 +415,11 @@ def steep_grad_corrections(cfg: cutlass.Constexpr, channel, t, scale, exchange_p
             if cutlass.const_expr(cfg.l2norm):
                 k_s = k_s * (k_norm_ptr + s).load()
             if s < t:
-                k_inv_s = (k_s * steep_restore_scale(cfg, exchange_ptr, log_last_ptr, s, channel)).to(cfg.io_dtype).to(cutlass.Float32)
                 decay = cute.math.exp2(steep_interval_log(cfg, exchange_ptr, log_last_ptr, s + 1, t + 1, channel), fastmath=True)
                 da = (dadm_ptr + t * cfg.b_t + s).load().to(cutlass.Float32)
                 dm = (dadm_ptr + tile + t * cfg.b_t + s).load().to(cutlass.Float32)
                 dq_attn = dq_attn + da * (k_s * decay)
-                dq_mma = dq_mma + da * k_inv_s
                 dkd_attn = dkd_attn + dm * (k_s * decay)
-                dkd_mma = dkd_mma + dm * k_inv_s
             else:
                 q_s = (raw_q_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
                 if cutlass.const_expr(cfg.l2norm):
@@ -451,10 +428,7 @@ def steep_grad_corrections(cfg: cutlass.Constexpr, channel, t, scale, exchange_p
                 da = (dadm_ptr + s * cfg.b_t + t).load().to(cutlass.Float32)
                 dm = (dadm_ptr + tile + s * cfg.b_t + t).load().to(cutlass.Float32)
                 dk_inv = dk_inv + ((q_s * scale) * da - (k_s) * dm) * decay
-    exp_t = steep_decay_scale(cfg, exchange_ptr, log_last_ptr, t, channel)
-    dq_delta = scale * (dq_attn - exp_t * dq_mma)
-    dkd_delta = exp_t * dkd_mma - dkd_attn
-    return dq_delta, dk_inv, dkd_delta
+    return scale * dq_attn, dk_inv, -dkd_attn
 
 
 @cute.jit
@@ -467,12 +441,9 @@ def pack_dstate_operand(cfg: cutlass.Constexpr, original, decayed, first_channel
     operand = cutlass.Array(cutlass.Float32, 32, alignment=16)
     for channel in cutlass.range_constexpr(32):
         operand[channel] = decayed[channel]
-    if cutlass.const_expr(has_exact_path(cfg)):
-        if steep_any != 0:
-            steep_rows = cutlass.const_expr(cfg.d_k // len(cfg.compute_group_0_warp_ids))
-            for channel in cutlass.range_constexpr(32):
-                if steep_channel_bit(words_ptr, first_channel + channel, steep_rows) != 0:
-                    operand[channel] = original[channel]
+    if cutlass.const_expr(uses_direct_decay(cfg)):
+        for channel in cutlass.range_constexpr(32):
+            operand[channel] = original[channel]
     packed = cutlass.Array(cutlass.Int32, 16, alignment=16)
     for pc in cutlass.range_constexpr(16):
         packed[pc] = fp32_to_fp16(operand[2 * pc], operand[2 * pc + 1], dtype=cfg.io_dtype)
