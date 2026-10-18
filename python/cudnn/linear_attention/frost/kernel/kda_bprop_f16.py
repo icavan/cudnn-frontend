@@ -276,7 +276,13 @@ def make_bars(cfg) -> KdaBpropBars:
         mb_neg_beta_dy_input_ready=MBarrier(alloc(1), try_wait=True, stages=1, init_count=CG1, producer=Producer.THREAD),
         mb_k_decay_inv_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
         mb_q_decay_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
-        mb_decay_done=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=MMA, producer=Producer.MMA_COMMIT),
+        mb_decay_done=MBarrier(
+            alloc(cfg.smem_decay_stages),
+            try_wait=True,
+            stages=cfg.smem_decay_stages,
+            init_count=MMA + (CG2 if not cfg.safe_gate else 0),
+            producer=Producer.MMA_COMMIT,
+        ),
         mb_decay_scale_ready=MBarrier(alloc(cfg.smem_decay_stages), try_wait=True, stages=cfg.smem_decay_stages, init_count=CG0, producer=Producer.THREAD),
         mb_t_inv_ready=MBarrier(
             alloc(cfg.smem_intermediate_stages), try_wait=True, stages=cfg.smem_intermediate_stages, init_count=WARP, producer=Producer.THREAD
@@ -2695,6 +2701,7 @@ def compute2_warp_group(
     sDgate_raw,
     sQ_raw,
     sK_raw,
+    sK_inv_raw,
     sSteepScan_ptr,
     sSteepLast_ptr,
     sSteepDadm_ptr,
@@ -2751,6 +2758,7 @@ def compute2_warp_group(
             chunk_start = chunk_idx * cfg.b_t
             raw_stage = chunk_serial % cfg.smem_raw_stages
             decay_stage = chunk_serial % cfg.smem_decay_stages
+            sK_inv_ptr = sK_inv_raw.data_ptr() + decay_stage * (cfg.b_t * cfg.d_k)
             has_dstate = cutlass.Boolean(rev_idx > 0)
             if cutlass.const_expr(cfg.use_dstate_in):
                 has_dstate = cutlass.Boolean(True)
@@ -3051,6 +3059,7 @@ def compute2_warp_group(
                                         steep_k_ptr,
                                         steep_q_norm_ptr,
                                         steep_k_norm_ptr,
+                                        sK_inv_ptr,
                                         steep_dadm_ptr,
                                     )
                                     dq_frag[k] = dq_frag[k] + dq_delta
@@ -3072,6 +3081,7 @@ def compute2_warp_group(
                                 steep_k_ptr,
                                 steep_q_norm_ptr,
                                 steep_k_norm_ptr,
+                                sK_inv_ptr,
                                 steep_dadm_ptr,
                             )
                             dk_delta = dk_inv + dgate_delta
@@ -3082,6 +3092,11 @@ def compute2_warp_group(
                                     dk_n[u] = dk_n[u] + dk_delta
             if steep_any != 0:
                 bars.mb_raw_done[raw_stage].arrive()
+            if cutlass.const_expr(not cfg.safe_gate):
+                # The direct backward correction reuses the rounded K-inverse
+                # operand. Join its generic readers with the MMA consumer before
+                # CG0 is allowed to overwrite this decay stage.
+                bars.mb_decay_done[decay_stage].arrive()
             bars.mb_da_diag_done[da_diag_stage].arrive()
 
             # ---- dGate finalize ------------------------------------------------------
@@ -4163,6 +4178,7 @@ def frost_kda_bprop(
             sDgate_raw,
             sQ_raw,
             sK_raw,
+            sK_inv_raw,
             sSteepScan_ptr,
             sSteepLast_ptr,
             sSteepDadm_ptr,
