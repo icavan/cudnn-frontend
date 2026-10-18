@@ -17,10 +17,14 @@
 
 """Stable interval-decay operands for KDA's 16-token tiles.
 
-The fast specialization preserves the original MMA operands and atomically
-flags unsafe channels. Its exact twin repairs only those channels with bounded
-prefix/suffix factors. Safe-gate replay sums token logs directly; non-safe
-replay follows FLA and forms intervals as ``prefix[i] - prefix[j]``.
+Safe-gate plans preserve the original MMA operands and replay only hazardous
+channels with directly summed token logs. Non-safe plans follow FLA's static
+path: they keep FP32 cumulative prefixes and form every triangular decay as
+``exp2(prefix[i] - prefix[j])`` on CUDA cores. This avoids reciprocal overflow
+and ``0 * inf`` without a data-dependent launch or host check. As in FLA, a
+prefix whose magnitude exceeds FP32's ability to retain later small increments
+can lose those increments; this path guarantees finite bounded exponentials,
+not recovery of information already rounded out of the cumulative prefix.
 
 KDA's beta is scalar and multiplies the triangular KK matrix after correction.
 The saved backward dM matrix already includes that row beta. Consequently the
@@ -56,8 +60,8 @@ def gate_scale(cfg, raw_gate: cutlass.Float32) -> cutlass.Float32:
 def scan_gate_prefixes(cfg: cutlass.Constexpr, gate_raw, chunk_start, batch_seqlen, cg0_a_log_exp, cg0_dt_bias_value):
     """Condition a channel's gates and scan in the original pairwise order.
 
-    Safe exact kernels retain token logs in ``gate_raw``. Non-safe exact kernels
-    keep cumulative prefixes. The caller owns exchange stores, scan ballots and
+    Safe exact kernels retain token logs in ``gate_raw``. Non-safe kernels keep
+    cumulative prefixes. The caller owns exchange stores, scan ballots and
     publication barriers.
     """
     g_prefix_regs = cutlass.Array(cutlass.Float32, cfg.b_t, alignment=16)
@@ -339,11 +343,12 @@ def encode_gate_exchange(
     """Classify a channel and encode its exchange registers and scan metadata.
 
     ``values`` holds log prefixes when ``exponentiate`` is true, otherwise their
-    exponentials. Safe-gate replay retains token logs; non-safe replay retains
-    cumulative prefixes, so every direct decay is one prefix subtraction and
-    one ``exp2``. The last exchange row always holds the state-decay
-    exponential. Callers own exchange stores, stage selection and publication
-    barriers; this helper never synchronizes.
+    exponentials. Safe-gate replay retains token logs so it can recover intervals
+    exactly. The static non-safe path follows FLA instead: rows 0 .. BT - 2 retain
+    cumulative prefixes and ``log_last_ptr`` retains the final prefix, so every
+    direct decay is one ``exp2(prefix[i] - prefix[j])``. The last exchange row
+    always holds the state-decay exponential. Callers own exchange stores, stage
+    selection and publication barriers; this helper never synchronizes.
     """
     channel_steep, word = classify_steep_channel(cfg, prefix, raw_k_ptr, channel, channel_rows, flag_slot, lane_idx)
     if cutlass.const_expr(has_exact_path(cfg)):
