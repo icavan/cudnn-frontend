@@ -112,8 +112,8 @@ def choose_pieces(
     ``CHAIN_MIN_UNITS_PER_PIECE``, chaining from ``CHAIN_MIN_PIECES`` (``CHAIN_MIN_PIECES_REVERSE`` for ``reverse``); the
     piece table then gives every slot the same span, ``ceil(total_chunks / (num_seqs * pieces))`` chunks, so a sequence
     fills slots in proportion to its length and an uneven batch walks the same critical path as an even one.  With
-    ``batch_invariant`` the length rule applies: ``clamp(ceil(total / LENGTH_RULE_PIECE_TOKENS), 1, CHAIN_MAX_PIECES)``
-    slots, each sequence filling ``ceil(len_b / LENGTH_RULE_PIECE_TOKENS)`` of them on device, so outputs are bitwise the
+    ``batch_invariant`` the length rule applies: ``clamp(ceil(total / length_rule_piece_tokens), 1, CHAIN_MAX_PIECES)``
+    slots, each sequence filling ``ceil(len_b / length_rule_piece_tokens)`` of them on device, so outputs are bitwise the
     same alone and in any batch; a provably one-piece batch runs uncut unless ``compose_tail`` (the summaries chain even
     then)."""
     b_t = int(b_t)
