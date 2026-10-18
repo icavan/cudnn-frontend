@@ -526,14 +526,14 @@ def steep_row_corrections(
     barrier must make all operand rows visible before this call."""
     with_a = cutlass.const_expr(raw_q_ptr is not None)
     if cutlass.const_expr(not cfg.safe_gate):
-        # Four source columns at a time retain destination operands across four
+        # Eight source columns at a time retain destination operands across eight
         # direct dots without keeping the whole 16x2 accumulator row live.
         # Every channel is direct in this specialization, so omit the ballot
         # branch while preserving each dot's channel and reduction order.
-        for source_block in cutlass.range_constexpr(cfg.b_t // 4):
-            kk_regs = cutlass.Array(cutlass.Float32, 4, alignment=16)
-            attn_regs = cutlass.Array(cutlass.Float32, 4, alignment=16)
-            for local_source in cutlass.range_constexpr(4):
+        for source_block in cutlass.range_constexpr(cfg.b_t // 8):
+            kk_regs = cutlass.Array(cutlass.Float32, 8, alignment=16)
+            attn_regs = cutlass.Array(cutlass.Float32, 8, alignment=16)
+            for local_source in cutlass.range_constexpr(8):
                 kk_regs[local_source] = cutlass.Float32(0.0)
                 attn_regs[local_source] = cutlass.Float32(0.0)
             for j in cutlass.range(cfg.d_k // 64 * 8, unroll=1):
@@ -542,8 +542,8 @@ def steep_row_corrections(
                 if cutlass.const_expr(with_a):
                     z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
                 destination_prefix = direct_prefix(cfg, exchange_ptr, log_last_ptr, row, channel)
-                for local_source in cutlass.range_constexpr(4):
-                    source_row = source_block * 4 + local_source
+                for local_source in cutlass.range_constexpr(8):
+                    source_row = source_block * 8 + local_source
                     if source_row <= row:
                         interval = destination_prefix - direct_prefix(cfg, exchange_ptr, log_last_ptr, source_row, channel)
                         k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
@@ -554,7 +554,7 @@ def steep_row_corrections(
                             kk_regs[local_source] = kk_regs[local_source] + x * k_decayed
                         if cutlass.const_expr(with_a):
                             attn_regs[local_source] = attn_regs[local_source] + z * k_decayed
-            for local_source in cutlass.range_constexpr(4):
+            for local_source in cutlass.range_constexpr(8):
                 kk = kk_regs[local_source]
                 attn = attn_regs[local_source]
                 for step in cutlass.range_constexpr(3):
@@ -563,7 +563,7 @@ def steep_row_corrections(
                     if cutlass.const_expr(with_a):
                         attn = attn + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, attn, distance, 31, kind=nvvm.Shfl.BFLY))
                 if lane_in_row_group == 0:
-                    source_row = source_block * 4 + local_source
+                    source_row = source_block * 8 + local_source
                     (corr_ptr + row * cfg.b_t + source_row).store(kk)
                     if cutlass.const_expr(with_a):
                         (corr_ptr + cfg.b_t * cfg.b_t + row * cfg.b_t + source_row).store(attn)
