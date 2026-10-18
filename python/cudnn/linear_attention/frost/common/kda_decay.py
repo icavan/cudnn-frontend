@@ -432,17 +432,6 @@ def steep_interval_log(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, start
 
 
 @cute.jit
-def steep_interval_log_reverse(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, start, end, channel):
-    """Sum ``[start, end)`` from the destination backward, preserving replay's historical order."""
-    total = cutlass.Float32(0.0)
-    for step in cutlass.range(cfg.b_t, unroll=1):
-        token = end - cutlass.Int32(1) - step
-        if token >= start:
-            total = total + steep_token_log(cfg, exchange_ptr, log_last_ptr, token, channel)
-    return total
-
-
-@cute.jit
 def steep_decay_scale(cfg: cutlass.Constexpr, exchange_ptr, log_last_ptr, row, channel):
     """A steep channel's K decay / Q decay scale on ``row``, ``exp2(g[row])``, at most 1 (may underflow to zero)."""
     if cutlass.const_expr(not cfg.safe_gate):
@@ -536,24 +525,35 @@ def steep_row_corrections(
     products and retains the historical additive correction. The row-stage
     barrier must make all operand rows visible before this call."""
     with_a = cutlass.const_expr(raw_q_ptr is not None)
+    kk_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
+    attn_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
     for source_row in cutlass.range_constexpr(cfg.b_t):
-        kk = cutlass.Float32(0.0)
-        attn = cutlass.Float32(0.0)
-        if source_row <= row:
-            for j in cutlass.range(cfg.d_k // 64 * 8, unroll=1):
-                if ((bits >> j) & 1) != 0:
-                    channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
-                    x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
-                    if cutlass.const_expr(with_a):
-                        z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
-                    interval = cutlass.Float32(0.0)
+        kk_regs[source_row] = cutlass.Float32(0.0)
+        attn_regs[source_row] = cutlass.Float32(0.0)
+    for j in cutlass.range(cfg.d_k // 64 * 8, unroll=1):
+        if ((bits >> j) & 1) != 0:
+            channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
+            x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
+            if cutlass.const_expr(cfg.safe_gate):
+                x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
+            if cutlass.const_expr(with_a):
+                z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
+                if cutlass.const_expr(cfg.safe_gate):
+                    z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
+            interval = cutlass.Float32(0.0)
+            destination_prefix = cutlass.Float32(0.0)
+            if cutlass.const_expr(not cfg.safe_gate):
+                destination_prefix = direct_prefix(cfg, exchange_ptr, log_last_ptr, row, channel)
+            # Safe replay grows an interval backward without subtracting
+            # prefixes. Non-safe follows FLA and subtracts cumulative prefixes.
+            for step in cutlass.range_constexpr(cfg.b_t):
+                source_row = cfg.b_t - 1 - step
+                if source_row <= row:
                     if source_row < row:
                         if cutlass.const_expr(cfg.safe_gate):
-                            interval = steep_interval_log_reverse(cfg, exchange_ptr, log_last_ptr, source_row + 1, row + 1, channel)
+                            interval = interval + steep_token_log(cfg, exchange_ptr, log_last_ptr, source_row + 1, channel)
                         else:
-                            interval = direct_prefix(cfg, exchange_ptr, log_last_ptr, row, channel) - direct_prefix(
-                                cfg, exchange_ptr, log_last_ptr, source_row, channel
-                            )
+                            interval = destination_prefix - direct_prefix(cfg, exchange_ptr, log_last_ptr, source_row, channel)
                     k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     if cutlass.const_expr(k_norm_ptr is not None):
                         k_s = k_s * (k_norm_ptr + source_row).load()
@@ -561,17 +561,18 @@ def steep_row_corrections(
                     if source_row < row:
                         value = x * k_decayed
                         if cutlass.const_expr(cfg.safe_gate):
-                            x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
                             k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                             value = value - x_decay * k_inv_s
-                        kk = kk + value
+                        kk_regs[source_row] = kk_regs[source_row] + value
                     if cutlass.const_expr(with_a):
                         value = z * k_decayed
                         if cutlass.const_expr(cfg.safe_gate):
-                            z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
                             k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                             value = value - z_decay * k_inv_s
-                        attn = attn + value
+                        attn_regs[source_row] = attn_regs[source_row] + value
+    for source_row in cutlass.range_constexpr(cfg.b_t):
+        kk = kk_regs[source_row]
+        attn = attn_regs[source_row]
         for step in cutlass.range_constexpr(3):
             distance = 4 >> step
             kk = kk + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, kk, distance, 31, kind=nvvm.Shfl.BFLY))
