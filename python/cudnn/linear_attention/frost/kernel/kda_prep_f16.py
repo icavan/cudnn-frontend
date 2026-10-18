@@ -647,7 +647,7 @@ def compute_warp_group(
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr((cfg.d_k // 16)):
+            for i in cutlass.range_constexpr((cfg.d_k // 16) if cfg.safe_gate else 0):
                 k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                 k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                 mma_step(
@@ -704,7 +704,7 @@ def compute_warp_group(
         for accum_idx in cutlass.range_constexpr(8):
             a_acc[accum_idx] = cutlass.Float32(0.0)
         if warp_local == 2:
-            for i in cutlass.range_constexpr((cfg.d_k // 16)):
+            for i in cutlass.range_constexpr((cfg.d_k // 16) if cfg.safe_gate else 0):
                 k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                 q_decay_frag = nvvm.ldmatrix(sQ_decay_ptr + a_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                 mma_step(

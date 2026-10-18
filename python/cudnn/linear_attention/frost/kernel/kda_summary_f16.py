@@ -343,7 +343,7 @@ def register_mma_warp(
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
 
-            for i in cutlass.range_constexpr((cfg.d_k // 16)):
+            for i in cutlass.range_constexpr((cfg.d_k // 16) if cfg.safe_gate else 0):
                 k_inv_frag = nvvm.ldmatrix(sK_inv_ptr + k_inv_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
                 k_decay_frag = nvvm.ldmatrix(sK_decay_ptr + k_decay_frag_offsets[i % 4] + (i // 4) * (cfg.b_t * 64), 4, nvvm.MMALayout.ROW)
 
