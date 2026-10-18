@@ -631,20 +631,7 @@ def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
 
 
 @cute.jit
-def steep_grad_corrections(
-    cfg: cutlass.Constexpr,
-    channel,
-    t,
-    scale,
-    exchange_ptr,
-    log_last_ptr,
-    raw_q_ptr,
-    raw_k_ptr,
-    q_norm_ptr,
-    k_norm_ptr,
-    k_inv_ptr,
-    dadm_ptr,
-):
+def steep_grad_corrections(cfg: cutlass.Constexpr, channel, t, scale, exchange_ptr, log_last_ptr, raw_q_ptr, raw_k_ptr, q_norm_ptr, k_norm_ptr, dadm_ptr):
     """The backward's intra-tile terms of steep channel ``channel`` at token ``t`` (bprop compute group 2).
 
     ``dadm_ptr`` holds the chunk's strict-lower dA and dM tiles, ``[2, BT, BT]`` in the io dtype, exactly as the
@@ -671,10 +658,7 @@ def steep_grad_corrections(
             if cutlass.const_expr(cfg.l2norm):
                 k_s = k_s * (k_norm_ptr + s).load()
             if s < t:
-                # Reuse the exact rounded operand consumed by the Tensor Core
-                # term that this correction subtracts. Reconstructing it here
-                # repeats a suffix exp2 and can drift by one io-dtype ULP.
-                k_inv_s = (k_inv_ptr + raw_offset(cfg, s, channel)).load().to(cutlass.Float32)
+                k_inv_s = (k_s * steep_restore_scale(cfg, exchange_ptr, log_last_ptr, s, channel)).to(cfg.io_dtype).to(cutlass.Float32)
                 if cutlass.const_expr(not cfg.safe_gate):
                     log_decay = direct_prefix(cfg, exchange_ptr, log_last_ptr, t, channel) - direct_prefix(cfg, exchange_ptr, log_last_ptr, s, channel)
                 else:
