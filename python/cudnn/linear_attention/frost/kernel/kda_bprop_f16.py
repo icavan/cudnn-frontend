@@ -1860,9 +1860,13 @@ def compute0_warp_group(
                     )
                     prefix0, row_pair_sum = cutlass.Float32(pair_vec[0]), cutlass.Float32(pair_vec[1])
                     prefix_acc = prefix_acc + row_pair_sum
-                    g_prefix_regs[row0] = cute.math.exp2(prefix0, fastmath=True)
-                    g_prefix_regs[row1] = cute.math.exp2(prefix_acc, fastmath=True)
-                exp_g_last = g_prefix_regs[cfg.b_t - 1]
+                    if cutlass.const_expr(cfg.safe_gate):
+                        g_prefix_regs[row0] = cute.math.exp2(prefix0, fastmath=True)
+                        g_prefix_regs[row1] = cute.math.exp2(prefix_acc, fastmath=True)
+                    else:
+                        g_prefix_regs[row0] = prefix0
+                        g_prefix_regs[row1] = prefix_acc
+                exp_g_last = cute.math.exp2(prefix_acc, fastmath=True)
 
                 # ---- steep channels: an in-tile log2 prefix below the steep threshold (a gate in (0, 1] never raises the
                 # prefix, so the last row holds its minimum) ----
@@ -1881,7 +1885,7 @@ def compute0_warp_group(
                     g_prefix_regs,
                     steep_scan_ptr,
                     steep_last_ptr,
-                    False,
+                    not cfg.safe_gate,
                     channel_active,
                 )
 
