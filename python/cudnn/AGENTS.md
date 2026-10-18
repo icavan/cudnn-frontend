@@ -783,11 +783,11 @@ absent and coarse checkpoints. Use a representable steep interval (for example,
 gates is finiteness-only: rounded FP32 prefixes can no longer retain those later
 increments, matching FLA's non-safe contract.
 Detector: `linear_attention/test_kda_steep_decay.py`. Never repair this with gate
-clipping or `nan_to_num`. Non-safe KDA follows FLA statically: materialize each
-FP32 token decay once and multiply only factors in the causal QK/KK interval on
-CUDA cores in the original forward/backward launch, without a fast trial or
-replay. Safe-gate plans may still use a device-flagged exact replay. That replay
-must not reread a mutated
+clipping or `nan_to_num`. Non-safe KDA follows FLA statically: preserve FP32
+cumulative prefixes and form triangular decay as
+`exp2(prefix_destination - prefix_source)` on CUDA cores in the original
+forward/backward launch, without a fast trial or replay. Safe-gate plans may
+still use a device-flagged exact replay. That replay must not reread a mutated
 aliased state, and every shared correction tile needs publication and
 reader-to-reuse ordering, including all lanes before an elected reader releases
 its stage. Run sanitizer on forward/prep/recompute too, not only backward. The
