@@ -510,7 +510,7 @@ def epilogue_warp(
                 a_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
                 for accum_idx in cutlass.range_constexpr(8):
                     a_acc[accum_idx] = cutlass.Float32(0.0)
-                for i in cutlass.range_constexpr(cfg.d_k // 16):
+                for i in cutlass.range_constexpr(cfg.d_k // 16 if cfg.safe_gate else 0):
                     a_col = i * 16 + a_col_offset
                     a_seg = a_col // 64
                     q_decay_frag = nvvm.ldmatrix(
@@ -748,7 +748,7 @@ def register_mma_warp(
             kk_acc = cutlass.Array(cutlass.Float32, 8, alignment=16)
             for accum_idx in cutlass.range_constexpr(8):
                 kk_acc[accum_idx] = cutlass.Float32(0.0)
-            for i in cutlass.range_constexpr(cfg.d_k // 16):
+            for i in cutlass.range_constexpr(cfg.d_k // 16 if cfg.safe_gate else 0):
                 a_col = i * 16 + a_col_offset
                 a_seg = a_col // 64
                 k_decay_frag = nvvm.ldmatrix(

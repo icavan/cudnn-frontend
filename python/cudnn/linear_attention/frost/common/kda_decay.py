@@ -476,7 +476,7 @@ def steep_row_corrections(
     q_decay_ptr,
     corr_ptr,
 ):
-    """Add the steep channels' KK and A entries of tile row ``row`` to ``corr_ptr``.
+    """Form the steep channels' KK and A entries of tile row ``row`` in ``corr_ptr``.
 
     Called by all lanes of the row stage after its K inv / K decay stores.  ``bits`` is the lane's
     :func:`lane_steep_bits`; ``k_norm`` / ``q_scale`` the row's K inverse norm and Q factor (the inverse norm, times
@@ -485,11 +485,14 @@ def steep_row_corrections(
     Each row group reduces in a fixed order and one lane stores each entry, for
     ``s <= row`` and each steep channel,
 
-        A[row, s]  += q_n[row] k_n[s] 2^(g[row] - g[s]) - Q decay[row] K inv[s]
-        KK[row, s] += k_n[row] k_n[s] 2^(g[row] - g[s]) - K decay[row] K inv[s]   (s < row)
+        A[row, s]  = q_n[row] k_n[s] 2^(g[row] - g[s])
+        KK[row, s] = k_n[row] k_n[s] 2^(g[row] - g[s])   (s < row)
 
-    using the stored K decay / Q decay / K inv values for the second terms. The correction does not duplicate
-    operand rounding. The row-stage barrier must make all operand rows visible before this call."""
+    Non-safe plans mark every channel and consume these complete tiles without
+    issuing the factorized Tensor Core products. Safe-gate replay marks only
+    hazardous channels, so it subtracts those channels' already-issued MMA
+    products and retains the historical additive correction. The row-stage
+    barrier must make all operand rows visible before this call."""
     with_a = cutlass.const_expr(raw_q_ptr is not None)
     kk_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
     attn_regs = cutlass.Array(cutlass.Float32, cfg.b_t)
@@ -500,10 +503,12 @@ def steep_row_corrections(
         if ((bits >> j) & 1) != 0:
             channel = (j // 8) * 64 + lane_in_row_group * 8 + (j % 8)
             x = (raw_k_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * k_norm
-            x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
+            if cutlass.const_expr(cfg.safe_gate):
+                x_decay = (k_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
             if cutlass.const_expr(with_a):
                 z = (raw_q_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32) * q_scale
-                z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
+                if cutlass.const_expr(cfg.safe_gate):
+                    z_decay = (q_decay_ptr + raw_offset(cfg, row, channel)).load().to(cutlass.Float32)
             interval = cutlass.Float32(0.0)
             # Grow an interval backward from its destination. Never subtract prefixes.
             for step in cutlass.range_constexpr(cfg.b_t):
@@ -514,12 +519,19 @@ def steep_row_corrections(
                     k_s = (raw_k_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     if cutlass.const_expr(k_norm_ptr is not None):
                         k_s = k_s * (k_norm_ptr + source_row).load()
-                    k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
                     k_decayed = k_s * cute.math.exp2(interval, fastmath=True)
                     if source_row < row:
-                        kk_regs[source_row] = kk_regs[source_row] + (x * k_decayed - x_decay * k_inv_s)
+                        value = x * k_decayed
+                        if cutlass.const_expr(cfg.safe_gate):
+                            k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
+                            value = value - x_decay * k_inv_s
+                        kk_regs[source_row] = kk_regs[source_row] + value
                     if cutlass.const_expr(with_a):
-                        attn_regs[source_row] = attn_regs[source_row] + (z * k_decayed - z_decay * k_inv_s)
+                        value = z * k_decayed
+                        if cutlass.const_expr(cfg.safe_gate):
+                            k_inv_s = (k_inv_ptr + raw_offset(cfg, source_row, channel)).load().to(cutlass.Float32)
+                            value = value - z_decay * k_inv_s
+                        attn_regs[source_row] = attn_regs[source_row] + value
     for source_row in cutlass.range_constexpr(cfg.b_t):
         kk = kk_regs[source_row]
         attn = attn_regs[source_row]
@@ -536,7 +548,7 @@ def steep_row_corrections(
 
 @cute.jit
 def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
-    """Add a ``[BT, BT]`` fp32 correction tile to an m16n16 register-MMA accumulator fragment (8 values per lane)."""
+    """Merge a direct/correction tile into an m16n16 accumulator fragment."""
     for accum_idx in cutlass.range_constexpr(8):
         row = lane_idx // 4
         if cutlass.const_expr(accum_idx % 4 >= 2):
@@ -544,7 +556,11 @@ def add_steep_corrections(cfg: cutlass.Constexpr, acc, corr_ptr, lane_idx):
         col = (accum_idx // 4) * 8 + 2 * (lane_idx % 4)
         if cutlass.const_expr(accum_idx % 2 == 1):
             col = col + cutlass.Int32(1)
-        acc[accum_idx] = acc[accum_idx] + (corr_ptr + row * cfg.b_t + col).load()
+        value = (corr_ptr + row * cfg.b_t + col).load()
+        if cutlass.const_expr(cfg.safe_gate):
+            acc[accum_idx] = acc[accum_idx] + value
+        else:
+            acc[accum_idx] = value
     # Callers release this stage through an elected lane. Join every reader
     # before that lane can let the producer overwrite the correction tile.
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
