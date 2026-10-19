@@ -22,7 +22,7 @@ from cudnn.frost.workspace import Workspace
 from cudnn.linear_attention.frost.kda_engine import build_kda
 from cudnn.linear_attention.ops import kimi_delta_attention
 
-from linear_attention.test_la import CUDNN_DTYPE, LEAF_NAMES, make_case, thd_tensors
+from linear_attention.test_la import CUDNN_DTYPE, LEAF_NAMES, STATE_TOL, assert_state_close, make_case, random_state, reference, thd_tensors, window
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -67,6 +67,114 @@ def execute(plan, values, outputs, workspace):
     plan.run(tuple(values.values()) + tuple(outputs.values()), workspace, torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
     assert all(torch.isfinite(t).all() for t in outputs.values())
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("gate_storage", ["fp32", "io"])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("mode", ["checkpoints", "transition"])
+def test_frost_kda_recompute_persistent_replay(dtype, gate_storage, dim, mode):
+    """Direct recompute covers raw/scheduler ring wraps without unrelated backward kernels.
+
+    Run under racecheck as well as pytest: numerical parity alone cannot detect
+    missing ordering between a warp's shared accesses and its elected signal.
+    """
+    from cudnn.linear_attention.frost.common.split_k import WORK_ITEM_FIELDS
+    from cudnn.linear_attention.frost.common.thd import TENSOR_MAP_QWORDS
+    from cudnn.linear_attention.frost.kernel.kda_recompute_f16 import TENSORMAP_DESC_ARRAYS, chunk_kda_recompute
+
+    gate_dtype = torch.float32 if gate_storage == "fp32" else dtype
+    lengths = [145, 33, 17]
+    case = make_case("kda", dtype, seq_lens=lengths, H=3, K=dim, V=dim, gate_dtype=gate_dtype, seed=419)
+    # Mild safe-gate logits isolate synchronization from inverse-decay overflow.
+    case.gates["g"].copy_((torch.randn_like(case.gates["g"]) * 0.1 - 5).to(gate_dtype))
+    transition = mode == "transition"
+    if transition:
+        case.v.zero_()
+        state0 = torch.eye(dim, device="cuda").expand(case.N, case.HO, dim, dim).contiguous()
+    else:
+        state0 = random_state(case)
+    _, k, v, g, beta = thd_tensors(case)
+    final = torch.empty_like(state0)
+    rows = case.T // 16 + case.N
+    checkpoints = torch.empty((rows, case.HO, dim, dim), dtype=dtype, device="cuda") if not transition else None
+    items = torch.empty((case.N * case.HO, WORK_ITEM_FIELDS), dtype=torch.int32, device="cuda")
+    count = torch.empty(1, dtype=torch.int32, device="cuda")
+    scheduler = torch.empty(4, dtype=torch.int32, device="cuda")
+    descriptors = torch.empty(TENSORMAP_DESC_ARRAYS * case.N * TENSOR_MAP_QWORDS, dtype=torch.int64, device="cuda")
+    a_log = torch.zeros(case.HO, device="cuda")
+    dt_bias = torch.zeros((case.HO, dim), device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def call():
+        """The prologue regenerates work items and resets caller-owned schedulers."""
+        chunk_kda_recompute(
+            k,
+            v,
+            g,
+            beta,
+            case.cu,
+            None if transition else state0,
+            final,
+            checkpoint_every_n_tokens=0 if transition else 16,
+            output_state_checkpoints=checkpoints,
+            use_qk_l2norm_in_kernel=True,
+            safe_gate=True,
+            use_beta_sigmoid=True,
+            work_items=items,
+            work_count=count,
+            scheduler_counter=scheduler[:2],
+            scheduler_all=scheduler,
+            order_in_prologue=True,
+            seed_identity=transition,
+            v_is_zero=transition,
+            tensormap_workspace=descriptors,
+            device=k.device.index,
+            num_sm=1,
+            stream=stream.cuda_stream,
+        )
+
+    with torch.cuda.stream(stream):
+        call()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                call()
+            for iteration in range(2):
+                call()
+                expected_final = final.clone()
+                expected_rows = checkpoints.clone() if checkpoints is not None else None
+                ref_options = dict(initial_state=state0, l2norm=True, safe_gate=True, a_log=a_log, dt_bias=dt_bias, use_beta_sigmoid=True)
+                with torch.no_grad():
+                    _, ref_final = reference(case, **ref_options)
+                    assert_state_close("recomputed final state", final, ref_final, STATE_TOL[dtype])
+                    if checkpoints is not None:
+                        assert torch.isfinite(checkpoints).all()
+                        token_base, row_base = 0, 0
+                        for sequence, length in enumerate(lengths):
+                            num_rows = (length + 15) // 16
+                            torch.testing.assert_close(checkpoints[row_base], state0[sequence].to(dtype), rtol=0, atol=0)
+                            prefix = window(case, token_base, token_base + (num_rows - 1) * 16)
+                            _, ref_row = reference(prefix, **(ref_options | dict(initial_state=state0[sequence : sequence + 1])))
+                            assert_state_close("last checkpoint", checkpoints[row_base + num_rows - 1 : row_base + num_rows], ref_row, STATE_TOL[dtype])
+                            token_base += length
+                            row_base += num_rows
+                for _ in range(2):
+                    graph.replay()
+                    assert torch.isfinite(final).all()
+                    torch.testing.assert_close(final, expected_final, rtol=0, atol=0)
+                    if checkpoints is not None:
+                        assert torch.isfinite(checkpoints).all()
+                        torch.testing.assert_close(checkpoints, expected_rows, rtol=0, atol=0)
+                if iteration == 0:
+                    g.add_(0.25)
+                    k.mul_(0.75)
+                    case.gates["g"].copy_(g.view_as(case.gates["g"]))
+                    case.k.copy_(k.view_as(case.k))
+        finally:
+            stream.synchronize()
+            graph.reset()
 
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
