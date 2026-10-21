@@ -118,6 +118,7 @@ def uncut_forward_host(
             prep_diag,
             prep_rows,
             prep_row_count,
+            scheduler,
             stream,
         )
     else:

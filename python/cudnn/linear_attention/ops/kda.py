@@ -1282,6 +1282,16 @@ def kimi_delta_attention(
     and ``final_state`` and the state gradients (``d_final_state``,
     ``d_initial_state``) follow it.
 
+    FROST does not clip the gate. Non-safe plans follow FLA's bounded formulation
+    directly: CUDA cores form each triangular decay as
+    ``exp2(prefix_destination - prefix_source)`` in one launch, avoiding
+    reciprocal overflow and ``0 * inf`` intermediates. Safe-gate plans retain
+    their Tensor Core factorization and use a device-flagged exact replay only
+    when an inverse operand can exceed its dtype range; normalized BF16 plans
+    with the default safe-gate bound omit those checks and replay. Potentially
+    overlapping state bindings use one corrected safe-gate launch when range
+    checks are needed.
+
     Args:
         g: per-key-channel decay: log-space by default (``alpha = exp(g) in
             (0, 1]^K``), the linear decay ``alpha`` itself when

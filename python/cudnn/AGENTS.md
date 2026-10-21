@@ -772,6 +772,30 @@ The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) do
 CUDA-owning objects, GC-timed release and stream capture: Rule 8.
 
 
+## Linear-attention interval-decay checks
+
+For factorized decay operands, test the operand dtype independently of the gate
+dtype: FP16 inverse keys can overflow even with KDA's default safe-gate bound;
+BF16 can fail after a finite extreme negative log gate. Check output, final
+state and every backward gradient against an FP64 token recurrence, with saved,
+absent and coarse checkpoints. Use a representable steep interval (for example,
+`-200`) for accuracy checks. An isolated `-1e8` log-gate spike followed by mild
+gates is finiteness-only: rounded FP32 prefixes can no longer retain those later
+increments, matching FLA's non-safe contract.
+Detector: `linear_attention/test_kda_steep_decay.py`. Never repair this with gate
+clipping or `nan_to_num`. Non-safe KDA follows FLA statically: preserve FP32
+cumulative prefixes and form triangular decay as
+`exp2(prefix_destination - prefix_source)` on CUDA cores in the original
+forward/backward launch, without a fast trial or replay. Safe-gate plans may
+still use a device-flagged exact replay. That replay must not reread a mutated
+aliased state, and every shared correction tile needs publication and
+reader-to-reuse ordering, including all lanes before an elected reader releases
+its stage. Run sanitizer on forward/prep/recompute too, not only backward. The
+precision-path test covers safe-gate replay, static non-safe execution, the
+16-bit gate exchange and checkpoint seed; forced schedules cover FP32 raw-gate
+storage reused with a channel permutation. Join every raw-gate reader before
+those stores, and match publication/reuse arrive counts to actual participants.
+
 ## DSA training composition
 
 Metadata for backward and targets has two different ordering contracts. Training
