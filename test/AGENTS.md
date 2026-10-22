@@ -273,6 +273,18 @@ Device pointer-table contents remain a caller contract, not a reason for a D2H r
 
 ### fp32 operands and TF32 references
 
+For KDA local-summary precision experiments, `batch_invariant=True` does not
+mean uncut: the FROST length rule still splits sequences above 8192 tokens.
+Disable `piece_chain.choose_pieces` in the isolated benchmark harness and
+record that choice before attributing H/M errors or timings to the local
+recurrence. Do not change production routing to obtain an experimental control.
+When changing Y precision, exercise summary H/M, normal and prep-fed prefill,
+checkpoint recompute, and backward's own Y regeneration. An analytic cancellation
+case must check the small state correction itself, not a global relative error
+diluted by unchanged state entries.
+`test/python/linear_attention/frost/test_kda_fp32_residual.py` and
+`test/python/linear_attention/frost/test_kda_residual_operand.py` are the focused detectors.
+
 Blackwell MMAs have no IEEE fp32 mode: fp32 operands run as TF32. Compute their
 torch reference with `torch.backends.cuda.matmul.fp32_precision = "tf32"` set
 explicitly in the test. Torch's default depends on the environment: NGC
