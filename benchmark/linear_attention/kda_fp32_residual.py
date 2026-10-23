@@ -25,6 +25,7 @@ import torch
 
 
 def inputs(tokens, heads, dim, case, dtype=torch.bfloat16, seed=1731):
+    """Generate reproducible CPU operands and state for ordinary/long memory."""
     rng = torch.Generator(device="cpu").manual_seed(seed + tokens + dim)
     q = torch.randn(tokens, heads, dim, generator=rng)
     k = torch.randn(tokens, heads, dim, generator=rng)
@@ -54,6 +55,7 @@ def fp64_reference(cpu_values, seed):
 
 
 def error(actual, reference):
+    """Measure FP64-relative L2 and maximum absolute error of a device result."""
     a = actual.detach().double().cpu().numpy()
     r = np.asarray(reference, dtype=np.float64)
     return {
@@ -65,6 +67,7 @@ def error(actual, reference):
 
 
 def graph_time(fn, calls=4, samples=17):
+    """Time warmed GPU graph replays, retaining their outputs until reset."""
     for _ in range(3):
         warm = fn()
     torch.cuda.synchronize()
@@ -89,6 +92,7 @@ def graph_time(fn, calls=4, samples=17):
 
 
 def main():
+    """Overlay the selected source revision and save accuracy/timing evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -110,6 +114,7 @@ def main():
     choose_pieces = piece_chain.choose_pieces
 
     def uncut(**kwargs):
+        """Retain production shape facts but disable experimental piece splits."""
         return 0, choose_pieces(**kwargs)[1]
 
     # batch_invariant alone still cuts sequences longer than 8192 tokens.

@@ -14,7 +14,7 @@ if requirement_error:
 
 from cudnn.linear_attention.ops.kda import kimi_delta_attention, kimi_delta_attention_summary
 
-pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 @pytest.fixture(autouse=True)
@@ -53,11 +53,8 @@ def cancellation_inputs(dim_k, dim_v, active):
     return (q, k, v, gate, beta, cu), seed, expected
 
 
-@pytest.mark.parametrize("dims", [(64, 64), (64, 128), (128, 64), (128, 128)])
-@pytest.mark.parametrize("active", [0, 16], ids=["initial", "steady"])
-@pytest.mark.parametrize("path", ["forward", "summary"])
-@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32])
-def test_projection_residual_retains_cancellation(dims, active, path, beta_dtype):
+def assert_projection_residual(dims, active, path, beta_dtype):
+    """Check the small analytic correction without dilution by unchanged state."""
     args, seed, expected = cancellation_inputs(*dims, active)
     args = (*args[:4], args[4].to(beta_dtype), args[5])
     if path == "forward":
@@ -70,6 +67,24 @@ def test_projection_residual_retains_cancellation(dims, active, path, beta_dtype
     assert torch.count_nonzero(actual[..., 2:]) == 0
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("path", ["forward", "summary"])
+def test_projection_residual_cancellation_smoke(path):
+    """Keep one small cancellation regression per public forward/summary path."""
+    assert_projection_residual((64, 64), 0, path, torch.bfloat16)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dims", [(64, 64), (64, 128), (128, 64), (128, 128)])
+@pytest.mark.parametrize("active", [0, 16], ids=["initial", "steady"])
+@pytest.mark.parametrize("path", ["forward", "summary"])
+@pytest.mark.parametrize("beta_dtype", [torch.bfloat16, torch.float32])
+def test_projection_residual_retains_cancellation(dims, active, path, beta_dtype):
+    """Cover dtype, dimension and initial/steady-state intersections at L1."""
+    assert_projection_residual(dims, active, path, beta_dtype)
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize("dim_k", [64, 128])
 @pytest.mark.parametrize("active", [0, 16], ids=["initial", "steady"])
 def test_prep_projection_residual_retains_cancellation(monkeypatch, dim_k, active):
@@ -91,6 +106,7 @@ def test_prep_projection_residual_retains_cancellation(monkeypatch, dim_k, activ
         fprop_cache.clear()
 
 
+@pytest.mark.L1
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("safe_gate", [False, True])
 def test_backward_saved_checkpoints_and_recompute_agree(dtype, safe_gate):

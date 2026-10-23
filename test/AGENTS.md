@@ -284,6 +284,10 @@ case must check the small state correction itself, not a global relative error
 diluted by unchanged state entries.
 `test/python/linear_attention/frost/test_kda_fp32_residual.py` and
 `test/python/linear_attention/frost/test_kda_residual_operand.py` are the focused detectors.
+Keep only the two small forward/summary cancellation cells at L0; parameterized
+precision and recompute sweeps belong at L1. Direct packing probes must also
+skip unsupported devices before importing/compiling GPU DSL code: the DSL
+version check alone does not establish device eligibility.
 
 Blackwell MMAs have no IEEE fp32 mode: fp32 operands run as TF32. Compute their
 torch reference with `torch.backends.cuda.matmul.fp32_precision = "tf32"` set

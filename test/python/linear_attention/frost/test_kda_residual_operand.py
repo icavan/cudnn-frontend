@@ -6,11 +6,15 @@
 import pytest
 import torch
 
-from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_requirement_error, current_sm
 
 requirement_error = cutedsl_requirement_error("KDA residual operand tests")
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
+
+sm = current_sm()
+if sm is None or not (100 <= sm <= 103 or sm == 107):
+    pytest.skip("requires SM100 / SM103 / SM107 FROST KDA", allow_module_level=True)
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -20,7 +24,7 @@ from cutlass.cute.runtime import from_dlpack
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from cudnn.linear_attention.frost.common.kda_residual import residual_operand
 
-pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
+pytestmark = [pytest.mark.L1, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
 @cute.kernel
@@ -33,6 +37,7 @@ def residual_probe(
     has_beta: cutlass.Constexpr,
     has_projection: cutlass.Constexpr,
 ):
+    """Pack one residual pair per thread without using the full KDA pipeline."""
     index = cute.arch.thread_idx()[0] * 2
     word = fp32_to_fp16(v[index].to(cutlass.Float32), v[index + 1].to(cutlass.Float32), dtype=dtype)
     p0, p1 = None, None
@@ -60,6 +65,7 @@ def probe_host(
     has_projection: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
+    """Launch the direct packing probe on the caller's current CUDA stream."""
     residual_probe(v, p, beta, out, dtype, has_beta, has_projection).launch(grid=(1,), block=(128,), stream=stream)
 
 
@@ -68,6 +74,7 @@ def probe_host(
 @pytest.mark.parametrize("has_projection", [False, True], ids=["zero_seed", "projected"])
 @pytest.mark.parametrize("zero_v", [False, True], ids=["H", "M"])
 def test_residual_operand_precision(dtype, has_beta, has_projection, zero_v):
+    """Match FP32-then-BF16 or legacy FP16 packing for H/M operand variants."""
     generator = torch.Generator(device="cpu").manual_seed(1731)
     v = torch.randn(256, generator=generator).to(dtype)
     if zero_v:

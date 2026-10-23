@@ -29,23 +29,25 @@ Performance uses 16 heads on the same GPU, three warm calls, capture of four cal
 
 User-specified B300, CUDA 13 environment, Torch 2.12.1+cu130. Baseline commit: `473a2c8f767a4681915c7dc16b874f1877534413`. Candidate kernel hashes in the reports match the PR source. Resource inspection of the representative dumped forward/summary/recompute/backward cubins found unchanged REG/STACK/LOCAL sizes (main entry REG=128, LOCAL=0); this does not assert zero cost for the extra FP32 arithmetic.
 
-## Accuracy
+## H/M accuracy
 
-| Case | Seed | Output relative L2: old → new | H relative L2: old → new | M relative L2: old → new |
-|---|---:|---:|---:|---:|
-| standard (4096, D=64) | 1731 | 0.46878% → 0.42995% | 0.36566% → 0.32073% | negligible history; see absolute errors |
-| long_memory (32768, D=128) | 1731 | 0.23644% → 0.23554% | 0.05266% → 0.03901% | 0.02023% → 0.01859% |
-| standard (4096, D=64) | 42 | 0.47051% → 0.43230% | 0.37357% → 0.31895% | negligible history; see absolute errors |
-| long_memory (32768, D=128) | 42 | 0.23648% → 0.23569% | 0.05281% → 0.03922% | 0.02022% → 0.01867% |
-| standard (4096, D=64) | 2026 | 0.47055% → 0.43020% | 0.36216% → 0.31990% | negligible history; see absolute errors |
-| long_memory (32768, D=128) | 2026 | 0.23661% → 0.23566% | 0.05322% → 0.03865% | 0.02019% → 0.01861% |
+The tables focus on the H/M stage changed by this PR. Downstream output error also depends on query projection, gating/decay and the chosen case, so it is not used here as a proxy for H/M accuracy. Original JSON reports retain all measured diagnostics; no observations are deleted.
+
+| Case | Seed | H relative L2: old → new | M relative L2: old → new |
+|---|---:|---:|---:|
+| standard (4096, D=64) | 1731 | 0.36566% → 0.32073% | negligible history; see absolute errors |
+| long_memory (32768, D=128) | 1731 | 0.05266% → 0.03901% | 0.02023% → 0.01859% |
+| standard (4096, D=64) | 42 | 0.37357% → 0.31895% | negligible history; see absolute errors |
+| long_memory (32768, D=128) | 42 | 0.05281% → 0.03922% | 0.02022% → 0.01867% |
+| standard (4096, D=64) | 2026 | 0.36216% → 0.31990% | negligible history; see absolute errors |
+| long_memory (32768, D=128) | 2026 | 0.05322% → 0.03865% | 0.02019% → 0.01861% |
 
 H summary matched ordinary uncut forward final state bitwise in all six random cases. Across the three seeds:
 
-- 4K standard: output relative L2 falls 8.1–8.6%; H/final-state relative L2 falls 11.7–14.6%.
-- 32K long-memory: H relative L2 falls 25.7–27.4%; M relative L2 falls 7.6–8.1%; output relative L2 falls only 0.34–0.40%.
+- 4K standard: H/final-state relative L2 falls 11.7–14.6%.
+- 32K long-memory: H relative L2 falls 25.7–27.4%; M relative L2 falls 7.6–8.1%.
 - Standard-case M has reference max magnitude around 1e-28 and absolute errors around 1e-30. Its relative error is not evidence about material history preservation.
-- Improvements are not pointwise/maximum-error guarantees. For long-memory seed 1731, output max absolute error increases from 1.44366e-4 to 1.51502e-4 despite the lower L2 error.
+- L2 improvement is not a pointwise/maximum-error guarantee. For long-memory seed 1731, H maximum absolute error changes from 1.32396e-4 to 9.21678e-5 and M from 1.19114e-4 to 1.11295e-4.
 
 ## Performance
 
@@ -64,7 +66,8 @@ The 32K/256K forward cost is about 2%, summary about 1%, and the 32K backward in
 
 ## Tests and retained evidence
 
-- New focused suite: **56 passed**. Includes all four K/V=64/128 combinations, first/steady chunks, BF16/FP32 beta inputs, explicit prep-fed execution, H/M operand packing, FP16 legacy arithmetic and backward saved-checkpoint/recompute parity with/without safe gate.
+- Original focused suite: **56 passed**. Includes all four K/V=64/128 combinations, first/steady chunks, BF16/FP32 beta inputs, explicit prep-fed execution, H/M operand packing, FP16 legacy arithmetic and backward saved-checkpoint/recompute parity with/without safe gate. Review follow-up: **58 passed**, with two representative cancellation cells at L0 and the full 56-cell matrix at L1; GPU-exclusive/group markers are preserved.
+- Review RED/GREEN controls: the old files collect 56 L0 / 0 L1 cases and fail the intended selection contract; the updated files collect 2 L0 / 56 L1 cases. A host-only import tripwire verifies device eligibility before GPU DSL imports: old code fails for modeled absent/SM80/SM90/SM120 devices, while the fix skips those and admits SM100–SM103/SM107 (nine modeled conditions total, without querying real hardware).
 - Existing selected KDA tests: **28 passed, 7 skipped** (head dimensions, ragged/initial-state forward, backward gradients against FP64, affine summary, prep and checkpoint paths); not a full repository test run.
 - RED observed against the untouched baseline: the analytic correction was lost, with max absolute state error 0.001953125. New H forward and summary paths pass the 1e-7 absolute check on the correction itself.
 - An initial FP16 compiler failure in the candidate was fixed by representing absent projections as compile-time None, preserving the old zero-seed packed path instead of converting constant zero through inline PTX. The corresponding baseline and corrected-candidate FP16 test both pass.
