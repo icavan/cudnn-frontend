@@ -17,7 +17,7 @@ import torch
 
 from cudnn._torch_stream import as_torch_stream
 
-from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import H64_TOPK_BUCKETS, TopKBucketSm100
+from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import TopKBucketSm100, h64_topk_bucket_count, h64_topk_bucket_shift
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 _compile_cache: dict = {}
@@ -346,7 +346,9 @@ def sparse_attention_forward_sm100(
             )
             return out, max_logits, lse, lse_indexer
 
-        use_h64_bucket = variant == "head64_regular" and head_dim == 512 and q.dtype == torch.bfloat16 and topk_idxs.shape[1] == 2048 and indexer_topk == 0
+        use_h64_bucket = (
+            variant == "head64_regular" and head_dim in (512, 576) and q.dtype == torch.bfloat16 and topk_idxs.shape[1] == 2048 and indexer_topk == 0
+        )
         kernel_topk_idxs = topk_idxs
         kernel_topk_length = topk_length
         if use_h64_bucket:
@@ -400,7 +402,7 @@ def sparse_attention_forward_sm100(
                 )
                 if use_h64_bucket:
                     compiled_bucket = cute.compile(
-                        TopKBucketSm100(topk_idxs.shape[1], H64_TOPK_BUCKETS),
+                        TopKBucketSm100(topk_idxs.shape[1], h64_topk_bucket_count(head_dim)),
                         to_cute_tensor(topk_idxs, assumed_align=4),
                         to_cute_tensor(kernel_topk_idxs, assumed_align=4),
                         to_cute_tensor(kernel_topk_length, assumed_align=4, fully_dynamic=True),
@@ -418,7 +420,7 @@ def sparse_attention_forward_sm100(
         if use_h64_bucket:
             if not isinstance(compiled, _H64BucketedForwardArtifacts):
                 raise TypeError("the H64 locality forward requires bucket and forward launchables")
-            bucket_shift = max(0, max(kv.shape[0] - 1, 1).bit_length() - (H64_TOPK_BUCKETS.bit_length() - 1))
+            bucket_shift = h64_topk_bucket_shift(head_dim, kv.shape[0])
             with torch.cuda.nvtx.range("dsa_sparse_attention_forward_topk_bucket"):
                 compiled.bucket(
                     topk_idxs,

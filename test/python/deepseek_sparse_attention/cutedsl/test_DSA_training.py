@@ -90,15 +90,23 @@ def test_native_training_and_original_score_slots(heads, dim, sink, lengths):
 
 
 @pytest.mark.L1
-def test_h64_k2048_shared_locality_metadata_matches_reference():
+@pytest.mark.parametrize("head_dim", [512, 576])
+@pytest.mark.parametrize("kv_length", [4096, 65536, 131072])
+@pytest.mark.parametrize("empty_rows", [False, True])
+def test_h64_k2048_shared_locality_metadata_matches_reference(head_dim, kv_length, empty_rows):
     """Forward and backward use the same stable H64 locality ordering."""
     torch.manual_seed(2048)
-    q = (torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
-    kv = (torch.randn(4096, 512, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+    q = (torch.randn(2, 64, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+    kv = (torch.randn(kv_length, head_dim, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
     sink = torch.randn(64, device="cuda", dtype=torch.float32, requires_grad=True)
-    idx = torch.stack([torch.randperm(4096, device="cuda")[:2048] for _ in range(2)]).to(torch.int32)
+    idx = torch.stack([torch.randperm(kv_length, device="cuda")[:2048] for _ in range(2)]).to(torch.int32)
     idx[0, 127] = -1
+    idx[0, 128] = idx[0, 0]
+    idx[0, 129] = kv_length
     lengths = torch.tensor([2048, 1999], dtype=torch.int32, device="cuda")
+    if empty_rows:
+        lengths[0] = 0
+        idx[1].fill_(-1)
 
     q_ref = q.detach().float().requires_grad_()
     kv_ref = kv.detach().float().requires_grad_()

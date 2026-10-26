@@ -217,6 +217,20 @@ contiguous on every route: `check_support()` declines a strided tensor with
 `NotImplementedError` naming it and its strides, and `execute()` rejects one
 with `ValueError`; the plan never repacks an input.
 
+For non-deterministic contiguous BF16 H64 with `head_dim` in `{512, 576}`,
+`head_dim_v=512`, and `topk_max=2048`, SM100/SM103 uses a stable sparse-index
+locality pass before the M64/N64 backward kernel. It retains every valid active
+entry, including duplicates, and compacts invalid entries out of the active
+prefix. The regular H64 forward with `indexer_topk=0` uses the same ordering;
+caller-visible indices and score-target slots are unchanged. The pass borrows
+the preallocated output as scratch before that output is written, so prepared
+execution remains allocation-free and CUDA-graph compatible. Arithmetic types
+and numerical tolerances are unchanged. Deterministic backward keeps its
+existing route. D512 retains eight address buckets; D576 uses eight through
+64K KV and sixteen above that extent. The active bucket range is a runtime
+shift within a fixed-capacity prepass, so changing sequence lengths does not
+add a compiled-plan specialization.
+
 The SM100 H16/H32/H96 D576 specializations compile the physical row stride of
 `topk_idxs` from `topk_max`, while the query count and per-query `topk_length`
 remain dynamic. H64 and the generic/H128 D512 paths retain their existing

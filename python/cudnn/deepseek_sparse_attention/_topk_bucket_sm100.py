@@ -15,6 +15,21 @@ from cudnn._cutlass_compat import SmemAllocator
 H64_TOPK_BUCKETS = 8
 
 
+def h64_topk_bucket_count(head_dim: int) -> int:
+    """Reserve finer address bins for the larger D576 KV/gradient working set."""
+    return 16 if head_dim == 576 else H64_TOPK_BUCKETS
+
+
+def h64_topk_bucket_shift(head_dim: int, total_s_kv: int) -> int:
+    """Use eight active bins through 64K KV, then the dimension's full capacity.
+
+    Unused bins remain empty, so the sequence extent changes only a runtime
+    shift and never requires recompiling a prepared shape-dynamic plan.
+    """
+    active_buckets = h64_topk_bucket_count(head_dim) if total_s_kv > 65536 else H64_TOPK_BUCKETS
+    return max(0, max(total_s_kv - 1, 1).bit_length() - (active_buckets.bit_length() - 1))
+
+
 class TopKBucketSm100:
     """Group a fixed-width top-k row into coarse key-address buckets."""
 

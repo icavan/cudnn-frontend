@@ -344,6 +344,44 @@ supported DSL.
 |     8192 |      8192 | 1024 |  4.538 |     605.76 |
 |     8192 |      8192 | 2048 |  8.562 |     642.06 |
 
+##### SM100 H64/D576 locality pass (2026-10-26)
+
+Compared with official `NVIDIA/cudnn-frontend` commit
+`63a1e59e6f2a5d4860afbd4707cc433796ac9571`, using the same benchmark source,
+BF16, H64, Dqk576/Dv512, top-k 2048, sink enabled, full runtime top-k lengths,
+unsorted indices, and non-deterministic backward. Each process used seed 424,
+20 warmups and 100 timed calls; rows average two runs per variant in
+upstream/candidate/candidate/upstream order. Imports were checked against the
+selected source tree, not just `PYTHONPATH`. Software: torch 2.14.1+cu130,
+CuTe DSL 4.8.1, cuDNN 9.24.0. Measurements include the locality prepass and
+all backward helper kernels, without profiler instrumentation.
+
+| Q length | KV length | Upstream ms | Locality ms | Speedup | Latency reduction |
+|---------:|----------:|------------:|------------:|--------:|------------------:|
+| 4096 | 4096 | 4.9855 | 4.8190 | 1.035x | 3.34% |
+| 8192 | 65536 | 14.3247 | 10.7098 | 1.338x | 25.24% |
+| 8192 | 131072 | 15.3228 | 11.7323 | 1.306x | 23.43% |
+
+The retained kernel is M64/N64. D576 uses eight active address buckets through
+64K KV and sixteen above it; forward and backward share the stable ordering.
+Using only eight buckets at 128K KV measured 15.017 ms, so the 64K gain must
+not be extrapolated to larger working sets without retuning. D512 is unchanged.
+Arithmetic precision and reference tolerances are unchanged.
+
+For reproduction, use `benchmark --seqlens 8192 --seqlens-kv 65536 --topks 2048
+--nheads 64 --head-dim 576 --synthetic-forward --warmup 20 --repeat 100` with
+`torch.manual_seed(424)` set before running the script. `--synthetic-forward`
+isolates backward timing; separate reference-based forward/backward tests
+validate numerics. The targeted regression set passed 24 cases, including
+4K/64K/128K KV, duplicate/invalid indices, empty rows, multi-CTA execution,
+allocation-free execution, and cold CUDA-graph capture.
+
+NCU on the 64K eight-active-bucket main kernel reported no local-memory
+spilling, 49.6% L2 hit rate, and 69.6% long-scoreboard stall share. IKET on
+CTA 4096 of the 8192-query grid measured about 115 us/warp across the two
+dKV atomic ranges versus 1.8 us of MMA tail-reuse waiting. These instrumented
+diagnostics are not end-to-end timing, nor a full-grid tail distribution.
+
 #### Profiling
 
 `profile` mode runs a single warmed-up backward call (using the first value

@@ -230,7 +230,8 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_sm100_h64_bucketed_dispatch():
+@pytest.mark.parametrize("head_dim", [512, 576])
+def test_DSA_sparse_attention_backward_sm100_h64_bucketed_dispatch(head_dim):
     """Select the tuned H64 locality pipeline only inside its validated envelope."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
@@ -243,10 +244,10 @@ def test_DSA_sparse_attention_backward_sm100_h64_bucketed_dispatch():
         "max_topk": 2048,
         "device_capability": (10, 0),
     }
-    assert _select_sm100_backend(64, 512, **supported) == ("h64_m64_bucketed", 64)
-    assert _select_sm100_backend(64, 576, **supported) == ("generic_m64", 64)
-    assert _select_sm100_backend(64, 512, **{**supported, "max_topk": 1024}) == ("generic_m64", 64)
-    assert _select_sm100_backend(64, 512, **supported, deterministic=True) == ("generic_m64", 64)
+    assert _select_sm100_backend(64, head_dim, **supported) == ("h64_m64_bucketed", 64)
+    assert _select_sm100_backend(64, head_dim, **{**supported, "max_topk": 1024}) == ("generic_m64", 64)
+    assert _select_sm100_backend(64, head_dim, **{**supported, "dtype": torch.float16}) == ("generic_m64", 64)
+    assert _select_sm100_backend(64, head_dim, **supported, deterministic=True) == ("generic_m64", 64)
 
 
 @pytest.mark.L1
@@ -258,15 +259,17 @@ def test_DSA_sparse_attention_backward_sm100_h64_bucketed_dispatch():
         pytest.param(False, True, id="invalid-holes-no-length"),
     ],
 )
-def test_DSA_sparse_attention_backward_sm100_h64_bucketed_matches_reference(has_topk_length, invalid_holes):
+@pytest.mark.parametrize("head_dim", [512, 576])
+@pytest.mark.parametrize("s_q,s_kv", [(2, 2048), (149, 65536)])
+def test_DSA_sparse_attention_backward_sm100_h64_bucketed_matches_reference(has_topk_length, invalid_holes, head_dim, s_q, s_kv):
     """Exercise locality bucketing and paired reducers with runtime top-k tails."""
     _require_sm100()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         64,
-        512,
+        head_dim,
         2048,
-        s_q=2,
-        s_kv=2048,
+        s_q=s_q,
+        s_kv=s_kv,
         has_topk_length=has_topk_length,
         invalid_holes=invalid_holes,
     )
@@ -1474,6 +1477,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster4_fp16():
         pytest.param(32, 576, 64, torch.bfloat16, False, "h32_m64", id="h32"),
         pytest.param(64, 512, 64, torch.bfloat16, False, "generic_m64", id="generic"),
         pytest.param(64, 512, 2048, torch.bfloat16, False, "h64_m64_bucketed", id="h64-bucketed"),
+        pytest.param(64, 576, 2048, torch.bfloat16, False, "h64_m64_bucketed", id="h64-d576-bucketed"),
         pytest.param(96, 576, 64, torch.bfloat16, False, "h96_h64_h32", id="h96"),
         pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
         pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),

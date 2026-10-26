@@ -12,7 +12,7 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
-from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import H64_TOPK_BUCKETS
+from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import h64_topk_bucket_count, h64_topk_bucket_shift
 from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
 
 from ._interface_sm100_common import (
@@ -165,7 +165,7 @@ def _select_sm100_backend(
         return "h32_m64", 64
     if (
         num_heads == 64
-        and head_dim == 512
+        and head_dim in (512, 576)
         and head_dim_v == 512
         and dtype == torch.bfloat16
         and max_topk == 2048
@@ -472,7 +472,7 @@ def _compile_nondeterministic_sm100(
     lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
     with torch.cuda.device(device_index):
         bucket = cute.compile(
-            TopKBucketSm100(max_topk, H64_TOPK_BUCKETS),
+            TopKBucketSm100(max_topk, h64_topk_bucket_count(head_dim)),
             indices,
             bucketed,
             bucketed_lengths,
@@ -809,7 +809,7 @@ def flash_attn_bwd_sm100(
             (topk_row_stride,),
             max_topk,
         )
-        bucket_shift = max(0, max(total_S_kv - 1, 1).bit_length() - (H64_TOPK_BUCKETS.bit_length() - 1))
+        bucket_shift = h64_topk_bucket_shift(head_dim, total_S_kv)
         with torch.cuda.nvtx.range("flash_attn_bwd_sm100_topk_bucket"):
             compiled_kernel.bucket(
                 topk_idxs,
