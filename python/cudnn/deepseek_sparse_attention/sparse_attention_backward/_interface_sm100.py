@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 import math
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -12,7 +12,9 @@ import cutlass.cute as cute
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import device_capability as _device_capability, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import H64_TOPK_BUCKETS
 from cudnn.frost.buffers import cutedsl_requirement_error, memset_zero_async
+
 from ._interface_sm100_common import (
     _BLACKWELL_CAPABILITIES,
     _align_workspace_bytes,
@@ -40,6 +42,14 @@ _SM100_FAMILY_ARCH_FLAGS = {
 }
 _DETERMINISTIC_HEAD_COUNTS = (16, 32, 64, 96, 128)
 _STATIC_TOPK_STRIDE_BACKENDS = ("h16_m128", "h32_m64", "h96_h64_h32", "h96_d576_2cta_m64")
+_H64_BUCKET_BACKEND = "h64_m64_bucketed"
+
+
+class _H64BucketArtifacts(NamedTuple):
+    """Precompiled locality transform and N64 backward launchables."""
+
+    bucket: object
+    backward: object
 
 
 def _sm100_gpu_arch_flag(device_capability: Tuple[int, int]) -> str:
@@ -162,7 +172,7 @@ def _select_sm100_backend(
         and device_capability in _BLACKWELL_CAPABILITIES
         and is_contiguous
     ):
-        return "h64_m64n32_2stage", 64
+        return _H64_BUCKET_BACKEND, 64
     return "generic_m64", 64
 
 
@@ -243,7 +253,9 @@ def _compile_sm100_artifact(
     *,
     kernel_cls,
     block_tile: int,
-    kv_tile: int,
+    kv_tile: Optional[int],
+    assume_valid_topk: bool,
+    topk_row_stride: Optional[int],
     dkv_planes: int,
     wide_addressing: bool,
 ):
@@ -256,7 +268,10 @@ def _compile_sm100_artifact(
         dout = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim_v)
         lse = _fake_runtime_tensor(cutlass.Float32, 2, alignment=8)
         sink = _fake_runtime_tensor(cutlass.Float32, 1)
-        lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
+        if has_topk_length and topk_row_stride is not None:
+            lengths = cute.runtime.make_fake_tensor(cutlass.Int32, (cute.sym_int(),), (topk_row_stride,), assumed_align=4)
+        else:
+            lengths = _fake_runtime_tensor(cutlass.Int32, 1, alignment=4) if has_topk_length else None
         dq = _fake_runtime_tensor(element_dtype, 3, divisibility=head_dim)
         dkv = _fake_runtime_tensor(element_dtype, 2, divisibility=head_dim)
         d_sink = _fake_runtime_tensor(cutlass.Float32, 1)
@@ -265,7 +280,10 @@ def _compile_sm100_artifact(
         indices = cute.runtime.make_fake_tensor(
             cutlass.Int32,
             (cute.sym_int(), max_topk),
-            (cute.sym_int64(divisibility=max(max_topk, 1)), 1),
+            (
+                topk_row_stride if topk_row_stride is not None else cute.sym_int64(divisibility=max(max_topk, 1)),
+                1,
+            ),
             assumed_align=16,
         )
     else:
@@ -275,25 +293,40 @@ def _compile_sm100_artifact(
         dout = out
         lse = _fake_compact_tensor(cutlass.Float32, (total_s_q, num_heads), alignment=8)
         sink = _fake_compact_tensor(cutlass.Float32, (num_heads,))
-        lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+        if has_topk_length and topk_row_stride is not None:
+            lengths = cute.runtime.make_fake_tensor(cutlass.Int32, (total_s_q,), (topk_row_stride,), assumed_align=4)
+        else:
+            lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
         dq, dkv, d_sink = q, kv, sink
         workspace_lse = _fake_compact_tensor(cutlass.Uint8, (1, num_heads, cute.sym_int(), 8))
         workspace_dkv = _fake_compact_tensor(cutlass.Uint8, (1, dkv_planes, cute.sym_int(), head_dim * 4))
-        indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+        if topk_row_stride is None:
+            indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+        else:
+            indices = cute.runtime.make_fake_tensor(
+                cutlass.Int32,
+                (total_s_q, max_topk),
+                (topk_row_stride, 1),
+                assumed_align=16,
+            )
     problem_shape = (
         cutlass.Int32(1),
         cutlass.Int32(1),
         cutlass.Int32(head_dim),
         (cutlass.Int32(num_heads), cutlass.Int32(1)),
     )
-    kernel = kernel_cls(
+    kernel_kwargs = dict(
         element_dtype=element_dtype,
         head_dim=head_dim,
         head_dim_v=head_dim_v,
         block_tile=block_tile,
         max_topk=max_topk,
-        kv_tile=kv_tile,
     )
+    if kv_tile is not None:
+        kernel_kwargs["kv_tile"] = kv_tile
+    if assume_valid_topk:
+        kernel_kwargs["assume_valid_topk"] = True
+    kernel = kernel_cls(**kernel_kwargs)
     with torch.cuda.device(device_index):
         return cute.compile(
             kernel,
@@ -369,7 +402,9 @@ def _compile_deterministic_sm100(
         has_topk_length=has_topk_length,
         kernel_cls=kernel_cls,
         block_tile=64,
-        kv_tile=64,
+        kv_tile=None,
+        assume_valid_topk=False,
+        topk_row_stride=None,
         dkv_planes=deterministic_shards,
         wide_addressing=wide_addressing,
     )
@@ -394,7 +429,11 @@ def _compile_nondeterministic_sm100(
         raise ValueError("the D576 two-CTA backend has its own prepared compiler")
     if dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported SM100 dtype {dtype}")
-    return _compile_sm100_artifact(
+    topk_row_stride = num_heads * head_dim // 2 if backend == _H64_BUCKET_BACKEND else None
+    # Bucketing changes only the sparse-row ordering. The backward launch is
+    # the established M64/N64 kernel specialized to trust the compacted row.
+    kernel_cls = _get_sm100_kernel_class("generic_m64" if backend == _H64_BUCKET_BACKEND else backend)
+    backward = _compile_sm100_artifact(
         device_index,
         device_capability,
         torch2cute_dtype_map[dtype],
@@ -402,13 +441,48 @@ def _compile_nondeterministic_sm100(
         head_dim_v=head_dim_v,
         num_heads=num_heads,
         max_topk=max_topk,
-        has_topk_length=has_topk_length,
-        kernel_cls=_get_sm100_kernel_class(backend),
+        has_topk_length=has_topk_length or backend == _H64_BUCKET_BACKEND,
+        kernel_cls=kernel_cls,
         block_tile=block_tile,
-        kv_tile=32 if backend == "h64_m64n32_2stage" else block_tile,
+        kv_tile=None,
+        assume_valid_topk=backend == _H64_BUCKET_BACKEND,
+        topk_row_stride=topk_row_stride,
         dkv_planes=1,
         wide_addressing=wide_addressing,
     )
+    if backend != _H64_BUCKET_BACKEND:
+        return backward
+
+    from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import TopKBucketSm100
+
+    total_s_q = cute.sym_int()
+    indices = _fake_compact_tensor(cutlass.Int32, (total_s_q, max_topk))
+    bucketed = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (total_s_q, max_topk),
+        (topk_row_stride, 1),
+        assumed_align=16,
+    )
+    bucketed_lengths = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (total_s_q,),
+        (topk_row_stride,),
+        assumed_align=4,
+    )
+    lengths = _fake_compact_tensor(cutlass.Int32, (total_s_q,), alignment=4) if has_topk_length else None
+    with torch.cuda.device(device_index):
+        bucket = cute.compile(
+            TopKBucketSm100(max_topk, H64_TOPK_BUCKETS),
+            indices,
+            bucketed,
+            bucketed_lengths,
+            lengths,
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            options=compile_options(gpu_arch=_sm100_gpu_arch_flag(device_capability)),
+        )
+    return _H64BucketArtifacts(bucket, backward)
 
 
 def flash_attn_bwd_sm100(
@@ -636,6 +710,32 @@ def flash_attn_bwd_sm100(
     )
 
     compiled_kernel = _compiled_kernel
+    if backend == _H64_BUCKET_BACKEND and compiled_kernel is None:
+        # Direct low-level callers retain lazy compilation. Prepared plans
+        # arrive here with the same two precompiled artifacts already bound.
+        compiled_kernel = _compile_nondeterministic_sm100(
+            device.index,
+            device_capability,
+            backend,
+            q.dtype,
+            head_dim,
+            head_dim_v,
+            num_head,
+            max_topk,
+            has_topk_length,
+            block_tile,
+            _requires_wide_data_addressing(
+                total_S_q,
+                total_S_kv,
+                head_dim,
+                head_dim_v,
+                num_head,
+                max_topk,
+                False,
+                backend,
+                include_workspace=True,
+            ),
+        )
     if compiled_kernel is None and compile_key not in flash_attn_bwd_sm100.compile_cache:
         q_tensor = to_cute_tensor(q, divisibility=head_dim)
         kv_tensor = to_cute_tensor(kv, divisibility=head_dim)
@@ -687,6 +787,41 @@ def flash_attn_bwd_sm100(
     if compiled_kernel is None:
         compiled_kernel = flash_attn_bwd_sm100.compile_cache[compile_key]
 
+    kernel_topk_idxs = topk_idxs
+    kernel_topk_length = topk_length
+    if backend == _H64_BUCKET_BACKEND:
+        if not isinstance(compiled_kernel, _H64BucketArtifacts):
+            raise TypeError("the H64 locality backend requires bucket and backward launchables")
+        # dQ is an output-only contiguous buffer. Its per-token storage is
+        # much larger than one top-k row, so reuse the first 8 KiB of each
+        # token as non-overlapping index scratch. The backward CTA consumes
+        # the complete row before it overwrites that token's dQ result.
+        topk_row_stride = num_head * head_dim // 2
+        dq_int32 = dq.view(torch.int32).view(-1)
+        kernel_topk_idxs = torch.as_strided(
+            dq_int32,
+            (total_S_q, max_topk),
+            (topk_row_stride, 1),
+        )
+        kernel_topk_length = torch.as_strided(
+            dq_int32,
+            (total_S_q,),
+            (topk_row_stride,),
+            max_topk,
+        )
+        bucket_shift = max(0, max(total_S_kv - 1, 1).bit_length() - (H64_TOPK_BUCKETS.bit_length() - 1))
+        with torch.cuda.nvtx.range("flash_attn_bwd_sm100_topk_bucket"):
+            compiled_kernel.bucket(
+                topk_idxs,
+                kernel_topk_idxs,
+                kernel_topk_length,
+                topk_length,
+                total_S_kv,
+                bucket_shift,
+                current_stream,
+            )
+        compiled_kernel = compiled_kernel.backward
+
     with torch.cuda.nvtx.range(f"flash_attn_bwd_sm100_kernel[{backend}]"):
         compiled_kernel(
             problem_shape,
@@ -696,8 +831,8 @@ def flash_attn_bwd_sm100(
             dout,
             lse,
             attn_sink,
-            topk_idxs,
-            topk_length,
+            kernel_topk_idxs,
+            kernel_topk_length,
             dq,
             dkv,
             d_sink,

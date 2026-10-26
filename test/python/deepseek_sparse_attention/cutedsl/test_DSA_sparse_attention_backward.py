@@ -131,6 +131,7 @@ def _plan_case(
     deterministic=False,
     q_cluster_mode="off",
     compile_plan=True,
+    invalid_holes=False,
 ):
     """Inputs, a checked plan, caller-owned outputs, and scratch for one route."""
     from cudnn import DSA
@@ -141,6 +142,10 @@ def _plan_case(
     kv = torch.randn(s_kv, head_dim, dtype=dtype, device=device) / 10
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device=device)
     topk_idxs = torch.stack([torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]).to(torch.int32)
+    if invalid_holes:
+        # Keep invalid slots inside the active prefix. The locality prepass
+        # must compact around them rather than treating validity as a tail.
+        topk_idxs[:, 1::127] = -1
     topk_length = torch.randint(1, topk + 1, (s_q,), dtype=torch.int32, device=device) if has_topk_length else None
     out, lse = ref_sparse_attention_forward_chunked(q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=softmax_scale)
     dout = torch.randn_like(out)
@@ -225,8 +230,8 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
-def test_DSA_sparse_attention_backward_sm100_h64_n32_dispatch():
-    """Select the tuned H64/N32 pipeline only inside its validated envelope."""
+def test_DSA_sparse_attention_backward_sm100_h64_bucketed_dispatch():
+    """Select the tuned H64 locality pipeline only inside its validated envelope."""
     try:
         from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
     except ImportError:
@@ -238,7 +243,7 @@ def test_DSA_sparse_attention_backward_sm100_h64_n32_dispatch():
         "max_topk": 2048,
         "device_capability": (10, 0),
     }
-    assert _select_sm100_backend(64, 512, **supported) == ("h64_m64n32_2stage", 64)
+    assert _select_sm100_backend(64, 512, **supported) == ("h64_m64_bucketed", 64)
     assert _select_sm100_backend(64, 576, **supported) == ("generic_m64", 64)
     assert _select_sm100_backend(64, 512, **{**supported, "max_topk": 1024}) == ("generic_m64", 64)
     assert _select_sm100_backend(64, 512, **supported, deterministic=True) == ("generic_m64", 64)
@@ -246,8 +251,15 @@ def test_DSA_sparse_attention_backward_sm100_h64_n32_dispatch():
 
 @pytest.mark.L1
 @torch_fork_set_rng(seed=424)
-def test_DSA_sparse_attention_backward_sm100_h64_n32_matches_reference():
-    """Exercise N32 score, dQ, and reducer fragments including runtime top-k tails."""
+@pytest.mark.parametrize(
+    "has_topk_length,invalid_holes",
+    [
+        pytest.param(True, False, id="runtime-tail"),
+        pytest.param(False, True, id="invalid-holes-no-length"),
+    ],
+)
+def test_DSA_sparse_attention_backward_sm100_h64_bucketed_matches_reference(has_topk_length, invalid_holes):
+    """Exercise locality bucketing and paired reducers with runtime top-k tails."""
     _require_sm100()
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         64,
@@ -255,9 +267,10 @@ def test_DSA_sparse_attention_backward_sm100_h64_n32_matches_reference():
         2048,
         s_q=2,
         s_kv=2048,
-        has_topk_length=True,
+        has_topk_length=has_topk_length,
+        invalid_holes=invalid_holes,
     )
-    assert plan._backend == "h64_m64n32_2stage"
+    assert plan._backend == "h64_m64_bucketed"
     _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
 
 
@@ -1460,6 +1473,7 @@ def test_DSA_sparse_attention_backward_sm100_cluster4_fp16():
         pytest.param(16, 576, 64, torch.bfloat16, False, "h16_m128", id="h16"),
         pytest.param(32, 576, 64, torch.bfloat16, False, "h32_m64", id="h32"),
         pytest.param(64, 512, 64, torch.bfloat16, False, "generic_m64", id="generic"),
+        pytest.param(64, 512, 2048, torch.bfloat16, False, "h64_m64_bucketed", id="h64-bucketed"),
         pytest.param(96, 576, 64, torch.bfloat16, False, "h96_h64_h32", id="h96"),
         pytest.param(128, 512, 128, torch.bfloat16, False, "h128_2cta_m64", id="h128-two-cta"),
         pytest.param(64, 512, 64, torch.bfloat16, True, "generic_m64", id="deterministic-generic-bf16"),
@@ -1498,7 +1512,10 @@ def test_DSA_sparse_attention_backward_sm100_plan_is_cold_capture_safe(
         deterministic=deterministic,
     )
     assert plan._backend == expected_backend
-    assert callable(plan._compiled_kernel)
+    if expected_backend == "h64_m64_bucketed":
+        assert all(callable(artifact) for artifact in plan._compiled_kernel)
+    else:
+        assert callable(plan._compiled_kernel)
 
     def forbidden_compile(*args, **kwargs):
         """Fail if the first post-plan execute attempts CuTe compilation."""

@@ -17,6 +17,7 @@ from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
+from cudnn.deepseek_sparse_attention.utils.sm90.primitives import red_add_fp32x4
 
 
 @dsl_user_op
@@ -57,6 +58,7 @@ class FlashAttentionDSABackwardSm100:
         block_tile: int,
         max_topk: int = 0,
         kv_tile: Optional[int] = None,
+        assume_valid_topk: bool = False,
     ):
         """Configure SM100 backward tiling, warp roles, registers, and TMEM regions."""
         self.head_dim = head_dim
@@ -65,6 +67,7 @@ class FlashAttentionDSABackwardSm100:
         self.block_tile = block_tile
         self.kv_tile = block_tile if kv_tile is None else kv_tile
         self.max_topk = max_topk
+        self.assume_valid_topk = assume_valid_topk
         self.QK_mma_tiler = (block_tile, self.kv_tile, head_dim)
         # head_dim_main: 128-aligned portion for the main 4 sub-tiles
         head_dim_main = (head_dim // 128) * 128
@@ -632,11 +635,11 @@ class FlashAttentionDSABackwardSm100:
             compute_mma_dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.compute_mma_dS_stage * 2]
             mma_reduce_dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mma_reduce_dKV_stage * 2]
             tmem_holding_buf: cutlass.Int32
+            sK: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(K_smem_layout_staged)], self.buffer_align_bytes]
             sQ: cute.struct.Align[
                 cute.struct.MemRange[self.element_dtype, cute.cosize(Q_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-            sK: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(K_smem_layout_staged)], self.buffer_align_bytes]
             sdO: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(dO_smem_layout_staged)], self.buffer_align_bytes]
             sP: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(P_smem_layout_staged)], self.non_tma_align_bytes]
             sdS: cute.struct.Align[cute.struct.MemRange[self.element_dtype, cute.cosize(dS_smem_layout_staged)], self.non_tma_align_bytes]
@@ -1533,7 +1536,9 @@ class FlashAttentionDSABackwardSm100:
         # the per-row mask, rather than rebuilding the same predicate in every
         # lane for every iteration of the fully-unrolled copy loop.
         lane_idx = tile_index * self.kv_tile + local_tidx * self.num_load_KV_warps + local_warp_idx
-        if cutlass.const_expr(mTopkLength is not None and not is_first):
+        if cutlass.const_expr(self.assume_valid_topk and not is_first):
+            lane_is_valid = True
+        elif cutlass.const_expr(mTopkLength is not None and not is_first):
             lane_is_valid = idx_reg >= 0 and idx_reg < mKV.shape[0]
         else:
             lane_is_valid = lane_idx < topk and idx_reg >= 0 and idx_reg < mKV.shape[0]
@@ -1544,7 +1549,9 @@ class FlashAttentionDSABackwardSm100:
             row_idx = tile_index * self.kv_tile + row
             tile_sK = sK_slice[row, (None, None)]
             topk_idx = cute.arch.shuffle_sync(idx_reg, i)
-            if cutlass.const_expr(mTopkLength is not None and not is_first):
+            if cutlass.const_expr(self.assume_valid_topk and not is_first):
+                row_is_valid = True
+            elif cutlass.const_expr(mTopkLength is not None and not is_first):
                 row_is_valid = topk_idx >= 0 and topk_idx < mKV.shape[0]
             else:
                 row_is_valid = row_idx < topk and topk_idx >= 0 and topk_idx < mKV.shape[0]
@@ -2422,11 +2429,17 @@ class FlashAttentionDSABackwardSm100:
                 global_row_idx = tile_index * self.kv_tile + local_row_idx
                 if full_tiles:
                     topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
-                    rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
+                    if cutlass.const_expr(self.assume_valid_topk):
+                        rTopkIdx[i] = topk_idx
+                    else:
+                        rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                 else:
                     if global_row_idx < topk:
                         topk_idx = mTopkIdxs[global_row_idx, (token_idx, batch_idx)]
-                        rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
+                        if cutlass.const_expr(self.assume_valid_topk):
+                            rTopkIdx[i] = topk_idx
+                        else:
+                            rTopkIdx[i] = topk_idx if topk_idx >= 0 and topk_idx < max_seqlen_kv else Int32(-1)
                     else:
                         rTopkIdx[i] = Int32(-1)
 
@@ -2452,8 +2465,7 @@ class FlashAttentionDSABackwardSm100:
                 _partial_cta_sync(self.t2r_dKV01_done_barrier.barrier_id, self.t2r_dKV01_done_barrier.num_threads)
 
             if cutlass.const_expr(self.same_hdim_kv):
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV0, rTopkIdx, 0)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV1, rTopkIdx, 1)
+                self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV0, rdKV1, rTopkIdx, 0, 1)
 
             # Advance to dKV4 (D576) or dKV2/3 (D512).
             mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
@@ -2502,8 +2514,7 @@ class FlashAttentionDSABackwardSm100:
                 _partial_cta_sync(self.t2r_dKV23_done_barrier.barrier_id, self.t2r_dKV23_done_barrier.num_threads)
 
             if cutlass.const_expr(self.same_hdim_kv):
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV2, rTopkIdx, 2)
-                self.reduce_dKV_from_reg(mdKV_acc, rdKV3, rTopkIdx, 3)
+                self.reduce_dKV_pair_from_reg(mdKV_acc, rdKV2, rdKV3, rTopkIdx, 2, 3)
             else:
                 mma_reduce_dKV_pipeline.consumer_release(mma_reduce_dKV_consumer_state)
                 mma_reduce_dKV_consumer_state.advance()
@@ -2586,7 +2597,7 @@ class FlashAttentionDSABackwardSm100:
                 tile_dKV_row = tile_dKV_row[None, sub_tile_idx]
                 tile_dKV_row = cute.flat_divide(tile_dKV_row, (4,))  # (4, 32)
                 cur_dKV_frg = tile_dKV_row[None, dp_idx // 4]
-                cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load())
+                cute.arch.atomic_add(cur_dKV_frg.iterator.llvm_ptr, rdKV_frg.load(), sem="relaxed", scope="gpu")
 
         if cutlass.const_expr(self.same_hdim_kv):
             _partial_cta_sync(self.reduce_sync_barrier.barrier_id, self.reduce_sync_barrier.num_threads)
@@ -2603,11 +2614,16 @@ class FlashAttentionDSABackwardSm100:
     ):
         """Reduce two resident 128-wide fragments with one index/address loop."""
         tidx, _, _ = cute.arch.thread_idx()
+        _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         dp_idx = tidx_in_wg % 128
 
         for i in cutlass.range_constexpr(self.reduce_rows_per_thread):
-            coord_base = i * 2 - i % 2
+            if cutlass.const_expr(self.kv_tile == 32 and self.num_reduce_warps == 4):
+                row_in_group = i % 4
+                coord_base = (i // 4) * 16 + row_in_group * 2 - row_in_group % 2
+            else:
+                coord_base = i * 2 - i % 2
 
             rdKV_frg0 = cute.make_rmem_tensor((4,), self.acc_dtype)
             rdKV_frg0[0] = tTR_rdKV0[coord_base]
@@ -2623,14 +2639,21 @@ class FlashAttentionDSABackwardSm100:
 
             topk_idx = rTopkIdx[i]
             if topk_idx >= 0:
-                # The sparse index may address multi-million-token contexts,
-                # so form its byte-independent element offset in Int64.
-                row_ptr = dKV_acc.iterator + Int64(topk_idx) * Int64(self.head_dim)
-                lane_offset = (dp_idx // 4) * 4
-                ptr0 = row_ptr + sub_tile_idx0 * 128 + lane_offset
-                ptr1 = row_ptr + sub_tile_idx1 * 128 + lane_offset
-                cute.arch.atomic_add(ptr0.llvm_ptr, rdKV_frg0.load())
-                cute.arch.atomic_add(ptr1.llvm_ptr, rdKV_frg1.load())
+                dKV_row = dKV_acc[None, topk_idx, (0, batch_idx)]
+                tile_dKV_row = cute.flat_divide(dKV_row, (128,))
+                tile0 = cute.flat_divide(tile_dKV_row[None, sub_tile_idx0], (4,))
+                tile1 = cute.flat_divide(tile_dKV_row[None, sub_tile_idx1], (4,))
+                ptr0 = tile0[None, dp_idx // 4].iterator
+                ptr1 = tile1[None, dp_idx // 4].iterator
+                if cutlass.const_expr(self.same_hdim_kv):
+                    red_add_fp32x4(rdKV_frg0[0], rdKV_frg0[1], rdKV_frg0[2], rdKV_frg0[3], ptr0, True, l2_cache_hint="evict_last")
+                    red_add_fp32x4(rdKV_frg1[0], rdKV_frg1[1], rdKV_frg1[2], rdKV_frg1[3], ptr1, True, l2_cache_hint="evict_last")
+                else:
+                    cute.arch.atomic_add(ptr0.llvm_ptr, rdKV_frg0.load(), sem="relaxed", scope="gpu")
+                    cute.arch.atomic_add(ptr1.llvm_ptr, rdKV_frg1.load(), sem="relaxed", scope="gpu")
+
+        if cutlass.const_expr(self.same_hdim_kv):
+            _partial_cta_sync(self.reduce_sync_barrier.barrier_id, self.reduce_sync_barrier.num_threads)
 
     @cute.jit
     def reduce_dKV_0_tail_1_from_reg(
@@ -2668,9 +2691,9 @@ class FlashAttentionDSABackwardSm100:
             topk0 = rTopkIdx[i0]
             if topk0 >= 0:
                 row0 = dKV_acc.iterator + Int64(topk0) * Int64(self.head_dim)
-                cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load())
-                cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load())
-                cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load())
+                cute.arch.atomic_add((row0 + lane_offset4).llvm_ptr, frg00.load(), sem="relaxed", scope="gpu")
+                cute.arch.atomic_add((row0 + 128 + lane_offset4).llvm_ptr, frg10.load(), sem="relaxed", scope="gpu")
+                cute.arch.atomic_add((row0 + self.head_dim_main + lane_offset2).llvm_ptr, frg40.load(), sem="relaxed", scope="gpu")
 
     @cute.jit
     def t2r_dKV_64(self, tdKVtdKV: cute.Tensor):

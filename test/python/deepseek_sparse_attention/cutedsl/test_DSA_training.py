@@ -89,6 +89,32 @@ def test_native_training_and_original_score_slots(heads, dim, sink, lengths):
     assert torch.equal(score["target"][~valid], torch.zeros_like(score["target"][~valid]))
 
 
+@pytest.mark.L1
+def test_h64_k2048_shared_locality_metadata_matches_reference():
+    """Forward and backward use the same stable H64 locality ordering."""
+    torch.manual_seed(2048)
+    q = (torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+    kv = (torch.randn(4096, 512, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+    sink = torch.randn(64, device="cuda", dtype=torch.float32, requires_grad=True)
+    idx = torch.stack([torch.randperm(4096, device="cuda")[:2048] for _ in range(2)]).to(torch.int32)
+    idx[0, 127] = -1
+    lengths = torch.tensor([2048, 1999], dtype=torch.int32, device="cuda")
+
+    q_ref = q.detach().float().requires_grad_()
+    kv_ref = kv.detach().float().requires_grad_()
+    sink_ref = sink.detach().clone().requires_grad_()
+    out_ref, lse_ref, _, _ = reference(q_ref, kv_ref, idx, sink_ref, lengths)
+    result = DSA.sparse_attention(q, kv, idx, sink, topk_length=lengths)
+    assert_numerics(result["out"], out_ref, 0.01)
+    torch.testing.assert_close(result["lse"], lse_ref, atol=4e-4, rtol=4e-4)
+
+    grad = torch.randn_like(result["out"])
+    result["out"].backward(grad)
+    out_ref.backward(grad.float())
+    for actual, expected in ((q.grad, q_ref.grad), (kv.grad, kv_ref.grad), (sink.grad, sink_ref.grad)):
+        assert_numerics(actual, expected)
+
+
 @pytest.mark.parametrize("reentrant", [False, True])
 def test_checkpoint_and_no_device_sync(reentrant):
     q, kv, idx, a, lens = inputs()

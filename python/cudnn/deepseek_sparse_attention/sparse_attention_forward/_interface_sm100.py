@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -17,6 +17,7 @@ import torch
 
 from cudnn._torch_stream import as_torch_stream
 
+from cudnn.deepseek_sparse_attention._topk_bucket_sm100 import H64_TOPK_BUCKETS, TopKBucketSm100
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 _compile_cache: dict = {}
@@ -25,6 +26,13 @@ _ARCH_FLAGS = {
     (10, 3): "sm_103a",
     (10, 7): "sm_100f",
 }
+
+
+class _H64BucketedForwardArtifacts(NamedTuple):
+    """Stable locality transform and forward kernel for H64/D512/K2048."""
+
+    bucket: object
+    forward: object
 
 
 def _gpu_arch_flag(device: torch.device) -> str:
@@ -131,7 +139,7 @@ def _compile_kernel(
         to_cute_tensor(lse, assumed_align=4),
         to_cute_tensor(lse_indexer, assumed_align=4) if lse_indexer is not None else None,
         to_cute_tensor(attn_sink, assumed_align=4) if attn_sink is not None else None,
-        to_cute_tensor(topk_length, assumed_align=4) if topk_length is not None else None,
+        (to_cute_tensor(topk_length, assumed_align=4, fully_dynamic=topk_length.stride(0) != 1) if topk_length is not None else None),
         cutlass.Float32(softmax_scale),
         stream,
         # CuTe DSL defaults to O3, but these large persistent kernels get a
@@ -323,8 +331,9 @@ def sparse_attention_forward_sm100(
         if indexer_topk and lse_indexer is None:
             lse_indexer = torch.empty((total_s_q, num_heads), dtype=torch.float32, device=device)
 
-        # Zero-size problems are a stream-ordered host-side epilogue.  No
-        # gather pointer is formed and no CuTe kernel is launched.
+        # Zero-size problems are a stream-ordered host-side epilogue.  Keep
+        # this before output-backed metadata views: an empty output has no
+        # storage for the otherwise valid nonzero length-slot offset.
         if total_s_q == 0 or logical_topk == 0 or kv.shape[0] == 0:
             out.zero_()
             max_logits.fill_(float("-inf"))
@@ -336,6 +345,19 @@ def sparse_attention_forward_sm100(
                 consumer,
             )
             return out, max_logits, lse, lse_indexer
+
+        use_h64_bucket = variant == "head64_regular" and head_dim == 512 and q.dtype == torch.bfloat16 and topk_idxs.shape[1] == 2048 and indexer_topk == 0
+        kernel_topk_idxs = topk_idxs
+        kernel_topk_length = topk_length
+        if use_h64_bucket:
+            # Reuse output-only storage before the forward CTA writes O.  One
+            # 64-KiB O row easily holds the 8-KiB canonical index row and its
+            # length. Forward and backward run the same stable transform, so
+            # they consume slot-identical metadata without a persistent copy.
+            topk_row_stride = num_heads * head_dim_v // 2
+            out_int32 = out.view(torch.int32).view(-1)
+            kernel_topk_idxs = torch.as_strided(out_int32, (total_s_q, topk_idxs.shape[1]), (topk_row_stride, 1))
+            kernel_topk_length = torch.as_strided(out_int32, (total_s_q,), (topk_row_stride,), topk_idxs.shape[1])
 
         # ``cutlass.Float32(scale)`` is a TVM-FFI runtime scalar argument, as
         # in the existing DSA indexer-forward interface; it intentionally does
@@ -355,39 +377,71 @@ def sparse_attention_forward_sm100(
             attn_sink is not None,
             topk_length is not None,
             int(indexer_topk),
+            use_h64_bucket,
         )
         compiled = _compile_cache.get(compile_key)
         if compiled is None:
             kernel_obj = _make_kernel(variant, head_dim, int(indexer_topk))
             with torch.cuda.nvtx.range("dsa_sparse_attention_forward_compile"):
-                compiled = _compile_kernel(
+                compiled_forward = _compile_kernel(
                     kernel_obj,
                     q,
                     kv,
-                    topk_idxs,
+                    kernel_topk_idxs,
                     out,
                     max_logits,
                     lse,
                     lse_indexer,
                     attn_sink,
-                    topk_length,
+                    kernel_topk_length,
                     scale,
                     current_stream,
                     device,
                 )
+                if use_h64_bucket:
+                    compiled_bucket = cute.compile(
+                        TopKBucketSm100(topk_idxs.shape[1], H64_TOPK_BUCKETS),
+                        to_cute_tensor(topk_idxs, assumed_align=4),
+                        to_cute_tensor(kernel_topk_idxs, assumed_align=4),
+                        to_cute_tensor(kernel_topk_length, assumed_align=4, fully_dynamic=True),
+                        to_cute_tensor(topk_length, assumed_align=4) if topk_length is not None else None,
+                        cutlass.Int32(1),
+                        cutlass.Int32(1),
+                        current_stream,
+                        options=_compile_options(device),
+                    )
+                    compiled = _H64BucketedForwardArtifacts(compiled_bucket, compiled_forward)
+                else:
+                    compiled = compiled_forward
             _compile_cache[compile_key] = compiled
+
+        if use_h64_bucket:
+            if not isinstance(compiled, _H64BucketedForwardArtifacts):
+                raise TypeError("the H64 locality forward requires bucket and forward launchables")
+            bucket_shift = max(0, max(kv.shape[0] - 1, 1).bit_length() - (H64_TOPK_BUCKETS.bit_length() - 1))
+            with torch.cuda.nvtx.range("dsa_sparse_attention_forward_topk_bucket"):
+                compiled.bucket(
+                    topk_idxs,
+                    kernel_topk_idxs,
+                    kernel_topk_length,
+                    topk_length,
+                    kv.shape[0],
+                    bucket_shift,
+                    current_stream,
+                )
+            compiled = compiled.forward
 
         with torch.cuda.nvtx.range("dsa_sparse_attention_forward_kernel"):
             compiled(
                 q,
                 kv,
-                topk_idxs,
+                kernel_topk_idxs,
                 out,
                 max_logits,
                 lse,
                 lse_indexer,
                 attn_sink,
-                topk_length,
+                kernel_topk_length,
                 cutlass.Float32(scale),
                 current_stream,
             )
