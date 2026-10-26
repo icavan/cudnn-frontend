@@ -153,6 +153,16 @@ def _select_sm100_backend(
         return "h16_m128", 128
     if num_heads == 32 and head_dim == 576:
         return "h32_m64", 64
+    if (
+        num_heads == 64
+        and head_dim == 512
+        and head_dim_v == 512
+        and dtype == torch.bfloat16
+        and max_topk == 2048
+        and device_capability in _BLACKWELL_CAPABILITIES
+        and is_contiguous
+    ):
+        return "h64_m64n32_2stage", 64
     return "generic_m64", 64
 
 
@@ -233,6 +243,7 @@ def _compile_sm100_artifact(
     *,
     kernel_cls,
     block_tile: int,
+    kv_tile: int,
     dkv_planes: int,
     wide_addressing: bool,
 ):
@@ -281,6 +292,7 @@ def _compile_sm100_artifact(
         head_dim_v=head_dim_v,
         block_tile=block_tile,
         max_topk=max_topk,
+        kv_tile=kv_tile,
     )
     with torch.cuda.device(device_index):
         return cute.compile(
@@ -357,6 +369,7 @@ def _compile_deterministic_sm100(
         has_topk_length=has_topk_length,
         kernel_cls=kernel_cls,
         block_tile=64,
+        kv_tile=64,
         dkv_planes=deterministic_shards,
         wide_addressing=wide_addressing,
     )
@@ -392,6 +405,7 @@ def _compile_nondeterministic_sm100(
         has_topk_length=has_topk_length,
         kernel_cls=_get_sm100_kernel_class(backend),
         block_tile=block_tile,
+        kv_tile=32 if backend == "h64_m64n32_2stage" else block_tile,
         dkv_planes=1,
         wide_addressing=wide_addressing,
     )

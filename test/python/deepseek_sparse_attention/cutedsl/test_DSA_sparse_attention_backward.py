@@ -225,6 +225,43 @@ def test_DSA_sparse_attention_backward_sm100_auto_dispatch(
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_backward_sm100_h64_n32_dispatch():
+    """Select the tuned H64/N32 pipeline only inside its validated envelope."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_backward._interface_sm100 import _select_sm100_backend
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    supported = {
+        "head_dim_v": 512,
+        "dtype": torch.bfloat16,
+        "max_topk": 2048,
+        "device_capability": (10, 0),
+    }
+    assert _select_sm100_backend(64, 512, **supported) == ("h64_m64n32_2stage", 64)
+    assert _select_sm100_backend(64, 576, **supported) == ("generic_m64", 64)
+    assert _select_sm100_backend(64, 512, **{**supported, "max_topk": 1024}) == ("generic_m64", 64)
+    assert _select_sm100_backend(64, 512, **supported, deterministic=True) == ("generic_m64", 64)
+
+
+@pytest.mark.L1
+@torch_fork_set_rng(seed=424)
+def test_DSA_sparse_attention_backward_sm100_h64_n32_matches_reference():
+    """Exercise N32 score, dQ, and reducer fragments including runtime top-k tails."""
+    _require_sm100()
+    plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
+        64,
+        512,
+        2048,
+        s_q=2,
+        s_kv=2048,
+        has_topk_length=True,
+    )
+    assert plan._backend == "h64_m64n32_2stage"
+    _assert_execute_allocates_nothing_and_never_synchronizes(plan, inputs, outputs, topk_length, softmax_scale, workspace)
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_backward_sm100_h96_dispatch():
     """Select native H96 only inside the validated two-CTA envelope."""
     try:
