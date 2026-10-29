@@ -19,7 +19,7 @@ from .dsa_bwd_sm100 import FlashAttentionDSABackwardSm100
 _SUPPORTED_DKV_SHARDS = (32, 64, 128)
 _LARGE_CONTEXT_WORKSPACE_BYTES = 16 << 30
 _RELAY_WORKSPACE_BUDGET_BYTES = 32 << 30
-_RELAY_WAVE_CTAS = 128
+_RELAY_WAVE_CTAS = 144
 _CLUSTER4_MIN_Q = 2048
 
 
@@ -638,9 +638,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster8(_FlashAttentionDSABackwardSm100DeterministicRelay):
-    """Sixteen-plane specialization using eight-CTA relays."""
+    """Eighteen-plane specialization using eight-CTA relays."""
 
-    num_dkv_shards = 16
+    num_dkv_shards = 18
     dkv_relay_cluster_size = 8
     dkv_mask_rows_per_word = 32 // dkv_relay_cluster_size
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
@@ -652,15 +652,15 @@ class FlashAttentionDSABackwardSm100DeterministicCluster8(_FlashAttentionDSABack
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABackwardSm100DeterministicRelay):
-    """Eight-plane memory-first specialization using sixteen-CTA relays."""
+    """Nine-plane memory-first specialization using sixteen-CTA relays."""
 
-    num_dkv_shards = 8
+    num_dkv_shards = 9
     dkv_relay_cluster_size = 16
     dkv_mask_rows_per_word = 32 // dkv_relay_cluster_size
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    # Eight planes fit comfortably in the conversion kernel's ordered loop.
+    # Nine planes fit comfortably in the conversion kernel's ordered loop.
     # Sum them there instead of writing and rereading an FP32 prefold plane.
     run_dkv_prefold = False
     num_dkv_final_terms = num_dkv_shards
@@ -668,9 +668,9 @@ class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABac
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABackwardSm100DeterministicRelay):
-    """Thirty-two-plane specialization using four-CTA relays."""
+    """Thirty-six-plane specialization using four-CTA relays."""
 
-    num_dkv_shards = 32
+    num_dkv_shards = 36
     dkv_relay_cluster_size = 4
     dkv_mask_rows_per_word = 32 // dkv_relay_cluster_size
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
