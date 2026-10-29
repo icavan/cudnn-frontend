@@ -517,6 +517,10 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         head_block_idx: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
     ):
+        # Profiling experiment: quantify the upper bound of removing the
+        # ordered row handoff. This is intentionally not numerically valid.
+        if cutlass.const_expr(True):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
@@ -551,6 +555,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         head_block_idx: Int32,
         problem_shape: Tuple[Int32, Int32, Int32, Tuple[Int32, Int32]],
     ):
+        # Profiling experiment paired with acquire_dKV_tile_relay above.
+        if cutlass.const_expr(True):
+            return
         tidx, _, _ = cute.arch.thread_idx()
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
