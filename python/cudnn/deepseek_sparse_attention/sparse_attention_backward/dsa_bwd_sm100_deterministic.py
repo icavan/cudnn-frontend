@@ -535,12 +535,10 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
                     mask_ptr = self._mask_word_ptr(mdKV_acc, max_seqlen_kv, token_idx, head_block_idx, problem_shape, kv_row)
                     _wait_lower_rank_mask(mask_ptr, lower_rank_mask)
         # The slot lanes import predecessor releases. The CTA barrier carries
-        # those observations to every reducer thread before it touches the
-        # shared plane; the GPU fence keeps the following GMEM updates after
-        # that handoff.
+        # that acquire causality to every reducer thread before its following
+        # GMEM updates; an additional GPU-wide fence is redundant.
         if rank > 0:
             _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
-            cute.arch.fence_acq_rel_gpu()
 
     @cute.jit
     def release_dKV_tile_relay(
@@ -561,8 +559,9 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         # No later rank can observe the last rank's ownership bit.
         # Publish every reducer thread's relaxed FP32 atomics through the CTA
         # barrier before a slot lane release-clears this rank's ownership bit.
+        # CTA-barrier causality is transitive into the release operation, so
+        # no GPU-wide fence is required here.
         if rank < self.dkv_relay_cluster_size - 1:
-            cute.arch.fence_acq_rel_gpu()
             _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
         if tidx_in_wg < self.block_tile and rank < self.dkv_relay_cluster_size - 1:
             tile_begin = tile_index * self.block_tile
