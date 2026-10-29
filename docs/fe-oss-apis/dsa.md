@@ -1063,7 +1063,11 @@ Physical K and sequence extents must be positive. K is padded to 128 for launch.
 
 ```python
 from cudnn import DSA
-result = DSA.sparse_attention(q, kv, indices, attn_sink, topk_length=lengths)
+result = DSA.sparse_attention(
+    q, kv, indices, attn_sink,
+    topk_length=lengths,
+    deterministic=True,
+)
 result["out"].float().square().mean().backward()
 score = DSA.sparse_attention_score_recompute(
     q.detach(), kv.detach(), result["lse"], indices, topk_length=lengths,
@@ -1072,9 +1076,16 @@ score = DSA.sparse_attention_score_recompute(
 
 Only `out` is differentiable (Q, KV and sink, first order). `lse` is KV-only
 natural-log LSE, excluding sink; `max_logits` and LSE are non-differentiable.
+Set `deterministic=True` to select the fixed-order native backward and obtain
+bitwise-reproducible Q, KV, and sink gradients. This is request-or-fail on an
+unsupported shape or device; it never silently falls back to the atomic
+backward. Forward, metadata normalization, and score recompute are already
+fixed-order for fixed inputs.
 No sink means an effective all-`-inf` sink vector. Launches and adapter tensor
 operations use the current PyTorch stream. First use compiles the kernels;
-warm before CUDA graph capture. This allocating convenience composition is
+warm the requested deterministic specialization before CUDA graph capture.
+The wrapper's output and workspace allocations are then owned by the graph's
+private pool. This allocating convenience composition is
 not a new allocation-free APIBase `execute` implementation.
 
 Safe mode maps all out-of-range indices to -1, bounds lengths to [0,K], masks
@@ -1091,3 +1102,23 @@ slots, then normalizes across the retained slots; all-masked rows return zeros.
 Targets are detached. Indexer training needs its own loss; discrete Top-K
 selection is not differentiated. This contract uses the existing native `out`
 return key, not the old unmerged bridge's `output` key.
+
+### End-to-end deterministic CSA/DSA training
+
+For the no-KV-cache-compression training path, enable determinism at every
+backward or selection stage that otherwise uses scheduling-dependent atomics or
+tie resolution:
+
+- `CSA.csa_compressor_backward_wrapper(..., deterministic=True)`
+- `DSA.indexer_top_k_wrapper(..., deterministic=True)`
+- `DSA.sparse_attention(..., deterministic=True)`
+- `DSA.indexer_backward_wrapper(..., deterministic=True)`
+
+CSA compressor forward, dense indexer forward, sparse attention forward, and
+score recompute are fixed-order for fixed inputs. The deterministic standalone
+Top-K additionally defines exact cutoff ties and returns selected local indices
+in ascending order. The deterministic indexer backward defaults to 96 FP32 dK
+planes; 128 and 148 are opt-in workspace/performance tradeoffs. With all four
+flags enabled, the composed path is accepted by strict
+`torch.use_deterministic_algorithms(True)` and remains CUDA Graph compatible
+after warming every requested specialization before capture.
