@@ -659,7 +659,11 @@ class FlashAttentionDSABackwardSm100DeterministicCluster16(_FlashAttentionDSABac
     dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
     dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
     num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
+    # Eight planes fit comfortably in the conversion kernel's ordered loop.
+    # Sum them there instead of writing and rereading an FP32 prefold plane.
+    run_dkv_prefold = False
+    num_dkv_final_terms = num_dkv_shards
+    dkv_final_stride = 1
 
 
 class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABackwardSm100DeterministicRelay):
