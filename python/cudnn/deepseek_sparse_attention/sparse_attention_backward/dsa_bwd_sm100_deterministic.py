@@ -338,6 +338,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
     dkv_fold_group_size = 8
     dkv_final_stride = dkv_fold_group_size
     run_dkv_prefold = True
+    dkv_relay_tiles_per_handoff = 2
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -522,12 +523,16 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        num_tiles = (self.max_topk + self.block_tile - 1) // self.block_tile
+        group_offset = Int32(num_tiles - 1) - tile_index
+        starts_group = group_offset % self.dkv_relay_tiles_per_handoff == 0
+        group_tiles = min(Int32(self.dkv_relay_tiles_per_handoff), tile_index + 1)
+        group_begin = tile_index - group_tiles + 1
         # Rank zero owns the first update and therefore has no predecessor
         # release to import. Avoid a CTA barrier and GPU fence on every tile.
         lower_rank_bits = (Uint32(1) << Uint32(rank)) - Uint32(1)
-        if tidx_in_wg < self.block_tile and rank > 0:
-            tile_begin = tile_index * self.block_tile
-            slot = tile_begin + tidx_in_wg
+        if tidx_in_wg < group_tiles * self.block_tile and rank > 0 and starts_group:
+            slot = group_begin * self.block_tile + tidx_in_wg
             if slot < topk:
                 kv_row = mTopkIdxs[slot, (token_idx, batch_idx)]
                 if kv_row >= 0 and kv_row < max_seqlen_kv:
@@ -538,7 +543,7 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         # The slot lanes import predecessor releases. The CTA barrier carries
         # that acquire causality to every reducer thread before its following
         # GMEM updates; an additional GPU-wide fence is redundant.
-        if rank > 0:
+        if rank > 0 and starts_group:
             _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
 
     @cute.jit
@@ -557,16 +562,20 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
         _, _, batch_idx = cute.arch.block_idx()
         tidx_in_wg = tidx - self.reduce_warp_id[0] * self.threads_per_warp
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        num_tiles = (self.max_topk + self.block_tile - 1) // self.block_tile
+        group_offset = Int32(num_tiles - 1) - tile_index
+        ends_group = group_offset % self.dkv_relay_tiles_per_handoff == self.dkv_relay_tiles_per_handoff - 1 or tile_index == 0
+        group_high = min(Int32(num_tiles - 1), tile_index + self.dkv_relay_tiles_per_handoff - 1)
+        group_tiles = group_high - tile_index + 1
         # No later rank can observe the last rank's ownership bit.
         # Publish every reducer thread's relaxed FP32 atomics through the CTA
         # barrier before a slot lane release-clears this rank's ownership bit.
         # CTA-barrier causality is transitive into the release operation, so
         # no GPU-wide fence is required here.
-        if rank < self.dkv_relay_cluster_size - 1:
+        if rank < self.dkv_relay_cluster_size - 1 and ends_group:
             _partial_cta_sync(self.dkv_relay_barrier.barrier_id, self.dkv_relay_barrier.num_threads)
-        if tidx_in_wg < self.block_tile and rank < self.dkv_relay_cluster_size - 1:
-            tile_begin = tile_index * self.block_tile
-            slot = tile_begin + tidx_in_wg
+        if tidx_in_wg < group_tiles * self.block_tile and rank < self.dkv_relay_cluster_size - 1 and ends_group:
+            slot = tile_index * self.block_tile + tidx_in_wg
             if slot < topk:
                 kv_row = mTopkIdxs[slot, (token_idx, batch_idx)]
                 if kv_row >= 0 and kv_row < max_seqlen_kv:
