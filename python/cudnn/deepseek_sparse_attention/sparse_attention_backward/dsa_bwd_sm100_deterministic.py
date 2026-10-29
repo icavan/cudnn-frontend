@@ -673,18 +673,6 @@ class FlashAttentionDSABackwardSm100DeterministicCluster4(_FlashAttentionDSABack
     num_dkv_final_terms = num_dkv_fold_groups
 
 
-class FlashAttentionDSABackwardSm100DeterministicCluster2(_FlashAttentionDSABackwardSm100DeterministicRelay):
-    """Sixty-four-plane specialization using two-CTA relays."""
-
-    num_dkv_shards = 64
-    dkv_relay_cluster_size = 2
-    dkv_mask_rows_per_word = 32 // dkv_relay_cluster_size
-    dkv_row_rank_mask = (1 << dkv_relay_cluster_size) - 1
-    dkv_cluster_shape = (dkv_relay_cluster_size, 1, 1)
-    num_dkv_fold_groups = num_dkv_shards // _FlashAttentionDSABackwardSm100DeterministicRelay.dkv_fold_group_size
-    num_dkv_final_terms = num_dkv_fold_groups
-
-
 _DETERMINISTIC_KERNELS = {
     32: FlashAttentionDSABackwardSm100Deterministic32,
     64: FlashAttentionDSABackwardSm100Deterministic64,
@@ -692,7 +680,6 @@ _DETERMINISTIC_KERNELS = {
 }
 
 _DETERMINISTIC_RELAY_KERNELS = {
-    2: FlashAttentionDSABackwardSm100DeterministicCluster2,
     4: FlashAttentionDSABackwardSm100DeterministicCluster4,
     8: FlashAttentionDSABackwardSm100DeterministicCluster8,
     16: FlashAttentionDSABackwardSm100DeterministicCluster16,
