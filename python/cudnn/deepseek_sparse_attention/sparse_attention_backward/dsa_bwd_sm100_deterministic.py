@@ -38,14 +38,12 @@ def _partial_cta_sync(barrier_id: int, thread_count: int, *, loc=None, ip=None):
 @cute.jit
 def _wait_lower_rank_mask(mask_ptr, lower_rank_mask: Uint32):
     """Wait until every lower cluster rank has published this KV row."""
-    # An acquire first read covers the overwhelmingly common no-predecessor
-    # case with one load. If a predecessor is still pending, keep polling with
-    # acquire loads so the zero observation also imports its release.
-    current = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+    current = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
     loop = cutlass.while_generate([current], lambda value: (value & lower_rank_mask) != Uint32(0))
     with loop as [value]:
-        value = cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
+        value = cute.arch.load(mask_ptr, Uint32, sem="relaxed", scope="gpu")
         cutlass.yield_out([value])
+    cute.arch.load(mask_ptr, Uint32, sem="acquire", scope="gpu")
 
 
 def deterministic_dkv_shards(total_seqlen_q: int) -> int:
