@@ -616,22 +616,32 @@ class _FlashAttentionDSABackwardSm100DeterministicRelay(FlashAttentionDSABackwar
             num_128_tiles = self.head_dim_main // 64
             for i in cutlass.range(num_128_tiles, unroll_full=True):
                 for j in cutlass.range(2, unroll_full=True):
+                    partials = cute.make_rmem_tensor((self.num_dkv_fold_groups,), Float32)
+                    partials.fill(0.0)
+                    for local_shard in cutlass.range_constexpr(self.dkv_fold_group_size):
+                        for group_idx in cutlass.range_constexpr(self.num_dkv_fold_groups):
+                            shard_idx = group_idx * self.dkv_fold_group_size + local_shard
+                            row = mdKV_acc[None, seq_id + shard_idx * physical_rows, (0, batch_idx)]
+                            tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
+                            partials[group_idx] += tile[tidx, j, i]
                     acc = Float32(0.0)
-                    for group_idx in cutlass.range_constexpr(self.num_dkv_final_terms):
-                        shard_idx = group_idx * self.dkv_final_stride
-                        row = mdKV_acc[None, seq_id + shard_idx * physical_rows, (0, batch_idx)]
-                        tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
-                        acc += tile[tidx, j, i]
+                    for group_idx in cutlass.range_constexpr(self.num_dkv_fold_groups):
+                        acc += partials[group_idx]
                     dim_idx = tidx // 4 + tidx % 4 * 8 + j * 32 + i * 64
                     cur_mdKV_row[dim_idx] = self.element_dtype(acc)
             if cutlass.const_expr(not self.same_hdim_kv):
                 for j in cutlass.range(2, unroll_full=True):
+                    partials = cute.make_rmem_tensor((self.num_dkv_fold_groups,), Float32)
+                    partials.fill(0.0)
+                    for local_shard in cutlass.range_constexpr(self.dkv_fold_group_size):
+                        for group_idx in cutlass.range_constexpr(self.num_dkv_fold_groups):
+                            shard_idx = group_idx * self.dkv_fold_group_size + local_shard
+                            row = mdKV_acc[None, seq_id + shard_idx * physical_rows, (0, batch_idx)]
+                            tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
+                            partials[group_idx] += tile[tidx, j, num_128_tiles]
                     acc = Float32(0.0)
-                    for group_idx in cutlass.range_constexpr(self.num_dkv_final_terms):
-                        shard_idx = group_idx * self.dkv_final_stride
-                        row = mdKV_acc[None, seq_id + shard_idx * physical_rows, (0, batch_idx)]
-                        tile = cute.flat_divide(cute.flat_divide(row, (64,)), (32,))
-                        acc += tile[tidx, j, num_128_tiles]
+                    for group_idx in cutlass.range_constexpr(self.num_dkv_fold_groups):
+                        acc += partials[group_idx]
                     k = tidx // 2 + j * 16
                     dim_idx = self.head_dim_main + (k // 8) * 16 + k % 8 + (tidx % 2) * 8
                     cur_mdKV_row[dim_idx] = self.element_dtype(acc)
