@@ -171,8 +171,8 @@ The row's wider cc range does not admit prepared FP8 plans on cc 10.8–11.9;
 the standalone adapter does not support those devices.
 The existing D256 quantized epilogue gate also uses prepared launches, with
 runtime BF16 gate pointers and Int64 strides. Amax remains the ungated SDPA
-output's maximum. Existing conversion routes use prepared gather/scatter copies
-around a compact prepared attention plan.
+output's maximum. Supported dense layouts bind their declared strides directly;
+unsupported layouts decline before compilation.
 Fixed dense D128 block-scaled outputs use the prepared hosts described below.
 
 SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
@@ -184,7 +184,7 @@ a mask-free dense `S_kv` off the 128-key tile is served through the KV-tail mask
 FP8 rows (#1425), the kernels replacing the tail tile's fully padded V scale blocks before BMM2.
 SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
 and for the block-scaled MXFP8 O on fixed dense unsplit plans;
-dense conversion layouts use staged copies around a prepared compact plan, with the scale tensors bound unchanged.
+supported dense layouts bind their declared strides directly, with the scale tensors bound unchanged.
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
 three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
@@ -193,8 +193,7 @@ SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM10
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
 operand; graph eligibility is unchanged. Conversion layouts and bias continue to
 decline runtime shape/stride overrides; a mask-free `S_kv` off the KV tile takes them
-through the KV-tail mask (#1425). Existing
-conversion layouts use staged copies around a prepared compact plan;
+through the KV-tail mask (#1425). Supported dense layouts use the native prepared plan;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
@@ -1583,7 +1582,7 @@ red (2026-09-08).
 | d128 decode tile (`TILE_CGA_M=1`, dense; the shared `sm100/decode_d128_f16.py` compiled for sm_107a; `S_q × packed group ≤ 128` proposes it first; past one tile the dense SM100 and cc 10.7 rows list both widths and lead with the decode tile while its waves stay within 1.6x the cga2 cluster's below a 16k cache, issue #1518; THD and the pre-folded scale keep the prefill tiles — the pair tile, or the single-CTA two-slab body for nonpaged D128 half THD with one query head per KV head on the SM100 line, where `TILE_CGA_M=1` selects that body rather than the decode tile) | envelope under split-KV only (the 32-wide tile is dense-only: a split selects d128; an unsplit graph runs the 32-wide prefill tile)ᵗ | envelope under split-KV only (the 64-wide tile is dense-only: a split selects d128; an unsplit graph runs the 64-wide prefill tile)ᵗ | ✅ (issue #1472) | ❌ (prefill) | ❌ (prefill) | ❌ (prefill) | — | — |
 | Paged KV (half THD; the attention sink composes ᵖˢ -- keyless rows O := 0 / LSE := sink; dense paged queries ❌ except decode-shaped dense Q on the cc 10.7 d256 decode tile ᵈʳ; MXFP8 pools with dense queries, sinks compose)ᵖ | ❌ᵗ (the pre-tile decline) | fp8 envelope · f16/bf16 ❌ᵗ (the pre-tile decline) | half THD ✅ (sink: unsplit, PackGQA on / off, cga1 / cga2, HND / NHD, page 8–1024) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, HND / NHD, cga2) | ❌ | half THD ✅, including unpacked split (sink: unsplit, PackGQA on / off) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, cga1) · decode-shaped dense Q on the d256 decode tile ✅ (sink, PackGQA and split included)ᵈʳ | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense; and THD / packed sequences on the d256 prefill through the STANDALONE adapter -- `SdpaFwdDslSm100(thd=True, sample_gate=...)`, the gated attention block's packed `fuse_gate`; the graph tail stays dense-onlyᵛⁱⁱⁱ; + over PAGED pools on the shared SM100 d256 half body compiled for sm_107a through the STANDALONE adapter -- packed queries (the gated attention block's EXTEND form, `kv_source='paged'` + `fuse_gate=True`), PackGQA on or off, and dense paged queries past the decode tile; unsplit; the graph rows keep declining paged x gate outside the decode tile's splitᵛⁱⁱⁱ; + on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or not; not under execute-time shape overridesᵈʳ) · fp8 ✅ (bf16 G; dense only) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled; dense only) | ❌ | — | — |
-| Index-list sparse attention (`QsaSpec`: per-query lists of 4-token KV blocks + the open tail; frontend-only -- the gated attention block's sparse stage and the standalone adapter, no graph form; the `SM107 d256 index-list sparse forward` section below) | ❌ᵗ (the small tiles carry the dense leg only) | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense BSHD or packed THD sequences -- through the gated attention block and the standalone adapter --, or paged K / V pools through the standalone adapter; per-batch KV lengths; GQA group 1..16; `top_k` 4..512; the decode form through the standalone adapter and, since 2026-10-14, through the gated attention block's DECODE / extend-with-prefix mode -- `kv_source="paged"` on a dense `[B, S_q]` `QsaSpec` block over the pools, `block_table` / `kv_lens`, one list per sequence at `S_q <= 4` and one per row past it --: bottom-right positions, split-KV with the fp32 combine, the gate and the LSE; the in-block indexer (`QsaSpec(index_source="indexer")`, bf16 activations, dense `[B, S]` prompts) with a bf16 or -- since 2026-10-14, `index_cache_dtype=torch.float8_e4m3fn` -- an e4m3 indexer cache (plain e4m3 compressed keys and queries through the DSA MXFP8 scorer with unit scales; the caller's `index_k_compressed` e4m3; a different selection function, opt-in by dtype, bf16 the default and the reference); the in-block indexer's DECODE step over the pools since 2026-10-21 -- through the block's DECODE mode: the paged compressed-key cache + the ring, the paged scorer and the decode top-k, one list per row, `fuse_prepare` served on that mode -- and at decode the e4m3 compressed-key cache too (2026-10-21: the compress arms' e4m3 store = the e4m3 cast of the bf16 row, the paged scorer's fp8 `mma.sync` read arm, `index_cache_dtypes` `(bf16, e4m3)`))) | ❌ | ❌ |  ❌  |
+| Index-list sparse attention (`QsaSpec`: per-query lists of 4-token KV blocks + the open tail; frontend-only -- the gated attention block's sparse stage and the standalone adapter, no graph form; the `SM107 d256 index-list sparse forward` section below) | ❌ᵗ (the small tiles carry the dense leg only) | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense BSHD or packed THD sequences -- through the gated attention block and the standalone adapter --, or paged K / V pools through the standalone adapter; per-batch KV lengths; GQA group 1..16; `top_k` 4..512; the decode form through the standalone adapter and, since 2026-10-14, through the gated attention block's DECODE / extend-with-prefix mode -- `kv_source="paged"` on a dense `[B, S_q]` `QsaSpec` block over the pools, `block_table` / `kv_lens`, one list per sequence at `S_q <= 4` and one per row past it --: bottom-right positions, split-KV with the fp32 combine, the gate and the LSE; the in-block indexer (`QsaSpec(index_source="indexer")`, bf16 activations, dense `[B, S]` prompts) with a bf16 or -- since 2026-10-14, `index_cache_dtype=torch.float8_e4m3fn` -- an e4m3 indexer cache (plain e4m3 compressed keys and queries through the DSA MXFP8 scorer with unit scales; the caller's `index_k_compressed` e4m3; a different selection function, opt-in by dtype, bf16 the default and the reference); the in-block indexer's DECODE step over the pools since 2026-10-21 -- through the block's DECODE mode: the paged compressed-key cache + the ring, the paged scorer and the decode top-k, one list per row, `fuse_prepare` served on that mode -- and at decode the e4m3 compressed-key cache too (2026-10-21: the compress arms' e4m3 store = the e4m3 cast of the bf16 row, the paged scorer's fp8 `mma.sync` read arm, `index_cache_dtypes` `(bf16, e4m3)`)); the in-block indexer's EXTEND step over the pools since 2026-10-29 -- `index_select_form` `"extend"`, or `"auto"` past the decode scorer's envelope: a T-row chunk behind a cached prefix selects for itself over the paged compressed-key cache (the chunk compress with the ring read-only, the dense kbar gather, the compact-logits scorer per row window, the canonical-order kernel) and writes its complete blocks into that cache and its last `cap` raw keys into the ring (the cache-write ring arm at `index_state_slot_mapping`); `QsaSpec.index_compress_rounding` `"single"` / `"hf"` names every indexer writer's rounding points) | ❌ | ❌ |  ❌  |
 | Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Bias (additive, `[1\|B, 1\|H_q, S_q, S_kv]` in the Q/K/V dtype; the RESIDENT row-block inside its budget, the STREAMED per-kv-tile ring above it; dense / unsplit / unpaged, no score outputs)ᵗᵇ | ✅ᵗᵇ any S_kv: resident up to 768 for a batch-broadcast bias on ≥ 2 flattened rows (the (n, n+1) pair work item, a 128-row block) / 384 for a per-batch bias, the 3-stage streamed ring above | ✅ᵗᵇ any S_kv: resident up to 384 (the pair item, cga1) / 128 (cga1) / 256 (cga2) for a per-batch bias, the streamed ring above (the pair item's 3 stages at cga1; a per-batch bias at cga2's 2 stages -- cga1 holds no ring for its 256-row tiles) | ❌ (no SMEM for a block or a ring) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Per-key mask (`kv_mask`, a python-only `sdpa` input `[1\|B, 1, 1, S_kv]`: BOOLEAN = the bit word, False = the key is masked for every query; the Q/K/V dtype or FLOAT = an ADDITIVE per-key vector folded pre-scale like the bias, S_kv % 8 == 0, 16-byte strides)ᵗᵇ | ✅ᵗᵇ any S_kv (nothing staged in SMEM; the bit word validated to n_kv = 8, the additive forms to n_kv = 4; an fp32 vector WITH a bias runs TILE_N 64, the heuristics' pick) | ✅ᵗᵇ any S_kv (cga1; cga2 on request; both forms) | ❌ | ❌ | ❌ | ❌ | — | — |
@@ -2716,9 +2715,9 @@ capacities without specializing the artifact on them. A fresh plan with the
 same specialization and stepped strides reuses the process-local artifact for
 different totals and bounds, even without persistent caching. The standalone
 THD wrapper binds caller data strides and logical widths directly to this prepared packed chain.
-Graph and direct-adapter padded widths use that same native chain. Internal
-legacy staging helpers remain isolated; supported public declarations cannot
-reach them. Standalone adapters require caller workspace, and convenience
+Graph and direct-adapter padded widths use that same native chain. The unused
+staging executors and data-copy helpers have been removed.
+Standalone adapters require caller workspace, and convenience
 wrappers provide it.
 
 The standalone SM80 packed forward wrapper also uses a cached pointer host.
@@ -3364,7 +3363,9 @@ of the warp reduction boundary. No timing or preferred split count is asserted.
 
 The gated attention block (`cudnn.gated_attention_block`; `docs/operations/attention/gated_attention_block.md`) has no engine row and no
 `sdpa` graph form: its serving forms are claims of the BLOCK, recorded here one row per form x pool layout x page size x dtype,
-each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) for every form; the DENSE bf16 / f16 forms also on cc 10.0
+each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) for every form -- including, since 2026-10-30, the
+FP8-PROJECTION + BF16-ATTENTION mode of the paged forms (`QuantSpec(attention_dtype=torch.bfloat16)`: FP8 projections, bf16 pools and
+attention, the gated O quantized to e4m3; the "Served since 2026-10-30" paragraph below; `FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0))`: cc 10.0 too, functional only) --; the DENSE bf16 / f16 forms also on cc 10.0
 since 2026-10-29 (`DENSE_SERVING_CCS`; the "Admitted 2026-10-29" paragraph below: functional only, UNMEASURED; the cells RAN 2026-10-29 on the GB200 class -- cc 10.0, 152 SMs, one exclusive GPU: 351 passed / 0 failed / 392 skipped over eleven selections, every skip a Rubin-only row -- with the Rubin regression green the same day (cc 10.7, 204 SMs, a shared GPU, functional: 679 / 0 / 56 over nine modules); the 32-column decode
 arm declined by name there until its own cells run, `DECODE_WIDE_TILE_CCS`; cc 10.3 declined by name). The pool contract is the SDPA adapter's own
 paged contract -- a 4-D view `[num_pages, H_kv, page_size, D]`, `D` contiguous, the other three strides free: **L1** HND compact
@@ -3373,10 +3374,26 @@ content row (K at `+0`, V at `+D`, token stride `2D`) bound as its two halves --
 whole number of 16-byte vectors (a typed `ValueError` otherwise), `page_size` a positive multiple of 16, `slot_mapping [T]` int32 or
 int64 (a negative slot writes nothing; a slot past the pool writes nothing either).
 
+**The serving stacks' packed K|V cache = L3 at the stack's own shape** (2026-10-29): one `[num_pages, H_kv, P, 2D]` tensor per layer, K in
+columns `[0, D)` and V in `[D, 2D)` of every row (the 24 / 4 model family's HND cache `[pages, 4, 16 | 32, 512]`), bound as the two half views
+`kv[..., :D]` / `kv[..., D:]` -- strides `(H_kv*P*2D, P*2D, 2D, 1)` on both, the V base `D` elements past the K base; nothing repacked. One explicit
+cell per form (`requires_dense_part`: cc 10.7 AND cc 10.0; L0) at 24 / 4, `d_head` 256, `d_model` 512, int64 slots, bf16 and f16 -- DECODE
+`test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_form`: page 16 x `S_q` 1 and page 32 x `S_q` 4 over kv 2048 / 0
+(padded) / 5 / 1000 / 33 -- the oracle, the step's rows in the K half bitwise the slab's K band and in the V half the V band, the prefix rows
+unchanged, every row nobody addressed (block 0, the stale tail slots, the spare pages) still the sentinel in BOTH halves, two launches bitwise,
+`out` bitwise the HND-compact twin, the route pinned per part; EXTEND `test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views`:
+pages 16 and 32, four sequences at `T_max` 512 (a 148-token chunk completing a 2048-key context, an empty-prefix sequence, a padded entry, a
+100-token step over a 5-row prefix; `T_live` 376) -- the suite's `check` through both halves (the stale rows untouched in both, the NULL page
+zero), two launches bitwise, bitwise the HND-compact twin on the same histories and pages. Run, per form: DECODE cells ✅ cc 10.0 (2026-10-29, the SM100
+development part, 148 SMs, one shared GPU, functional: 4 / 4, and the module 117 passed / 0 failed / 80 skipped) and ✅ cc 10.7 (2026-10-29, the sm107
+job of the `python/misc` CI target on the change: 4 / 4 passed with the Rubin pool matrix 8 / 8); EXTEND cells ✅ cc 10.0 (the same development-part run:
+4 / 4, the module 86 passed / 0 failed / 113 skipped / 1 deselected) and cc 10.7 ✅ (2026-10-29, a Rubin development node, 204 SMs, a shared GPU, functional: the eight packed cells 8 passed / 0 failed (50 s); the modules decode 158 passed / 0 failed / 39 skipped (415 s) and extend 192 passed / 0 failed / 7 skipped / 1 deselected (212 s), the Rubin pool matrix among them; no timeout exit).
+
 **Served since 2026-10-12 -- the paged KV-cache WRITE-THROUGH** (`paged_kv_page_size > 0`, the block's `(4w)` stage: the post-RoPE
 K / V of every token into the caller's pools at `execute(k_cache=, v_cache=, slot_mapping=)`, after norm + RoPE and before the SDPA,
 which still attends over the block's own K / V; `out` bitwise the block's without it; `get_workspace_size()` unchanged; `quant`
-and `save_for_backward` with it are typed declines; a CuTe DSL below the floor is declined at `check_support`, named with the
+and `save_for_backward` with it are typed declines -- `quant` except the FP8-projection + bf16-attention mode on the paged forms since
+2026-10-30 (bf16 pools under it; the paragraph below); a CuTe DSL below the floor is declined at `check_support`, named with the
 installed version). Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim) at the 8 / 2 d256
 geometry, T = 512 (dense B = 2 x S = 256; packed sequences 300 / 0 / 128 / 84 -- a zero-length sequence in the packing), the
 default in-place pipeline, every 9th token padded (`-1`) on NaN-poisoned pools, int32 slots at pages 16 / 64 and int64 at 32 / 128:
@@ -3421,6 +3438,7 @@ tokens' pool rows bitwise the slab rows attention consumed, every unaddressed po
 | EXTEND `kv_source="paged"` (the paged THD read; bottom-right; bounded tokens) | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | EXTEND | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | EXTEND | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| EXTEND | L3 at the stacks' own shape `[pages, 4, P, 512]` (24 / 4), the two half views, int64 slots, kv to 2048 (2026-10-29) | bf16 ✅ f16 ✅ (cc 10.0; cc 10.7 ✅) | bf16 ✅ f16 ✅ (cc 10.0; cc 10.7 ✅) | -- (the L3 row above) | -- (the L3 row above) |
 
 Also validated (bf16): a one-sequence EXTEND with an EMPTY prefix at a tight declaration (`T_live = T_max = 384`) against the dense `B = 1`
 block on the same tokens -- the two bodies differ (the shared SM100 paged THD body vs the Rubin sibling): BITWISE on `out` and on the gated O (0 of 196 608 / 786 432 elements differ; both legs within the oracle budget, out cos 0.999995), pinned; a 512-token sequence
@@ -3501,6 +3519,7 @@ same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0
 | DECODE `[B, S_q]` over the pools | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | DECODE | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
 | DECODE | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| DECODE | L3 at the stacks' own shape `[pages, 4, P, 512]` (24 / 4), the two half views, int64 slots, kv to 2048 (2026-10-29) | bf16 ✅ f16 ✅ (cc 10.0 + cc 10.7) (`S_q` 1) | bf16 ✅ f16 ✅ (cc 10.0 + cc 10.7) (`S_q` 4) | -- (the L3 row above) | -- (the L3 row above) |
 
 Also validated: the block's form BITWISE the standalone `SdpaFwdDslSm100` on the same slab Q views / pools / table / gate at the
 same split and packing; paged == dense BITWISE (O and LSE) at the unsplit plan on the block's own operands (the padded dense
@@ -3620,7 +3639,54 @@ the plain chain, `thd=True` x the switch declined by name, the AUTO reading `Tru
 LOWERS stage (1) to the unfused chain -- `fuse_norm_rope_effective` reads it back; `True` keeps the fused fork for the A/B, and so does an
 explicit `fuse_cache_write=True`, the request for the arm that lives in the fork; `False` + `fuse_cache_write=True` is the typed decline).
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step past `S_q = 32` tokens (the DECODE form's `decode_rows` row: the EXTEND form's packed business), a pinned split on the prefill route, `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step past `S_q = 32` tokens (the DECODE form's `decode_rows` row: the EXTEND form's packed business), a pinned split on the prefill route, `save_for_backward` on the paged forms, `quant` on the paged forms OTHER THAN the FP8-projection + bf16-attention mode (`QuantSpec(attention_dtype=None)` -- the fp8 d256 SDPA pipeline --, `MxQuantSpec`, the fp4 modes: no paged leg; the mode itself is served since 2026-10-30, the paragraph below), e4m3 pools (`kv_cache_dtype`) on the DENSE paged forms (served on the block-sparse decode mode at `S_q <= 4` and as the quantizing write-through on the dense prefill forms -- the e4m3 paragraph below; under the mode too: its pools stay bf16), the write-through folded into the projection epilogue, `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
+
+**Served since 2026-10-30 -- the FP8-PROJECTION + BF16-ATTENTION mode on the paged forms** (`QuantSpec(attention_dtype=torch.bfloat16)`,
+spelled `QuantSpec.bf16_attention(descale_h, descale_w_qkvg, descale_w_o, scale_o)`; an op attribute appended to `QuantSpec`, never a knob; the
+spelling of a serving stack whose attention projections are static per-tensor FP8 W8A8 while its KV cache and attention math are bf16).
+The function: `h8 x W8_qkvg -> fp32 -> * alpha_qkvg -> bf16 slab` (the FP8 FROST GEMM on the forced 256-wide tile, the capture-safe jit-only
+route), bf16 QK-norm + RoPE in place (the DECODE form's write-through fold admitted), the post-RoPE K / V into bf16 pools (the pools STAY
+bf16), stage (4) the bf16 serving form's own kernels and routes over the pools (the d256 decode tile + its split combine / the paged d256
+prefill tile; the gate in the combine at split >= 2 / the paged body's epilogue on cc 10.7, its own launch otherwise), ONE quantize launch
+`o8 = cvt.rn.satfinite(bf16 O_gated * scale_o)`, `o8 x W8_o -> fp32 -> * alpha_o -> bf16 out` with `alpha_o = descale_w_o / scale_o`.
+`scale_q` / `scale_k` / `scale_v` are None (no quantization point; each refused by name if set); no descale reaches the SDPA; the carve holds
+no compact e4m3 Q / K / V (`o8` alone; every carve without the mode byte-identical); three device scalars (`alpha_qkvg`, `alpha_o`, `scale_o`)
+written on the launch stream at the first execute and by `update_quant_scales` (`attention_dtype` a plan fact of it); `serving_envelope(...,
+quant=spec)` predicts the mode and each form's `quant_modes` names the spelling served on the part.  The static-scale mapping (the docs'
+"Serving: FP8 projections with bf16 attention"): `descale_h` = the qkv projection's input scale, `descale_w_qkvg` = the merged qkv weight's one
+per-tensor scale (`qkvg_from_vllm` / `qkvg_from_hf` permute e4m3 codes as bytes, the scale untouched), `descale_w_o` = the o projection's weight
+scale, `scale_o` = 1 / the o projection's input scale.  Served (each an accept cell, host + cc 10.7): the dense DECODE form (every route the bf16
+form takes: the decode tile packed / token units / unpacked, the prefill route) and the packed EXTEND form; pages 16 / 32 / 64 / 128, L1 / L2 /
+L3 pools, `inplace_qkv` None / True, `fuse_norm_rope=False`, `fuse_gate` as the bf16 form reads it, `fuse_cache_write_small_m` None / True /
+False, the decode route knobs, `update_quant_scales`, CUDA-graph capture of the FIRST execute, the 24 / 4 geometry at `d_model` 5120 on a
+serving stack's packed K|V rows.  Refused BY NAME (each a reject cell): `kv_source="self"` (dense or packed, with or without the write-through),
+`fuse_norm_rope=True` (and `fuse_norm_rope_small_m` / an explicit `fuse_cache_write=True` with it), `inplace_qkv=False`, `save_for_backward` /
+`return_lse` (an inference form), `kv_cache_dtype=torch.float8_e4m3fn`, a `QsaSpec` geometry, `use_pdl=True` (AUTO False), `num_tokens_live`,
+`MxQuantSpec` and `QuantSpec(attention_dtype=None)` on the paged forms (the write-through's decline names the mode as the way in),
+`attention_dtype=torch.float16`, 16-bit `h` with the QuantSpec, and the mode on a served dense part off `FP8_PROJ_BF16_ATTENTION_CCS` (none today: cc
+10.0 is admitted below; the gate stays for a further dense part).  Numerics: the oracle (the fp8 reference's `attention_bf16` arm) replicates the mode's one quantization point; the bound is the bf16
+serving forms' own (`cos(out) > 0.999`, a padded entry exactly 0, block 0 untouched -- never the fp8 suite's 0.99); the e4m3 O is BITWISE the
+cast of the block's own gated bf16 O (the store pin) and within one e4m3 ulp of a serving stack's gate-and-quantize model `e4m3(bf16(bf16(O) *
+sigmoid(G)) * scale_o)` on the e4m3 value band `|x| >= 4` (one ulp there >= 0.5, above the chain's bf16 noise; the rest reported, never claimed;
+never bitwise: two roundings against one on the combine route, the kernels' sigmoid against torch's); `satfinite` saturation at +-448, never
+NaN / inf.  Cells (one per code path, `test_block_serving_decode.py` / `test_block_serving_extend.py` `quant=` arms of the bf16 harnesses +
+`test_block_fp8_bf16_attention.py`): DECODE -- every served group (16 / 12 / 8 / 6 / 4) x `S_q` 1 .. 5 at the standard lengths (a tail tile, the
+ring depth, four tiles with a tail, a padded entry), the 27B 24 / 4 geometry at `d_model` 5120 on packed K|V rows (page 16 x `S_q` 1, page 32 x
+`S_q` 4), the e4m3 O store pin + gate-quant histogram + saturation through `update_quant_scales`, `get_workspace_size()` honesty, the capture of
+the first execute + the replay over a new step, `update_quant_scales` after a warmed-up capture (the live values, the oracle at the new
+`scale_o`), the pool matrix (L1 / L2 / L3 x pages 16 / 32 / 64 / 128), the launch census on both parts (B 2 x S_q 1, every kernel counted: cc 10.7 6 / 7
+with the gate in the combine and 7 / 8 with the separate gate, cc 10.0 7 / 8 -- folded / separate cache write, the bf16 unfused chain's own
+counts with the quantize launch in the place of its small-M split-K reduce; the fold drops exactly the cache-write launch); EXTEND -- the degenerate matrix (hnd 16, unified 32; nhd 64 / hnd 128 at L1), two chunks then a prefix hit on L3, a
+middle pad + a live-Q dead-KV entry (bytes 0) + the lengths form, the gate in the paged body's epilogue vs the separate launch (one bf16
+rounding), the e4m3 O store pin + model, the 27B geometry; the FP8 forced-tile GEMM at the mode's shapes on the capture-safe route (both parts).
+RUN RECORD: cc 10.0 RAN 2026-10-30 on the SM100 development part (148 SMs, a SHARED GPU, functional only): the FP8 forced-tile GEMM cell 6 passed / 0 failed, the mode's DECODE cells 35 passed / 0 failed / 1 skipped (the Rubin-only launch census), its EXTEND cells 8 / 0 / 1 (the Rubin-only epilogue-gate row), the mode's own module 15 / 0 / 0; cc 10.7 RAN 2026-10-30 on a Rubin development part (204 SMs, a SHARED GPU, functional only): the mode's own module 15 passed / 0 failed; the mode's DECODE cells 35 passed / 1 failed / 0 skipped and its EXTEND cells 9 / 0 / 0 (the Rubin-only epilogue-gate and launch-census rows RAN; the gate-quant histogram on the combine route: 0 codes beyond one e4m3 ulp in the band |x| >= 4) -- the one failure is the launch-census cell, refused at `check_support` by the GATE layout predicate of the dense-layout binding change for a batch 1 x one-token declaration with the gate in the combine: a develop defect that four bf16 serving cells and two PDL detector cells of the same tree reproduce on develop itself (`epilogue_gate_layout_declarable` tests `bshd_compact` on the raw strides while `bshd_zero_copy_stride` canonicalizes the singleton axes first and returns None for the canonical compact layout), not of this change, fixed separately.  The nine-module regression of the same tree on that part: 693 passed / 9 failed / 56 skipped -- the nine = that defect (seven, the census among them) and two test-side `torch.exp2` jit failures in the mode's store-pin cells, fixed in the follow-up commit of this change (both cells green on both parts afterwards).  Review follow-up (2026-10-30): the launch-census cell re-pointed to a batch 2 x one-token declaration at KV 512 with the split ladder pinned at 4 and NO numerical reference (a launch-count cell: ~40 s on cc 10.7, ~140 s on cc 10.0, compiles included; the predicate admits batch 2; the chain has no batch- or KV-dependent kernel) on every served part with every kernel counted -- RAN green on cc 10.7 (1 passed: 7 / 6 launches with the gate in the combine, 8 / 7 with the separate gate; separate cache write / folded) and on cc 10.0 (1 passed: 8 / 7), the same development parts; the mode's five EXTEND cells carry level marks (L0 on the dead-row / lengths-form cell and the e4m3 store pin, L1 on the rest), so `-m L0` runs them.  No performance number is claimed (the FP8 forced-tile GEMM at decode row counts is a functional claim; any development-GPU timing is
+indicative only).  cc 10.0 (`FP8_PROJ_BF16_ATTENTION_CCS = ((10, 7), (10, 0))`): admitted 2026-10-30 by the FP8 forced-tile GEMM cell
+(`test_fp8_forced_tile_projection_gemm_with_the_alpha_epilogue_runs_on_the_capture_safe_route`: six shapes, the forced
+`128x256x128` cluster-2 tile, each within one bf16 ulp of the dequantized fp32 product) and the mode's DECODE / EXTEND cells on the SM100
+development part -- the gate always its own launch there (the sm100 row claims no gate epilogue), every other piece the bf16 forms' (admitted
+2026-10-29) plus the part-free quantize launch; functional only, unmeasured; a further part lifts the same way.  Follow-ups, not served: the fused gated e4m3 store in the dense decode tile's split combine
+(the sparse adapter carries it; the dense adapter has no `out_scale`), the FP8 small-M GEMM arm at decode row counts, the mode over the block's
+own K / V, an e4m3 KV cache under the mode, `use_pdl=True`, `num_tokens_live`.
 
 **Admitted 2026-10-29 -- the DENSE bf16 / f16 serving forms on cc 10.0 (the SM100 line: B200 / GB200; `DENSE_SERVING_CCS = ((10, 7), (10, 0))`),
 FUNCTIONAL ONLY, UNMEASURED; the cc 10.0 cells RAN 2026-10-29 (the run record in the cells table below).**  The block's part gate reads ONE tuple (`_Sdpa.check_support`, the envelope's part
@@ -3642,7 +3708,8 @@ typed `NotImplementedError` naming the lift; host rows on any device + the on-pa
 fused projection forks (`fuse_norm_rope=True` on the EXTEND form and on the dense form past 128 rows, `fuse_norm_rope_small_m=True`, an
 explicit `fuse_cache_write=True`: `sm_107a` renderings -- the DECODE form's C0 lowering keeps `fuse_norm_rope=True` SERVED at decode row
 counts, lowered to the unfused chain); `quant` (QuantSpec / MxQuantSpec: the Rubin FP8 / MXFP8 d256 SDPA rows + the forks; the lift is
-the FP8-projection + bf16-attention mode); `save_for_backward=True` (the backward binds `SdpaBwdDslSm107`); `thd=True` over the block's own
+the FP8-projection + bf16-attention mode -- which EXISTS since 2026-10-30, `QuantSpec(attention_dtype=torch.bfloat16)`, and IS served on cc
+10.0 through its own tuple `FP8_PROJ_BF16_ATTENTION_CCS`, its GEMM and DECODE / EXTEND cells green on the SM100 development part the same day); `save_for_backward=True` (the backward binds `SdpaBwdDslSm107`); `thd=True` over the block's own
 K / V (no packed self-attention cell through the block there; the EXTEND form is the served packed form); a `QsaSpec` geometry on any
 `kv_source` -- the sparse core, the LEAN TILE THROUGH THE BLOCK (the standalone adapter's explicit lean admission of 2026-10-28 is not the
 block's: the block's sparse stage declines before the adapter), the in-block indexer, the e4m3 cache; `decode_q_tile_max` (the Rubin
@@ -3703,6 +3770,7 @@ no performance number exists for any cc 10.0 cell.  The 32-column decode arm is 
 |---|---|---|
 | DECODE `[B, S_q]` over the pools | every served group (16 / 12 / 8 / 6 / 4) x `S_q` 1 .. 5 at d_model 512 on the SM100 route above (`test_sm100_decode_matches_the_oracle_at_every_group_and_s_q`); the 27B geometry 24 / 4 at d_model 5120 (`S_q` 1 at page 16: tile 16; `S_q` 4 at page 32: U16); the pool matrix L1 HND / L2 NHD / L3 unified x pages 16 / 32 / 64 / 128 x bf16 / f16 at 24 / 2 `S_q` 2 (bitwise across the layouts); two launches bitwise + the workspace sentinel; capture / replay of the FIRST execute with new lengths / tables / slots / inputs; the explicit `use_pdl=True` chain bitwise the plain one (dec + pdl: the default, the unfused-auto and the unfused-unsplit declarations); the prefill route at 32 / 2 `S_q` 2 / 5, 8 / 1 `S_q` 3, 4 / 1 `S_q` 5 at the standard batch (mtp) | ✅ 2026-10-29, the GB200 class (cc 10.0, 152 SMs); functional, UNMEASURED |
 | EXTEND `kv_source="paged"` + `token_capacity` | the degenerate matrix cell bf16 / HND / 16 (L0) + f16 / unified / 64 + bf16 / NHD / 32 (int64 slots) + f16 / HND / 128 (`test_sm100_extend_matrix_cell`); the 27B 24 / 4 EXTEND at d_model 5120 (two sequences at T_max 256, page 16); two launches bitwise + the `[B]` lengths form | ✅ 2026-10-29, the GB200 class (cc 10.0, 152 SMs); functional, UNMEASURED |
+| the packed K\|V rows cells, both forms (`requires_dense_part`: the stacks' `[pages, 4, P, 512]` tensor as two half views at 24 / 4, pages 16 / 32, int64 slots, kv to 2048, bf16 / f16; the paragraph under the pool contract above) | `test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_form` (4 cells) + `test_extend_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views` (4 cells) | ✅ 2026-10-29 on the SM100 development part (cc 10.0, 148 SMs, one shared GPU; functional, UNMEASURED: the new cells 8 / 0, decode 117 / 0 / 80 skipped, extend 86 / 0 / 113 skipped) and on the sm100 job of the `python/misc` CI target (the DECODE cells 4 / 4); cc 10.7 per form: DECODE ✅ (the sm107 CI job, 4 / 4), EXTEND ✅ (a Rubin development node, 2026-10-29: 8 passed / 0 failed (50 s) on the eight packed cells; decode 158 passed / 0 failed / 39 skipped (415 s), extend 192 passed / 0 failed / 7 skipped / 1 deselected (212 s)) |
 | dense prefill `[B, S]` (`kv_source="self"`) | `test_block_end_to_end.py`'s `requires_dense_part` cells: the fp32 oracle at S 256 / 512 (qk_norm on / off), the RoPE-only passthrough, the non-causal arm, the dead-row (padded) arm, the second execute, the caller stream, in-place == out-of-place, the Qwen3.8 family at S 512 / 2051; the flag-free projection route and the zero-warm-up capture of `test_block_serving_capture.py` | ✅ 2026-10-29, the GB200 class (cc 10.0, 152 SMs); functional, UNMEASURED |
 | the declines | `fuse_gate` / the fused forks / `quant` / `save_for_backward` / `thd` + `self` / a `QsaSpec` geometry (the explicit lean tile through the block) / the cap / the 32-column arm (U32 at any launch, W at a wide one): the cc 10.0 reading on any host + the on-part twins | ✅ host rows green on an sm_80 host (the sm80 reading and the simulated cc 10.0 reading); the on-part twins green in the 2026-10-29 cc 10.0 run (the W twin, added by the review follow-up, awaits that part's next run) |
 | the 32-column decode arm (`W`: 17 .. 32 packed rows on a wide launch; `U32`: an unpacked step of 17 .. 32 tokens) | NOT RUN -- declined by name (`DECODE_WIDE_TILE_CCS = ()`); the host rows pin the decline at the geometries that would have hit it, the small-launch reading unchanged and the one-tuple lift restoring the adapter's rule; its accept cells ARE the lift | ⛔ declined until its cells run |
@@ -3771,16 +3839,16 @@ rows exact, the pools' step rows BITWISE the slab's K / V bands, the prefix rows
 | indexer position tables (2026-10-21) | 4 / per row, `rope_position_tables_only=True` | 4: 8191, 2, 0, 300 | L1 page 16 | 4 | fused / LSE ; `fuse_prepare` | bf16 ✅ (BITWISE the per-token form; `cos` / `sin` refused) |
 | indexer MTP residues (2026-10-21) | 4 / per row, `pos_0 mod 4` in 0..3 on ~60-token sequences | 2 | L1 page 16 | 1 | fused / LSE ; both knob readings | bf16 ✅ (the `4k + 3` row sees and lists its own block; no earlier row lists it) |
 | indexer workspace sentinel (2026-10-21) | 1 / per row | 3: 4096, 512, 0 | L1 page 16 | 8 | fused / -- ; the unfused prepare | bf16 ✅ (a sentinel past `get_workspace_size()` untouched; the five slots 16-byte aligned) |
-| indexer multi-step (2026-10-21) | 1 then 4 / per row: eight carried steps after a 301-token PREFILL | 1 | L1 page 16 | the fill rule | fused / LSE ; both knob readings | bf16 ✅ (`test_block_qsa_end_to_end.py`: the prefill's `index_k_compressed` rows scattered into the paged cache, the ring primed from the slab's band; a rejected draft re-stepped; after every step the cache rows BITWISE a from-scratch compress of the accepted stream; the completing row sees its own block) |
+| indexer multi-step (2026-10-21) | 1 then 4 / per row: eight carried steps after a 301-token prompt as EXTEND chunks (2026-10-29) | 1 | L1 page 16 | the fill rule | fused / LSE ; both knob readings | bf16 ✅ (`test_block_qsa_end_to_end.py`: since 2026-10-29 the prompt runs as CHUNKS [125, 2, 1, 173] through the EXTEND step, which primes the paged cache and the ring itself -- no scatter by the test; a rejected draft re-stepped; after every step the cache rows BITWISE a from-scratch compress of the accepted stream; the completing row sees its own block) |
 | caller-list band + `fuse_prepare` (2026-10-21) | 1 and 4 / per row, `index_source="caller"` | 4: 2052, 300, 0, 4097 | L1 page 16 ; page 64 | 2 | fused / LSE | bf16 ✅ (BITWISE the two-stage form incl. the raw-key pool; one launch fewer) |
 
 **Served since 2026-10-21 -- the in-block indexer's DECODE step over the pools** (`QsaSpec(index_source="indexer", index_band=True)` on the
 block-sparse DECODE mode above; bf16; the `indexer ...` rows of the table): the block derives the step's selection itself from its
 band -- `_IndexerDecode` (stage name `qsa_indexer`) in the indexer's slot between the prepare / write-through and the sparse core.
 Declared with three more samples -- the PAGED compressed-key cache `[n_pages, P / 4, 1, 128]` (row `j` of sequence `b` on page
-`block_table[b, j // (P / 4)]`; page 0 the null page), the RING of raw indexer keys `[blocks, cap >= S_q + 3, 1, 128]` (position-indexed,
-`pos % cap`; block 0 the null block; the compress kernel's `min_ring_rows` rule, spelled DSL-free in the api and drift-checked at plan
-time) and its `[B, 1]` int32 table -- and executed with `w_iq_norm` / `w_ik_norm`, the three caches, the position tables `cos_pos` /
+`block_table[b, j // (P / 4)]`; page 0 the null page), the RING of raw indexer keys `[blocks, cap, 1, 128]` (position-indexed,
+`pos % cap`; block 0 the null block; `cap >= S_q + 3` on the DECODE step and `cap >= 3` on the EXTEND step -- the compress kernel's
+`min_ring_rows` rule per form, spelled DSL-free in the api and drift-checked at plan time) and its `[B, 1]` int32 table -- and executed with `w_iq_norm` / `w_ik_norm`, the three caches, the position tables `cos_pos` /
 `sin_pos` `[1 or B, >= max_pages x P, rope_dim]` (the CEILING on positions; one row short refused by form before any stage) and the
 optional `block_ids_out` / `block_lens_out`; `block_ids` / `block_lens`, `index_k_raw`, `index_k_compressed` and `n_commit` refused by
 name.  The step: the pool-1 query compress (bitwise the prefill form's), the raw keys into the ring and the block a row completes
@@ -3806,12 +3874,15 @@ logits `[T, max_pages x P / 4]`, the counts, the ids, the compressed-slot report
 `index_cache_dtypes`, `index_head_dims`, `index_kv_heads`, `index_block_sizes`, `index_top_k_range`, `index_query_rows_max` (64),
 `index_state_rows_extra` (3), `index_page_sizes` (16 / 32 / 64 / 128), `fuse_prepare_default`; `kv_cache_dtypes` narrows to `(bf16,)`
 under the indexer.  Typed declines by row name, the raised text EQUAL to the envelope's row: `indexer_query_rows` (`S_q x
-next_pow2(index_heads) > 64`), `indexer_page_size` (`P / 4` not a power of two), `indexer_e4m3_pool` (the sparse core's in-kernel dequant
+next_pow2(index_heads) > 64` -- since 2026-10-29 under the explicit `index_select_form="decode"` pin only, `"auto"` taking the EXTEND step past the
+envelope), `indexer_page_size` (`P / 4` not a power of two), `indexer_e4m3_pool` (the sparse core's in-kernel dequant
 arm), `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`,
 `indexer_head_dim`, `indexer_thd`, `shared_list_rows`; `use_pdl=True` on the sparse chain keeps the existing decline (the stage threads
-the switch it is handed: `pdl_names` the kernels that would take it).  LIMITATION: no FROST writer of the paged compressed-key cache at
-PREFILL -- the prefill form writes `index_k_compressed` densely; the serving stack scatters the rows into the pages and primes the ring
-(the multi-step row does exactly that).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim;
+the switch it is handed: `pdl_names` the kernels that would take it).  Served since 2026-10-29: the EXTEND step (its own paragraph below)
+writes the paged compressed-key cache and the ring at prefill -- the multi-step row runs the prompt as chunks through it; the former
+LIMITATION (no FROST writer at prefill, a stack-side scatter) is closed.  `QsaSpec.index_compress_rounding` (`"single"` / `"hf"`) is a compile
+key of EVERY indexer writer -- the prefill form's two recipes, the step form, the fused prepare's arms (2026-10-30: threaded into the prefill
+and decode stages; the multi-step row and a prefill-form cell run under both values).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim;
 `test_block_qsa_decode.py`, `test_block_qsa_end_to_end.py`) against the two-stage oracle: the step's SET equals the fp64 top-k of the
 block's own `(ix_q, kbar)` up to ties (`TIE_TOL` 1e-4), every row's attention within `cos(out) > 0.999` / atol 2e-2 of the fp32 oracle fed
 the kernel's list, the ring rows bitwise the slab's raw band, the completed cache rows bitwise the compress kernel, dead rows exact.
@@ -3820,7 +3891,59 @@ the kernel's list, the ring rows bitwise the slab's raw band, the completed cach
 | indexer e4m3 identity (2026-10-21) | 1 / per row, e4m3 cache | 4: 2048 (= `top_k` visible blocks) | L1 page 16 | 8 | fused / LSE | e4m3 ✅ (the list `511 .. 0`; bitwise the caller-list block fed the full list) |
 | indexer e4m3 census (2026-10-21) | 1 and 4 / per row, e4m3 cache | 4: 4096, 300, 0, 2051 ; 4: 4095, 2, 0, 2052 | L1 page 16 | 4 | fused and unfused / LSE | e4m3 ✅ (fused == unfused BITWISE on out, the LSE, the gated O, the pools, the ring, the e4m3 cache, `ix_q`, the list; 8 / 11 launches by kernel NAME -- no cast kernel; no memset / memcpy / allocation / host sync) |
 | indexer e4m3 capture (2026-10-21) | 2 / per row, e4m3 cache | 4: 300, 0, 1000, 77 | L1 page 16 | 4 | fused and unfused / LSE | e4m3 ✅ (the FIRST execute captured with no warm-up, the replay bitwise eager incl. the e4m3 cache; a new step through the captured tensors) |
-| indexer e4m3 multi-step (2026-10-21) | 1 then 4 / per row: eight carried steps after a 301-token e4m3 PREFILL | 1 | L1 page 16 | the fill rule | fused and unfused / LSE | e4m3 ✅ (`test_block_qsa_end_to_end.py`: the prefill form's e4m3 `index_k_compressed` rows scattered into the paged e4m3 cache, the ring primed bf16; after every step the cache rows BITWISE a from-scratch e4m3 compress of the accepted stream -- one rounding convention across the prefill form, the step form and the fused prepare) |
+| indexer e4m3 multi-step (2026-10-21) | 1 then 4 / per row: eight carried steps after a 301-token e4m3 PREFILL | 1 | L1 page 16 | the fill rule | fused and unfused / LSE; `index_compress_rounding` `"single"` and `"hf"` | e4m3 ✅ (`test_block_qsa_end_to_end.py`: since 2026-10-29 the prompt runs as CHUNKS [125, 2, 1, 173] through the EXTEND step storing e4m3 directly, the ring bf16; after every chunk / step the cache rows BITWISE a from-scratch e4m3 compress of the stream compiled under the SAME attribute -- one rounding convention across the chunk form, the step form and the fused prepare, under both values since 2026-10-30) |
+| indexer extend ladder 1 (2026-10-29) | T 20 / per row, `index_select_form` auto -> EXTEND (a chunk behind a 301-token prefix, residue 1) | 1: 321 | L1 HND page 16, ring cap 4 | the fill rule | launch / LSE | bf16 ✅ (`test_block_qsa_extend.py`, the two-stage oracle for the chunk form: the SET == the fp64 top-k of the block's OWN `(ix_q, kbar)` up to ties on every live row; EVERY complete block of the stream BITWISE the from-scratch compress after the chunk, the primed prefix untouched; the ring = the sequence's last cap positions bitwise the stream's raw band, every other slot untouched; `out` / the gated O / the LSE within the module's bars of the fp32 oracle fed the kernel's list; two executes bitwise with the side caches restored; the chunk-start pin -- a row lists the straddling block iff it completes at or before that row) |
+| indexer extend ladder 2 (2026-10-29) | T 128 / per row, a dead entry | 2: 6272, 0 | L2 NHD page 32, cap 8 | the fill rule | fused (epilogue) / LSE | bf16 ✅ (the dead sequence exact: counts 0, every slot -1, the report -1, no cache / ring row) |
+| indexer extend ladder 3 (2026-10-29) | T 300, residue 3 | 1: 8495 | L1 page 16, cap 4 | 2 | fused (combine) / -- | bf16 ✅ |
+| indexer extend ladder 4 (2026-10-29) | T 512, residue 2 | 1: 6658 | L1 page 16, cap 4 | the fill rule | fused / LSE | bf16 ✅ |
+| indexer extend ladder 5 (2026-10-29) | T 2 at residue 2 (one block completes); T 2 at residue 1 and T 1 at residue 2 (`T < 4 - P % 4`: NO block completes, the tail alone enters the ring) | 1: 8196 ; 1: 8195 ; 1: 8195 | L1 page 16, cap 4 | 1 | launch / LSE | bf16 ✅ (the `T < cap` chunks carry the ring's tail through the cache-write ring arm) |
+| indexer extend ladder 6 (2026-10-29) | T 2048, residue 0 | 1: 8192 | L3 unified page 16, cap 4 | 1 | fused / LSE | bf16 ✅ |
+| indexer extend ladder 7 (2026-10-29) | B 4 x T 512 behind 30720 | 4: 31232 x 4 | L1 page 16, cap 4 | the fill rule | fused / LSE | bf16 ✅ |
+| indexer extend ladder 8 (2026-10-29) | T 2052 at P 0: the identity rows + the first sparse row | 1: 2052 | L1 page 64, cap 8 | the fill rule | launch / LSE | bf16 ✅ (row 2051 drops its oldest block) |
+| indexer extend ladder 9 (2026-10-29) | T 128 behind a 122880-token prefix at the 128K reach (`n_blocks_max` 30752) | 1: 123008 | L1 page 128, cap 4 | the fill rule | fused / LSE | bf16 ✅ (the oracle's prefix-only construction; the 15 MiB window scratch) |
+| indexer extend windows (2026-10-29) | T 20 x B 4 at a lowered select budget: two windows | 4: 4116, 320, 0, 2071 | L1 page 16, cap 4 | 4 | fused / LSE | bf16 ✅ (the window count changes no bit: the list and `out` bitwise the one-window block; the census + 2 launches per further window) |
+| indexer extend e4m3 cache (2026-10-29) | T 20 / T 300 / T 2048, `QsaSpec(index_cache_dtype=torch.float8_e4m3fn)` | 1: 321 ; 1: 8495 ; 1: 8192 | L1 page 16 ; unified page 16 | the fill rule, 2, 1 | launch and fused / LSE and -- | bf16 activations, e4m3 cache ✅ (the chunk form's e4m3 store arm: the cache rows and `ix_q` BITWISE the bf16 twin's `.to(e4m3)`; the agreement a statistic with every flip at the rank boundary) |
+| indexer extend 24 / 2 (2026-10-29) | T 20 and T 128 (residue 2) at `d_model` 2560 | 1: 321 ; 1: 6274 | L1 page 16, cap 4 | the fill rule | fused / LSE | bf16 ✅ (the band slab on the small-M route) |
+| indexer extend vs decode (2026-10-29) | the `"extend"` pin at S_q 1 / 2 / 4 vs the DECODE form on the same inputs | 3: 8195, 301, 0 ; 2: 8194, 2052 ; 4: 8191..8188 | L1 page 16, cap 8 | the fill rule | fused / LSE | bf16 ✅ (the same selection SET up to ties, the same `out` within the budget -- never bitwise, two scorers --, the ring and the cache BITWISE after both) |
+| indexer extend cache parity (2026-10-29) | T 300 (residue 3) and T 2 (residue 2) under `index_compress_rounding` `"single"` and `"hf"` | 3: 8495, 0, 321 ; 2: 8196, 2052 | L1 page 16, cap 4 | the fill rule | launch / LSE | bf16 ✅ (every complete block BITWISE the from-scratch compress under the same attribute; `"hf"` within the kernel module's statistic gate of the HF-rounding oracle -- >= 99.9 % bitwise, every element within 6 io ulps at the larger rotation operand --, `"single"` within one io ulp of the fp32 oracle at the same yardstick) |
+| indexer prefill-form rounding (2026-10-30) | the PREFILL form (`kv_source="self"`, `index_k_compressed` out) at S 2560 under `index_compress_rounding` `"single"` and `"hf"`, bf16 and e4m3 cache | 1: 2560 | dense | -- | launch / LSE | ✅ (`test_block_qsa_end_to_end.py`: the compressed-key slot, the caller's cache and the `ix_q` slot BITWISE the compress kernel compiled under the same attribute over the block's own band; e4m3: the cast rows bitwise the e4m3 store arm; the two chains differ on these rows, so the attribute is observable) |
+| indexer extend contract (2026-10-29) | T 48: a SHORT sequence (`0 < kv_lens < S_q`) and a sequence PAST the table's reach | 3: 300, 0, 20 ; 3: 389, 0, 1000 | L1 page 16, cap 4 | the fill rule | launch / LSE | bf16 ✅ (the reports -2 / -3 in the workspace's per-sequence report; the dead sequence exact beside them; the -3 case through the indexer stage alone: the sentinel past every piece's compact slab and past `get_workspace_size()` untouched, the compress's blocks past the table -2) |
+| indexer extend workspace / census / capture (2026-10-29) | T 128 (bf16 and e4m3) ; the 24 / 2 geometry at T 20 ; T 24 | 3: 4224, 428, 0 ; 4: 4116, 320, 0, 2071 ; 3: 321, 0, 2075 | L1 page 16, cap 4 | the fill rule, 4 | fused / LSE | bf16 ✅ (`get_workspace_size()` honest with the window scratch inside -- a sentinel past it untouched, every slot 16-byte aligned --, no allocation and no host sync over three executes after the first; the CUPTI census by kernel NAME = the caller-list band block + 6 at one window -- the pool-1 `frost_qsa_compress`, `frost_qsa_compress_step`, `cudnn_block_qsa_kbar_gather`, the scorer + top-k pair, `cudnn_block_qsa_canonical_list`; the raw-key `frost_cache_write` replaced by the RING write -- and + 2 per further window, no memset / memcpy; the capture after ONE eager warm-up replays bitwise eager, a new chunk through the captured buffers bitwise eager) |
+| indexer extend multi-step (2026-10-29) | the 301-token prompt as CHUNKS [125, 2, 1, 173] through the EXTEND step, then the eight carried decode steps | 1 | L1 page 16, cap 8 | the fill rule | fused / LSE ; both decode knob readings | bf16 and e4m3 cache ✅ (`test_block_qsa_end_to_end.py`: the side caches primed by the chunks' own writes -- no scatter --, after every chunk the counts / the complete visible set descending / the chunk-start pin / the attention within budget / the pools' rows / the ring's last cap positions / EVERY complete block bitwise the from-scratch compress; then the eight decode steps unchanged) |
+
+**Served since 2026-10-29 -- the in-block indexer's EXTEND step over the pools** (`index_select_form="extend"`, or `"auto"` past the decode
+scorer's envelope `S_q x next_pow2(index_heads) <= 64`; the `indexer extend ...` rows of the table): a T-row CHUNK of every sequence behind a
+cached prefix of `P = kv_lens[b] - T` tokens (`P = 0` the first chunk) -- `_IndexerExtend` (stage name `qsa_indexer`) in the indexer's slot:
+the pool-1 query compress, the step compress's CHUNK form with the ring READ-ONLY (`ring_write=False`: every chunk row that completes a block
+pools it from the ring -- the straddling block -- and the chunk's rows into the paged compressed-key cache through the main table, bitwise the
+from-scratch prefill compress), the dense kbar gather `cudnn_block_qsa_kbar_gather` (every visible compressed row through the table into
+`[B, max_pages x P / 4, 128]`, the per-row counts, the select pieces' first query positions clamped so no scorer write leaves its slab, a
+per-sequence report), the DSA compact-logits scorer + fused radix top-k per row WINDOW (`R = min(T, max(16, QSA_EXTEND_SELECT_BUDGET_BYTES //
+(n_blocks_max x 4)))` rows per launch pair over ONE fp32 scratch slot; the 512 MiB budget a module constant published in the envelope, not a
+knob), the canonical-order kernel `cudnn_block_qsa_canonical_list` in place (ids descending, `-1` past the count); the cache-write stage's RING
+arm then writes the chunk's last `cap` raw keys at `execute(index_state_slot_mapping=)` (REQUIRED on this form), AFTER the chunk compress's ring
+reads in stream order.  `4 + 2 x n_windows` indexer launches (the whole step: 12 launches at one window, 13 with a split -- the combine's --, + 2 per further window).  Always unfused (`fuse_prepare`
+None reads False; an explicit True is the typed `indexer_extend_fuse_prepare`); `rope_position_tables_only=False` (`indexer_extend_rope_tables_only`);
+the ring sample `cap >= 3` (`indexer_extend_ring_rows`: the kernel's TRUE bound `min_ring_rows(..., ring_write=False)`, spelled DSL-free as
+`index_extend_ring_rows_min` and drift-checked at plan time; the DECODE step keeps `cap >= S_q + 3`); `S_q <= max_kv_len`
+(`indexer_extend_chunk_rows`, the raised text the envelope's row + the two numbers).  The ring INPUT contract (positions `4 floor(P / 4) .. P - 1`
+already in the ring) and the DEVICE-VALUE contract (`kv_lens[b] in {0} u [S_q, max_pages x P]`: a dead sequence exact, `0 < kv_lens < S_q`
+reported `-2`, past the table `-3` -- memory-safe by construction, never raised, never read by the block) are stated in the docs.  The carve: the
+caller-list band block's + nine slots at the END (the window scratch last).  The first execute uploads the window plan's constants: a capture
+takes the block after ONE eager warm-up.  `QsaSpec.index_compress_rounding` (`"single"` the reference / `"hf"` the HF / vLLM rounding points,
+not their bits) names every indexer writer's rounding points; the extend chunk, the prefill form and the decode step are one chain per
+convention.  Mixed steps: TWO plans per layer (the decode step and the extend step) back to back on one stream; ragged chunks several extend
+executes grouped by `T` (the interim contract until the packed sparse arm).  The envelope publishes `index_select_forms`,
+`index_extend_ring_rows_min` (3), `index_extend_select_budget_bytes`, `index_compress_roundings`; the `indexer_query_rows` row stays reachable
+under the explicit `"decode"` pin.  The canonical order is the BLOCK's on every form (the prefill form's identity list is descending since this
+change and its canonical order runs in the FROST kernel in place of the `torch.sort` windows; the standalone paged selector's ASCENDING order is
+its own contract).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim -- the perf row is a later
+change's; `test_block_qsa_extend.py`, `test_block_qsa_end_to_end.py`, the kernel-level modules); cc 10.0 / 10.3 declined by name with every
+other QsaSpec form.  Kernel-level since the kernels landed (#2056): the chunk form bitwise the prefill compress at every residue x T, the
+gather's rows / metadata / reports / the loose-base guard, the canonical kernel at every `top_k`, the rounding attribute at four sites, the
+cache-write ring arm; this change adds the step kernel's `max(kv_lens, 0)` position derivation (an int32 length within `S_q` of `INT_MIN` reads
+as a dead sequence, as the gather does; every default-arm output bitwise the previous head on an A100 and on cc 10.7) with its cells in
+`test_qsa_compress_step.py` / `test_qsa_prepare.py`.
 
 **Served since 2026-10-21 -- the e4m3 compressed-key (indexer) cache at DECODE** (`QsaSpec(index_source="indexer", index_band=True,
 index_cache_dtype=torch.float8_e4m3fn)` on the block-sparse DECODE mode above; bf16 activations, **bf16 main pools** (the block's cache-write check requires the pools in the resolved activation dtype; the e4m3 indexer cache is the independently declared dtype); the `indexer e4m3 ...` rows
@@ -4061,7 +4184,25 @@ POSITIVE NORMAL fp32 by contract (its value is never read on the host; a zero / 
 byte on a dead row, +-448 on the live rows).  Declines by name: `NotImplementedError` (the typed decline) for an unwired form -- an e4m3 `o`
 without the gate / unsplit / under THD, any other output dtype --, `ValueError` for a malformed declaration -- an e4m3 `o` without the scale,
 a scale with a half `o`, a scale that is not one contiguous fp32 element.  `gated_e4m3_out` is the record's LAST field (appended after
-`lean_explicit_ccs`).  Validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean group walk -- against
+`lean_explicit_ccs`) -- then `gated_e4m3_out_roundings` (appended 2026-10-29): the fused store's TWO ROUNDING CONVENTIONS, the
+declaration's `out_rounding=` attribute (an OP ATTRIBUTE, never a knob -- it changes the bytes; the vocabulary `heuristics.COMBINE_OUT_ROUNDINGS`,
+the record field pinned equal to it): `single` (the default; the ONE rounding of the fp32 gated value above, FROST's convention, every existing
+declaration bitwise) and `staged` (a serving stack's gate-and-quantize order, `e4m3(rn, satfinite)(bf16(bf16(O32) / (1 + exp(-G))) * div.rn(1,
+scale))`: the merged O rounded to bf16 as that stack's attention kernel stores it, the exact sigmoid as a division, the gated value rounded to
+bf16, the fp32 multiply by the same inverse, the saturating cvt -- spelled with the DSL ops that stack's kernel spells,
+`sm100/split_combine.compile_ptr(out_rounding="staged")` -> the trailing `quant_rounding` constexpr of the combine kernels, so a provider whose
+speculative verify is tuned on the stack's bytes can take the fused launch without moving the acceptance length: the two conventions differ by
+one e4m3 code on a few percent of the elements, enough to flip a near-tie greedy token).  bf16 operands only (f16 is declined by name,
+`NotImplementedError`: the convention is a bf16 chain's; a half `o` with the attribute is a malformed declaration, `ValueError`; a value outside
+the vocabulary a `ValueError` at construction); the same forms (AUTO / OFF / the lean group walk per the part's rule), the LSE bitwise the half
+entry's, dead rows 0, the PDL arm bitwise the plain arm, deterministic; no barrier / SMEM / launch-geometry change (per-lane register
+arithmetic under a trace-time constant).  The staged convention validated bitwise against the torch model of the convention on every cell
+on cc 10.0 and cc 10.7 (the model on the same form's ungated bf16 O: every form, the exact-merge cells where the merged value is the bf16
+input itself, the walk geometries, saturation, the strided element path, the PDL arm, the boundary cell reading 52 where the single mode
+reads 48, the adapter's lean and tcgen05 routes; the histogram against the model and the single mode is the suite's record,
+`test_split_combine_gate_e4m3.py`) and bitwise against a serving stack's gate-and-quantize kernel on the exact-merge probe cells (36 of 36
+on both parts).  The single convention validated on the Rubin development class (every form of the entry -- AUTO / ON / OFF and the lean
+group walk -- against
 the unfused twin, the walk at two walk-selected geometries, the f16 underflow boundary of the twin claim, the saturation at +-448, the strided
 element path, the PDL arm; the adapter's lean
 route end to end, and the tcgen05 route's split plan at split 4: the module's own forms inside the bound, the lean group walk on the
@@ -4154,6 +4295,23 @@ rebinding and retained replay. `test_fp8_tma_layout_matches_each_mma_consumer`
 checks the distinct dP/dV shared-memory layouts; the paired-fold tests retain
 legacy D256 controls and independent gradient widths.
 
+
+## Native dense forward layout contract
+
+SM100/SM103, SM107 and SM120 half, per-tensor FP8 and MXFP8 forward rows bind
+Q/K/V/O through their declared strides. Dense B/H/S axes may have any covering,
+non-overlapping permutation and padding; D is innermost with stride one. Every
+outer storage stride must be a 16-byte multiple after canonicalizing unused
+axes. Alignment uses each port's actual storage dtype, including packed FP4 O.
+Graph and standalone declarations decline unsupported pitches before compilation.
+There is no dense layout gather/scatter or staging workspace. Split-KV retains
+its algorithmic partial/combine workspace, and quantized plans retain scalar
+scratch. THD packing and paged pool contracts remain independently checked.
+The SM107 fused epilogue gate port follows the same contract
+(`config_sm107.epilogue_gate_layout_declarable` is `dense_bind_strides`), so a
+batch-1, one-token gate sliced out of a projection slab, whose singleton axes
+carry the slab's token pitch, is declarable on the graph and the standalone path alike.
+
 ### SM100/SM103 large-head backward native dense strides
 
 The `sdpa_bwd_sm100` dense D264–D512 half/BF16 chain binds independent
@@ -4166,3 +4324,23 @@ THD retains its compact packed contract. The SM107 D512 graph row remains
 BSHD-only; this change does not widen that row or deterministic support.
 Detector: `test_sdpa_bwd_native_layouts_sm100.py` checks native binding,
 padding canaries, fresh allocations, stream handling and changed-data replay.
+
+### Native SM107 half D64 ragged and packed execution
+
+The native D64 flavor supports nonpaged THD with FP16/BF16 Q/K/V/O,
+CGA1/CGA2, packed or unpacked GQA, natural/LPT scheduling, and TILE_N 64/128.
+Packed token/head-major and explicitly padded Stats retain their existing
+contracts. Independent physical origins and runtime length rebinding use the
+prepared THD chain without staging copies. Dense PackGQA uses the native
+64-wide tile, including smaller aligned head dimensions through its envelope.
+Paged KV, splitting, score side outputs and pre-folded scale keep their
+existing larger-flavor selection and admission boundaries. D32 THD remains
+outside this native flavor.
+
+Unsplit nonpaged native D64 PackGQA is currently available through explicit
+plans. Automatic packed proposals still use the historical shared-D128
+eligibility predicate; extending that policy is a separate heuristics change.
+The existing split candidates keep their D128 selection.
+`test_sdpa_fp8_sm107.py::TestNativeD64Half` exposes all 60 native regression
+cases through the SM107 CI entrypoint; its shared helper module is not
+collected separately.
