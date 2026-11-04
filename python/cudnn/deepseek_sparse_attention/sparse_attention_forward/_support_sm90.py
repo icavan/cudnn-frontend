@@ -3,11 +3,26 @@
 
 """DSL/runtime admission checks shared by the SM90 DSA forward adapters."""
 
+from packaging.version import InvalidVersion, Version
+
 from cudnn.frost.buffers import cutedsl_requirement_error
 
 
 def sm90_dsa_cutedsl_requirement_error():
     """Return an actionable error before importing or compiling the kernel."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    installed, version = cutedsl_state()
+    requirement = "SM90 DSA forward requires nvidia-cutlass-dsl >= 4.8.0"
+    if not installed:
+        return requirement
+    if version is not None and version[0] == "nvidia-cutlass-dsl":
+        try:
+            if Version(version[1]) < Version("4.8.0"):
+                return f"{requirement}; found {version[1]}"
+        except InvalidVersion:
+            pass
+
     error = cutedsl_requirement_error("SM90 DSA forward")
     if error is not None:
         return error

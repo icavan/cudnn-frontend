@@ -1132,11 +1132,14 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
 `DSA.sparse_attention` composes the existing native forward and backward
 wrappers, without FlashMLA. It accepts contiguous BF16 `q[S_q,H,D]`,
 `kv[S_kv,D]`, INT32 `indices[S_q,K]`, optional FP32 `attn_sink[H]`, and
-optional INT32 `topk_length[S_q]`, on one SM100 device. Supported pairs are
-H16/H32/H64 with D512/D576 and H128 with D512; output V dimension is 512.
-H16/H32 forward explicitly pads heads to 64 and slices the result. This cost
-belongs to the semantic adapter and is included when benchmarking the call.
-Physical K and sequence extents must be positive. K is padded to 128 for launch.
+optional INT32 `topk_length[S_q]`, on one SM90/SM100 device. SM90 supports
+H16/H32/H64/H96/H128 with D512/D576. It launches the native head count and
+logical K directly; the kernel predicates its final head/K tiles, so the
+composition does not materialize head or Top-K padding. SM100 supports
+H16/H32/H64 with D512/D576 and H128 with D512; H16/H32 forward explicitly
+pads heads to 64 and slices the result, and physical K is padded to 128 for
+launch. These SM100 adapter costs are included when benchmarking the call.
+Output V dimension is 512 and sequence/physical-K extents must be positive.
 
 ```python
 from cudnn import DSA
@@ -1146,6 +1149,13 @@ score = DSA.sparse_attention_score_recompute(
     q.detach(), kv.detach(), result["lse"], indices, topk_length=lengths,
 )
 ```
+
+Set `deterministic=True` for the deterministic backward. On SM90,
+`deterministic_relay_cluster_size` exposes the same 4/8/16/32/64-CTA logical
+relay choices as `SparseAttentionBackward`; `None` selects C16. The choice is
+fixed for that cached backward plan and changes its caller-transparent
+workspace/performance tradeoff. Cluster 32 and 64 are implemented as two and
+four ordered physical C16 launches. The default remains the ordinary backward.
 
 Only `out` is differentiable (Q, KV and sink, first order). `lse` is KV-only
 natural-log LSE, excluding sink; `max_logits` and LSE are non-differentiable.
@@ -1160,7 +1170,7 @@ passes use the same normalized metadata. Duplicate indices remain distinct
 slots. `trusted_compact_metadata=True` is an explicit producer contract:
 bounded valid active prefixes, negative inactive suffixes, bounded lengths;
 without lengths every nonnegative index is in range. It skips normalization,
-not launch padding. Violating that contract is unsafe.
+not any architecture-required launch padding. Violating that contract is unsafe.
 
 Score recompute preserves original slots, including holes, and returns both
 `target` and effective `indices`. It sums per-head probabilities, masks invalid
