@@ -108,6 +108,29 @@ def test_DSA_sparse_attention_forward_rejects_invalid_public_contracts():
 
 
 @pytest.mark.L0
+def test_DSA_sparse_attention_forward_current_stream_skips_capture_unsafe_device_query(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    try:
+        from cuda.bindings import driver as cuda
+        from cudnn.deepseek_sparse_attention.sparse_attention_forward import _interface_sm100 as interface_sm100
+    except ImportError:
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    current = torch.cuda.current_stream(device)
+    stream = cuda.CUstream(current.cuda_stream)
+
+    def fail_query(_):
+        pytest.fail("the device-scoped current stream must not call cuStreamGetDevice")
+
+    monkeypatch.setattr(interface_sm100.cuda, "cuStreamGetDevice", fail_query)
+    with interface_sm100._launch_context(device, stream) as (resolved, consumer):
+        assert int(resolved) == current.cuda_stream
+        assert consumer == current
+
+
+@pytest.mark.L0
 def test_DSA_sparse_attention_forward_rejects_stream_from_another_device(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100-family GPU required")
@@ -121,7 +144,7 @@ def test_DSA_sparse_attention_forward_rejects_stream_from_another_device(monkeyp
     q = torch.empty((1, 64, 512), dtype=torch.bfloat16, device=device)
     kv = torch.empty((1, 512), dtype=torch.bfloat16, device=device)
     topk_idxs = torch.empty((1, 0), dtype=torch.int32, device=device)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.Stream(device=device).cuda_stream)
     other_device = device.index + 1
     monkeypatch.setattr(interface_sm100.cuda, "cuStreamGetDevice", lambda _: (cuda.CUresult.CUDA_SUCCESS, other_device))
 

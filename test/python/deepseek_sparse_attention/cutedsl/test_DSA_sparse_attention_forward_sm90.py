@@ -186,6 +186,34 @@ def test_DSA_sparse_attention_forward_sm90_gates_cutedsl_before_kernel_import(mo
     interface_sm90.compile_sparse_attention_forward_sm90.cache_clear()
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "installed,version,expected",
+    [
+        (False, None, "SM90 DSA forward requires nvidia-cutlass-dsl >= 4.8.0"),
+        (True, "4.7.1", "SM90 DSA forward requires nvidia-cutlass-dsl >= 4.8.0; found 4.7.1"),
+        (True, "4.8", None),
+        (True, "4.8.0", None),
+        (True, "4.9.0", None),
+    ],
+)
+def test_DSA_sparse_attention_forward_sm90_cutedsl_version_gate(monkeypatch, installed, version, expected):
+    """The SM90 forward route names its 4.8 DSL floor without importing the kernel."""
+    _require_sm90()
+    from cudnn.deepseek_sparse_attention.sparse_attention_forward import _support_sm90
+    from cudnn.frost import buffers
+
+    state = None if version is None else ("nvidia-cutlass-dsl", version)
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (installed, state))
+    monkeypatch.setattr(_support_sm90, "cutedsl_requirement_error", lambda _: None)
+    if expected is None:
+        from cutlass.base_dsl.version_info import CUDA_VERSION
+
+        if (int(CUDA_VERSION.major), int(CUDA_VERSION.minor)) < (13, 0):
+            pytest.skip("this environment does not provide the SM90 CUDA 13 compiler flavor")
+    assert _support_sm90.sm90_dsa_cutedsl_requirement_error() == expected
+
+
 @pytest.mark.L1
 @pytest.mark.parametrize("head_dim", [512, 576])
 def test_DSA_sparse_attention_forward_sm90_indexer_prefix_lse(head_dim):

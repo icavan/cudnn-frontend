@@ -4,8 +4,9 @@
 """PyTorch training composition over the native DSA APIBase wrappers.
 
 This allocating semantic adapter deliberately lives above the kernel execute
-contract. Metadata normalization and optional H16/H32-to-H64 forward padding
-are explicit parts of this API; no external forward provider is loaded.
+contract. Metadata normalization and the SM100 H16/H32-to-H64 / K128 launch
+padding are explicit parts of this API; SM90 serves the native H/K extents.
+No external forward provider is loaded.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from cudnn.api_base import TupleDict
 
 
 def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
+    """Validate the eager training contract and return scale plus SM90 routing."""
     for name, tensor in (("q", q), ("kv", kv), ("indices", indices), ("attn_sink", attn_sink), ("topk_length", topk_length)):
         if tensor is None and name in ("attn_sink", "topk_length"):
             continue
@@ -33,8 +35,6 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
     sq, heads, dim = q.shape
     if sq <= 0 or kv.shape[0] <= 0 or indices.shape[1] <= 0:
         raise ValueError("sequence extents and physical Top-K must be positive")
-    if heads not in (16, 32, 64, 128) or dim not in (512, 576) or (heads, dim) == (128, 576):
-        raise NotImplementedError("native training supports H16/H32/H64 D512/D576 and H128 D512")
     if kv.shape[1] != dim or indices.shape[0] != sq:
         raise ValueError("KV dimension and index row count must match Q")
     if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16 or indices.dtype != torch.int32:
@@ -48,14 +48,40 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
     scale = dim**-0.5 if softmax_scale is None else float(softmax_scale)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("softmax_scale must be finite and positive")
-    if not q.is_cuda or torch.cuda.get_device_capability(q.device) not in ((10, 0), (10, 3)):
-        raise NotImplementedError("native sparse attention training currently requires SM100 or SM103")
-    from cudnn.frost.buffers import cutedsl_requirement_error
+    capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else None
+    if capability == (9, 0):
+        if heads not in (16, 32, 64, 96, 128) or dim not in (512, 576):
+            raise NotImplementedError("SM90 native training supports H16/H32/H64/H96/H128 with D512/D576")
+    elif capability in ((10, 0), (10, 3)):
+        if heads not in (16, 32, 64, 128) or dim not in (512, 576) or (heads, dim) == (128, 576):
+            raise NotImplementedError("SM100 native training supports H16/H32/H64 D512/D576 and H128 D512")
+    else:
+        raise NotImplementedError("native sparse attention training currently requires SM90, SM100, or SM103")
+    if capability == (9, 0):
+        from .sparse_attention_forward._support_sm90 import sm90_dsa_cutedsl_requirement_error
 
-    error = cutedsl_requirement_error("native DSA training")
-    if error:
-        raise RuntimeError(error)
-    return scale
+        error = sm90_dsa_cutedsl_requirement_error()
+        if error:
+            raise RuntimeError(error)
+    else:
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        error = cutedsl_requirement_error("native DSA training")
+        if error:
+            raise RuntimeError(error)
+    return scale, capability == (9, 0)
+
+
+def _validate_deterministic_options(deterministic: bool, deterministic_relay_cluster_size: Optional[int]) -> None:
+    """Reject invalid deterministic options before metadata staging or launch."""
+    if not isinstance(deterministic, bool):
+        raise TypeError("deterministic must be a bool")
+    if deterministic_relay_cluster_size is not None and (
+        type(deterministic_relay_cluster_size) is not int or deterministic_relay_cluster_size not in (4, 8, 16, 32, 64)
+    ):
+        raise ValueError("deterministic_relay_cluster_size must be one of {4, 8, 16, 32, 64} or None")
+    if deterministic_relay_cluster_size is not None and not deterministic:
+        raise ValueError("deterministic_relay_cluster_size requires deterministic=True")
 
 
 def _normalize_sparse_index_slots(
@@ -131,12 +157,13 @@ def _pad_indices(indices):
     return torch.nn.functional.pad(indices, (0, padded - topk), value=-1)
 
 
-def _native_forward(q, kv, indices, sink, lengths, scale):
+def _native_forward(q, kv, indices, sink, lengths, scale, native_sm90):
+    """Launch the native forward, retaining legacy SM100 head padding only."""
     from .sparse_attention_forward.api import sparse_attention_forward_wrapper
 
     heads = q.shape[1]
     launch_q, launch_sink = q, sink
-    if heads < 64:
+    if not native_sm90 and heads < 64:
         launch_q = torch.nn.functional.pad(q, (0, 0, 0, 64 - heads))
         launch_sink = torch.nn.functional.pad(sink, (0, 64 - heads), value=-float("inf"))
     result = sparse_attention_forward_wrapper(
@@ -147,14 +174,15 @@ def _native_forward(q, kv, indices, sink, lengths, scale):
         topk_length=lengths,
         softmax_scale=scale,
     )
-    if heads < 64:
+    if not native_sm90 and heads < 64:
         return tuple(result[key][:, :heads].contiguous() for key in ("out", "max_logits", "lse"))
     return result["out"], result["max_logits"], result["lse"]
 
 
 class _SparseAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, indices, sink, lengths, scale, trusted):
+    def forward(ctx, q, kv, indices, sink, lengths, scale, trusted, native_sm90, deterministic, deterministic_relay_cluster_size):
+        """Normalize metadata, launch forward, and save lower-backward inputs."""
         with torch.cuda.device(q.device):
             safe_indices, safe_lengths = _normalize_cudnn_sparse_metadata(
                 indices,
@@ -162,13 +190,15 @@ class _SparseAttention(torch.autograd.Function):
                 kv.shape[0],
                 trusted_compact_metadata=trusted,
             )
-            safe_indices = _pad_indices(safe_indices)
+            launch_indices = safe_indices if native_sm90 else _pad_indices(safe_indices)
             effective_sink = sink if sink is not None else torch.full((q.shape[1],), -float("inf"), dtype=torch.float32, device=q.device)
-            out, max_logits, lse = _native_forward(q, kv, safe_indices, effective_sink, safe_lengths, scale)
+            out, max_logits, lse = _native_forward(q, kv, launch_indices, effective_sink, safe_lengths, scale, native_sm90)
         ctx.scale = scale
         ctx.has_lengths = safe_lengths is not None
+        ctx.deterministic = deterministic
+        ctx.deterministic_relay_cluster_size = deterministic_relay_cluster_size
         if any(ctx.needs_input_grad[i] for i in (0, 1, 3)):
-            tensors = [q, kv, out, lse, effective_sink, safe_indices]
+            tensors = [q, kv, out, lse, effective_sink, launch_indices]
             if safe_lengths is not None:
                 tensors.append(safe_lengths)
             ctx.save_for_backward(*tensors)
@@ -179,8 +209,9 @@ class _SparseAttention(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, dout, _dmax, _dlse):
+        """Run the selected native backward and return requested gradients."""
         if dout is None:
-            return (None,) * 7
+            return (None,) * 10
         q, kv, out, lse, sink, indices, *rest = ctx.saved_tensors
         from .sparse_attention_backward.api import sparse_attention_backward_wrapper
 
@@ -195,9 +226,22 @@ class _SparseAttention(torch.autograd.Function):
                 indices,
                 softmax_scale=ctx.scale,
                 topk_length=rest[0] if ctx.has_lengths else None,
+                deterministic=ctx.deterministic,
+                deterministic_relay_cluster_size=ctx.deterministic_relay_cluster_size,
             )
         needs = ctx.needs_input_grad
-        return (result["dq"] if needs[0] else None, result["dkv"] if needs[1] else None, None, result["d_sink"] if needs[3] else None, None, None, None)
+        return (
+            result["dq"] if needs[0] else None,
+            result["dkv"] if needs[1] else None,
+            None,
+            result["d_sink"] if needs[3] else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def sparse_attention(
@@ -208,26 +252,46 @@ def sparse_attention(
     softmax_scale: Optional[float] = None,
     topk_length: Optional[torch.Tensor] = None,
     trusted_compact_metadata: bool = False,
+    deterministic: bool = False,
+    deterministic_relay_cluster_size: Optional[int] = None,
 ) -> TupleDict:
     """Native BF16 MQA sparse attention with first-order PyTorch autograd.
 
     Returns ``out``, ``max_logits`` and KV-only natural-log ``lse``. Only
     ``out`` is differentiable, with respect to Q, KV and optional sink.
-    Inputs are contiguous on one SM100 device; launch uses the current
-    PyTorch stream. H16/H32 forward is padded to H64, then sliced back.
+    Inputs are contiguous on one SM90/SM100 device; launch uses the current
+    PyTorch stream. SM90 serves native H/K extents. SM100 H16/H32 forward is
+    padded to H64 and its physical Top-K is padded to 128, then sliced back.
 
     Safe mode masks invalid/OOB indices and inactive suffixes; supplied lengths
     are clamped to [0,K] and valid entries compacted before both passes.
     ``trusted_compact_metadata=True`` skips that work only when the producer
     guarantees bounded valid active prefixes, negative inactive suffixes, and
     lengths in [0,K]. Without lengths, all nonnegative indices must be in range.
-    Top-K is padded to a 128-slot launch envelope. This allocating composition
-    does not change the lower-level APIBase execute contract.
+    ``deterministic=True`` selects the deterministic backward. On SM90,
+    ``deterministic_relay_cluster_size`` may be 4, 8, 16, 32, or 64 and defaults
+    to 16; it changes the backward workspace/performance tradeoff. On SM100 and
+    SM103, an explicit relay size is accepted only when backward selects the
+    deterministic generic-M64 backend; other plans raise ``ValueError`` during
+    backward. This allocating composition does not change the lower-level
+    APIBase execute contract.
     """
     if not isinstance(trusted_compact_metadata, bool):
         raise TypeError("trusted_compact_metadata must be a bool")
-    scale = _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
-    out, max_logits, lse = _SparseAttention.apply(q, kv, indices, attn_sink, topk_length, scale, trusted_compact_metadata)
+    _validate_deterministic_options(deterministic, deterministic_relay_cluster_size)
+    scale, native_sm90 = _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale)
+    out, max_logits, lse = _SparseAttention.apply(
+        q,
+        kv,
+        indices,
+        attn_sink,
+        topk_length,
+        scale,
+        trusted_compact_metadata,
+        native_sm90,
+        deterministic,
+        deterministic_relay_cluster_size,
+    )
     return TupleDict(out=out, max_logits=max_logits, lse=lse)
 
 
@@ -245,24 +309,27 @@ def sparse_attention_score_recompute(
     LSE is the KV-only natural-log statistic from native sparse attention.
     Invalid/inactive slots return zero. No gradients are attached to targets.
     """
-    scale = _validate_contract(q, kv, indices, None, topk_length, softmax_scale)
+    scale, native_sm90 = _validate_contract(q, kv, indices, None, topk_length, softmax_scale)
     if not isinstance(lse, torch.Tensor) or lse.shape != q.shape[:2] or lse.dtype != torch.float32 or lse.device != q.device or not lse.is_contiguous():
         raise ValueError("lse must be contiguous FP32 [S_q,H] on Q's device")
     from .score_recompute.api import sparse_attn_score_recompute_wrapper
 
     with torch.cuda.device(q.device):
         safe_indices, _ = _normalize_sparse_index_slots(indices, topk_length, kv.shape[0])
+        launch_indices = safe_indices if native_sm90 else _pad_indices(safe_indices)
         result = sparse_attn_score_recompute_wrapper(
             q.unsqueeze(0),
             kv.unsqueeze(0),
             lse.unsqueeze(0),
-            _pad_indices(safe_indices).unsqueeze(0),
+            launch_indices.unsqueeze(0),
             scale,
             qhead_per_kv_head=q.shape[1],
             topk_length=None,
             topk_indices_global=False,
         )
-        target = result["target"].squeeze(0)[:, : indices.shape[1]].contiguous()
+        target = result["target"].squeeze(0)
+        if not native_sm90 and target.shape[1] != indices.shape[1]:
+            target = target[:, : indices.shape[1]].contiguous()
     return TupleDict(target=target, indices=safe_indices)
 
 

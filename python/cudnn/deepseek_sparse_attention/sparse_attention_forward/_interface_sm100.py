@@ -68,18 +68,20 @@ def _launch_context(device: torch.device, stream):
         context = nullcontext()
         if stream is None:
             stream = cuda.CUstream(consumer.cuda_stream)
-        else:
-            # Even an explicit handle equal to the current stream must retain
-            # the public stream/device validation contract. Do not cache raw
-            # handles: external streams can be destroyed and their IDs reused.
+        elif int(stream) != consumer.cuda_stream:
+            # A non-current external handle still needs the public stream/device
+            # validation contract. The current PyTorch stream is already scoped
+            # to ``device``; querying it again through cuStreamGetDevice during
+            # CUDA Graph capture is illegal and invalidates the capture.
+            # Do not cache external raw handles: streams can be destroyed and
+            # their IDs reused.
             status, stream_device = cuda.cuStreamGetDevice(stream)
             if status != cuda.CUresult.CUDA_SUCCESS:
                 raise ValueError(f"Unable to resolve the CUDA device for stream {stream}: {status}")
             if int(stream_device) != device.index:
                 raise ValueError(f"stream belongs to cuda:{int(stream_device)}, but Q is on {device}")
-            if int(stream) != consumer.cuda_stream:
-                consumer = as_torch_stream(int(stream), device)
-                context = torch.cuda.stream(consumer)
+            consumer = as_torch_stream(int(stream), device)
+            context = torch.cuda.stream(consumer)
         with context:
             yield stream, consumer
 
