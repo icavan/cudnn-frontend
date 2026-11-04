@@ -1155,7 +1155,10 @@ Set `deterministic=True` for the deterministic backward. On SM90,
 relay choices as `SparseAttentionBackward`; `None` selects C16. The choice is
 fixed for that cached backward plan and changes its caller-transparent
 workspace/performance tradeoff. Cluster 32 and 64 are implemented as two and
-four ordered physical C16 launches. The default remains the ordinary backward.
+four ordered physical C16 launches. On SM100/SM103, an explicit relay choice is
+accepted only when backward selects the deterministic generic-M64 backend;
+other plans raise `ValueError` during backward. The default remains the
+ordinary backward.
 
 Only `out` is differentiable (Q, KV and sink, first order). `lse` is KV-only
 natural-log LSE, excluding sink; `max_logits` and LSE are non-differentiable.

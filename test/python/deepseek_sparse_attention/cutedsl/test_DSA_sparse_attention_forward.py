@@ -115,7 +115,7 @@ def test_DSA_sparse_attention_forward_current_stream_skips_capture_unsafe_device
         from cuda.bindings import driver as cuda
         from cudnn.deepseek_sparse_attention.sparse_attention_forward import _interface_sm100 as interface_sm100
     except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda", torch.cuda.current_device())
     current = torch.cuda.current_stream(device)

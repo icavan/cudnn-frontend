@@ -270,9 +270,11 @@ def sparse_attention(
     lengths in [0,K]. Without lengths, all nonnegative indices must be in range.
     ``deterministic=True`` selects the deterministic backward. On SM90,
     ``deterministic_relay_cluster_size`` may be 4, 8, 16, 32, or 64 and defaults
-    to 16; it changes the backward workspace/performance tradeoff. This
-    allocating composition does not change the lower-level APIBase execute
-    contract.
+    to 16; it changes the backward workspace/performance tradeoff. On SM100 and
+    SM103, an explicit relay size is accepted only when backward selects the
+    deterministic generic-M64 backend; other plans raise ``ValueError`` during
+    backward. This allocating composition does not change the lower-level
+    APIBase execute contract.
     """
     if not isinstance(trusted_compact_metadata, bool):
         raise TypeError("trusted_compact_metadata must be a bool")
