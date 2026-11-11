@@ -91,6 +91,15 @@ not attention apply, distributed communication or training E2E.
 | 32 x 33 | 520.26 | 289.48 | 1.80x | 627.90 | 396.89 | 1.58x | 7.78 / 11.56 |
 | 20 x 17 + 1024 + 4096 | 3198.49 | 1755.89 | 1.82x | 4112.54 | 2478.98 | 1.66x | 28.80 / 42.80 |
 
+**Strong-gate counterexample:** T=1024/H=8/g=-5 takes the per-tile FP32
+fallback throughout. Reverse summary latency is **2290.82 us TC-plan versus
+694.08 us FP32 (3.30x slower)**, measured with three groups of ten replays.
+Both outputs match FP32 exactly on this case. The smaller TC CTA processes
+fallback rows serially and repeats gate work that the default FP32 engine
+shares across 512 threads. The extra coefficient pass and workspace remain.
+This is an explicit limitation of the optional provider, not a universal speedup.
+Reproduce with `--tokens 1024 --heads 8 --gate -5 --repeats 10 --groups 3`.
+
 Against an independent FP64 recurrence, relative L2 errors are:
 
 | Tokens | TC forward H | TC forward M | TC reverse G | TC reverse M | FP32 forward M |

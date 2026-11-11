@@ -35,6 +35,10 @@ Forward and reverse factorizations need not produce bitwise transposes.
 For a tile with a nonfinite log prefix or absolute prefix above 20, the device
 takes the direct per-token FP32 recurrence, avoiding unsafe reciprocal gate
 factorization. This range fallback is not a promise of FP32 parity on other tiles.
+It also has a performance cost: at T=1024/H=8/g=-5 on H20, the reverse
+summary took 2290.82 us versus 694.08 us for the default FP32 engine (3.30x
+slower). Prefer the FP32 provider for workloads dominated by these tiles;
+the weak-decay speedups do not apply to all gate distributions.
 
 A parallel producer prepares each K/gate coefficient tile once. The recurrent
 H/G and M CTAs share those coefficients instead of repeating their preparation
