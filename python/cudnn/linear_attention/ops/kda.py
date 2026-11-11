@@ -2246,6 +2246,23 @@ def kimi_delta_attention_summary(
     that stream finishes. Execute-time shape changes are rejected; offset
     values may change in-place between replays within the declared capacity.
 
+    Explicit ``plan_name="kda_summary_hopper_tc"`` selects an optional SM90
+    BT16 Tensor Core summary with the same input/layout restrictions. It
+    computes M directly from identity, independently of V and the seed, but
+    rounds projection/update operands to BF16; state carry, residual/solve
+    arithmetic and MMA accumulation remain FP32. It is not FP32-equivalent.
+    Unsafe per-tile gate prefixes take a direct FP32 recurrence. Set
+    ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`` and provide a complete CUDA
+    toolkit with MMA headers (``CUDA_HOME``); no CuTeDSL version gate is added.
+    The graph reports ``(total_tokens//16 + N)*HO*10400`` workspace bytes
+    (zero for empty inputs). Pass a contiguous, 32-byte-aligned buffer on the
+    same device, disjoint from all operands, and retain it until execution
+    completes; concurrent executions require separate workspace and outputs.
+    The public wrapper allocates this workspace. The graph engine allocates
+    nothing and launches preprocessing plus recurrence on the caller stream.
+    FP32 remains the default; assess this explicit mixed-precision choice
+    against the application's accuracy requirements.
+
     Args:
         use_beta_sigmoid_in_kernel: apply ``sigmoid(beta)`` in the kernel; ``beta`` then holds raw logits.
         safe_gate: ``g`` is read as ``gate_lower_bound * sigmoid(exp(a_log) * (g + dt_bias))``; ``a_log`` ``[HO]`` and
@@ -2320,6 +2337,13 @@ def kimi_delta_attention_summary_bwd(
     does not produce a backward context or state checkpoints. It computes
     only the state-gradient summary, not dQ/dK/dV/dG/dBeta, and is not an
     autograd implementation for the summary operation itself.
+
+    The optional ``kda_summary_hopper_tc`` plan has the same opt-in, toolkit,
+    binding and mixed-precision contracts as the forward summary, and uses
+    ``(total_tokens//16 + N)*HO*15456`` workspace bytes (zero for empty inputs).
+    It computes the reverse transition independently of Q/dO/the seed. Forward
+    and reverse BF16 factorisations need not give bitwise transposes; neither
+    is a substitute for the default FP32 precision path.
 
     Args:
         scale: attention scale applied to ``q``; defaults to ``1 / sqrt(K)``.

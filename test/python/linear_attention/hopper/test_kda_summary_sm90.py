@@ -144,7 +144,7 @@ def test_summary_determinism(backward):
     assert_golden(f"kda_summary_sm90_{'bwd' if backward else 'fwd'}_bf16", target, expected)
 
 
-def make_graph(x, backward=False, transition=True):
+def make_graph(x, backward=False, transition=True, expected_workspace=0):
     graph = cudnn.pygraph()
     names = ("q", "k", "g", "beta", "dO") if backward else ("k", "v", "g", "beta")
     names += ("cu", "state")
@@ -169,7 +169,7 @@ def make_graph(x, backward=False, transition=True):
     bindings[state_t] = state
     if transition:
         bindings[transition_t] = trans
-    assert graph.get_workspace_size() == 0
+    assert graph.get_workspace_size() == expected_workspace
     return graph, tensors, state_t, transition_t, bindings, state, trans
 
 

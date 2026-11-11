@@ -4,6 +4,163 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM90 KDA optional BF16 Tensor Core summaries — 2026-11-11
+
+Follow-up branch `icavan/sm90-kda-tc-summary`, based on precision-fix PR #2473
+at `b8ee857147a5b83c7d47dd8184266a801e8204e9`. The new explicit
+`kda_summary_hopper_tc` plan computes H/G and M directly with BT16 BF16 MMA
+operands, FP32 accumulation/state carry/residuals/triangular solve, and a
+device-side FP32 fallback for unsafe gate prefixes. The default FP32 engine,
+its tolerances and its goldens remain unchanged. The
+[provider contract](../../../docs/operations/linear_attention/kda_sm90_tensor_core_summary.md)
+documents numerical choices, supported inputs and caller-owned workspace.
+
+Validated on H20-3e, Torch 2.9.1+cu128, CUDA 12.8, driver API 12080, cuDNN
+91002, Python 3.12. The imported source was
+`/root/cudnn-sm90-tc-summary/python/cudnn/__init__.py`. CUDA source SHA256:
+`9284574da604b87030e6ab6ed414abc23cc35c7a91130d5e0346a89b9797ec2c`.
+The implementation uses NVRTC CUDA C++/WMMA and needs complete CUDA headers;
+the installed CuTeDSL version does not gate this path. CUDA 13 and other
+SM90 hardware remain unverified; other architectures are declined by contract.
+
+**129 passed, 1 skipped:** 50 new Tensor Core cases, 62 existing FP32 summary
+cases and 17 existing apply cases. The apply skip is the absent optional
+cuTile runtime. Two new goldens were recorded only after independent FP64,
+replay and batch-invariance checks; their inputs/runtime match the corresponding
+FP32 records, but output hashes are deliberately distinct. A subsequent strict
+run with recording unset passed all four summary goldens unchanged.
+
+Coverage includes seeded/unseeded H/G and M, empty/tail/partial-capacity THD,
+INT32/INT64 offsets, padded strides, changed-input/offset/gate capture with
+poisoned scratch and output padding, optional transition, mixed and extreme
+gates, large seeds, custom reverse scales, logical CP64 composition, concurrent
+GPU work, reordered/duplicated neighbors, value/seed-independent M, bounded
+compile count, unchanged default selection, and rejection before launch.
+Workspace rejection checks cover short and zero-length capacity, misalignment,
+input/output overlap, CPU, foreign CUDA device and strided storage. CPU and
+foreign-device tests were observed failing at the launch tripwire before device
+validation was added; CPU metadata is now rejected before DLPack export.
+
+The new small-case numerical budget is explicitly mixed precision: normwise
+error <= `0.01*norm(reference) + 1e-5*sqrt(numel)` and maximum absolute error
+<= `0.02*max(abs(reference)) + 1e-4`. It is separate from, and does not relax,
+the FP32 tests. Larger benchmark errors are reported individually below;
+these tolerances do not establish accuracy for arbitrary conditioning or loss.
+
+Memcheck, racecheck and synccheck each passed **24 cases**: seeded/unseeded
+weak/moderate/strong/extreme gates, strided changed-input capture, mixed gate
+fallback, and empty/optional/partial-capacity cases. Each reports zero errors;
+racecheck also reports zero warnings. Existing nanobind shutdown reference
+warnings remain; this change does not claim to repair that binding lifetime.
+
+From `test/python`, with `CUDA_HOME=/usr/local/cuda`, the checkout's `python`
+directory on `PYTHONPATH`, and two visible CUDA devices for negative tests:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest linear_attention/hopper/test_kda_summary_tc_sm90.py \
+  linear_attention/hopper/test_kda_summary_sm90.py \
+  linear_attention/hopper/test_kda_sm90_cuda.py -m L0 -q
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+PYTORCH_ALLOC_CONF=expandable_segments:False \
+compute-sanitizer --tool racecheck --error-exitcode 77 \
+python -m pytest linear_attention/hopper/test_kda_summary_tc_sm90.py -m L0 -q \
+  -k 'strided_changed_input_capture or mixed_gates or empty_optional or summary_fp64'
+```
+
+Use `--tool memcheck` or `--tool synccheck` for the other instrumented runs.
+Both allocator-variable spellings must be set as in the parent qualification.
+
+#### Performance and precision
+
+The benchmark uses CPU seed 713, H=8, K=V=128, normalized BF16 Q/K, BF16
+V/dO, FP32 g=-0.001 and beta=0.5. Times include coefficient preparation plus
+H/G and direct M; allocation and compilation precede capture. Median of five
+groups of 50 CUDA Graph replays, in microseconds. These are summary GPU times,
+not attention apply, distributed communication or training E2E.
+
+| THD lengths | FP32 fwd | TC fwd | Speedup | FP32 reverse | TC reverse | Speedup | Scratch MiB fwd/reverse |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 38.07 | 32.34 | 1.18x | 47.61 | 40.33 | 1.18x | 0.40 / 0.59 |
+| 256 | 143.36 | 95.14 | 1.51x | 181.12 | 119.92 | 1.51x | 1.35 / 2.00 |
+| 1024 | 563.89 | 344.81 | 1.64x | 715.43 | 439.45 | 1.63x | 5.16 / 7.66 |
+| 4096 | 2272.32 | 1576.14 | 1.44x | 3281.09 | 2012.53 | 1.63x | 20.39 / 30.31 |
+| 16384 | 9960.94 | 6687.76 | 1.49x | 13625.27 | 8239.96 | 1.65x | 81.33 / 120.87 |
+| 32 x 33 | 520.26 | 289.48 | 1.80x | 627.90 | 396.89 | 1.58x | 7.78 / 11.56 |
+| 20 x 17 + 1024 + 4096 | 3198.49 | 1755.89 | 1.82x | 4112.54 | 2478.98 | 1.66x | 28.80 / 42.80 |
+
+Against an independent FP64 recurrence, relative L2 errors are:
+
+| Tokens | TC forward H | TC forward M | TC reverse G | TC reverse M | FP32 forward M |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64 | 2.5020e-3 | 1.1444e-3 | 1.8956e-3 | 1.1443e-3 | 2.3770e-7 |
+| 256 | 2.7681e-3 | 2.4075e-3 | 2.2275e-3 | 2.4085e-3 | 5.5151e-7 |
+| 1024 | 2.9228e-3 | 4.9089e-3 | 2.4099e-3 | 4.9207e-3 | 1.1520e-6 |
+
+At T=16,384 the random-key transition has norm about 2.8564e-27. Its TC
+relative error versus FP32 reaches 2.10% forward / 2.07% reverse, but maximum
+absolute error is 1.60e-30 / 1.66e-30. Reporting the reference norm avoids
+hiding this result behind a denominator floor or interpreting it as a large
+boundary-state contribution. The H/G errors remain about 0.29% / 0.24%.
+
+64 logical 17-token spans composed in FP64 against a monolithic FP64 recurrence
+give final TC H/G relative errors 2.7404e-3 / 2.2757e-3. No GPU communication
+or production merge error is included.
+
+The stronger long-memory experiment repeats one key, uses g=-1e-6 and H=1,
+and compares against an independent FP64 closed form. This retains substantial
+transition magnitude over 1M tokens instead of erasing rank dependencies with
+rapid decay. Final composed state errors, using FP64 composition for both
+providers:
+
+| Logical layout | TC forward | FP32 forward | TC reverse | FP32 reverse |
+| --- | ---: | ---: | ---: | ---: |
+| 64 x 256 | 7.0525e-3 | 4.0309e-5 | 1.6653e-3 | 1.7127e-4 |
+| 64 x 16,384 (1M) | 6.3055e-3 | 1.3007e-3 | 1.7234e-3 | 6.9857e-3 |
+
+This special case does not show that BF16 is generally more accurate than FP32:
+TC is worse in forward, while 16-token grouping reduces repeated-rounding error
+in the long reverse case. The default stays FP32. A monolithic FP32 recurrence
+is not an exact reference at this length; the closed-form helper is separately
+checked against the serial FP64 recurrence on 0/17/33-token cases in both
+directions. All 64 spans execute on one GPU; this is not a CP64 E2E result.
+Workspace for that one-GPU evaluation is 650.63 MiB forward / 966.94 MiB reverse;
+real ranks size scratch from their local inputs.
+
+Reproduce from the repository root:
+
+```bash
+python benchmark/linear_attention/benchmark_sm90_summary_tc.py --thd
+python benchmark/linear_attention/benchmark_sm90_summary_tc.py \
+  --tokens 64 256 1024 --heads 8 --fp64 --repeats 3 --groups 1
+python benchmark/linear_attention/benchmark_sm90_summary_tc.py \
+  --tokens 17 --heads 1 --cp64 --fp64 --repeats 3 --groups 1
+python benchmark/linear_attention/benchmark_sm90_summary_tc.py \
+  --tokens 256 16384 --heads 1 --cp64 --correlated-keys --gate -0.000001 \
+  --closed-form --repeats 3 --groups 1
+```
+
+Nsight Compute at T1024/H8 confirms BF16 Tensor Core work in both coefficient
+preparation and state recurrence. Their tensor-pipe instruction counts are
+8,192 and 262,144 respectively. Instrumented cold-cache timings are distinct
+from the warm graph measurements above. A fused prototype repeated coefficient
+preparation in every state-row CTA and did not speed up backward; sharing that
+work in the separate producer removes this duplication. Padded shared memory
+and two independent 16-lane row solves per warp reduce the small-tile overhead.
+
+Compatibility audit: passed for the documented SM90 envelope. Docstring audit:
+passed for both public summaries and graph-plan ownership/stream contracts.
+Fence audit: passed. Coefficient writes become visible to consumers through
+ordered launches on the same stream. Inside a CTA, `__syncthreads()` publishes
+shared inputs before warp MMA and protects state/operand reuse after every
+tile. WMMA operations are synchronous and consume register fragments; there
+is no WGMMA/TMA async proxy or persistent cross-CTA flag. Half-warp solves
+use full participating warps with width-16 shuffles. Empty/gap and unsafe-tile
+branches are CTA-uniform, tail slots are initialized, and each output row has
+one writer. Concurrent executions use separate caller scratch and outputs.
+
 ### SM90 KDA FP32 summaries — 16-token staging, 2026-11-11
 
 The final SM90 path shares a 16-token K/gate/decay/beta tile across 16 rows

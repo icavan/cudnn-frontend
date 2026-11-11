@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FP32 KDA span summaries on SM90, independent of the BF16-MMA apply path.
+"""Direct KDA span summaries on SM90, independent of ordinary apply kernels.
 
 One warp owns a state/transition row throughout a sequence. A 512-thread CTA
 shares each 16-token tile's keys and decay factors across 16 state rows, keeping
 the direct FP32 recurrence's operation order. Transition rows start from
 identity and never read V/dO or the caller's boundary state. Subtracting
 ordinary forwards F(I,V)-F(0,V) instead amplifies BF16 operand rounding.
-The ordinary KDA forward/backward kernels are unchanged.
+The optional Tensor Core plan uses a separate mixed-precision BT16 recurrence
+and caller-owned coefficients; the FP32 plan remains the default.
 """
 
 import math
@@ -24,6 +25,7 @@ from ..graph_analyzer import analyze, to_buffer_dtype
 
 _LOCK = threading.Lock()
 _LIBRARIES = {}
+_TC_LIBRARIES = {}
 
 
 def _library(device):
@@ -37,11 +39,11 @@ def _library(device):
         return _LIBRARIES[device]
 
 
-def check_contract(facts, node):
+def check_contract(facts, node, name="kda_summary_hopper_cuda"):
     """Reject unsupported features before compilation or any output write."""
 
     def decline(reason):
-        raise NotImplementedError(f"kda_summary_hopper_cuda: {reason}")
+        raise NotImplementedError(f"{name}: {reason}")
 
     if facts is None or facts.op != "KDA_SUMMARY":
         decline("requires one KDA_SUMMARY or KDA_SUMMARY_BWD node")
@@ -93,6 +95,12 @@ class KdaSummaryHopperPlan(CompiledPlan):
 
     takes_variant_pack = True
     plan_name = "kda_summary_hopper_cuda"
+    rows_per_cta = 16
+    threads = 512
+    kernel_prefix = "cudnn_kda_summary_"
+
+    def _load_library(self):
+        return _library(self.device)
 
     def __init__(self, graph, facts):
         node = next(iter(graph.nodes))
@@ -105,8 +113,8 @@ class KdaSummaryHopperPlan(CompiledPlan):
         self.outputs = set(node.outputs)
         self.cu64 = facts.cu_dtype == cudnn.data_type.INT64
         self.ports = None
-        self.library = _library(self.device)
-        self.function = self.library.function("cudnn_kda_summary_bwd" if self.is_bwd else "cudnn_kda_summary_fwd")
+        self.library = self._load_library()
+        self.function = self.library.function(self.kernel_prefix + ("bwd" if self.is_bwd else "fwd"))
 
     def get_workspace_size(self):
         return 0
@@ -173,10 +181,15 @@ class KdaSummaryHopperPlan(CompiledPlan):
             for stride in strides:
                 params.i64(stride)
         params.i32(self.heads).i32(int(self.cu64)).f32(self.scale)
-        groups = 16 if "transition" in x else 8
+        self._launch(params, x, spans, variant_pack, ctx)
+
+    def _launch(self, params, x, spans, variant_pack, ctx):
+        from ..cake import compiler
+
+        groups = (256 if "transition" in x else 128) // self.rows_per_cta
         if self.seqs:
             with device_context(self.device):
-                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (512, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
+                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (self.threads, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
 
 
 class KdaSummaryHopperCudaEngine(BaseEngine):
@@ -184,10 +197,11 @@ class KdaSummaryHopperCudaEngine(BaseEngine):
 
     name = "kda_summary_hopper_cuda"
     behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
+    plan_class = KdaSummaryHopperPlan
 
     def check_support(self, graph):
         facts = graph._facts_for(analyze)
-        check_contract(facts, next(iter(graph.nodes), None))
+        check_contract(facts, next(iter(graph.nodes), None), self.name)
         if buffers.current_sm() != 90:
             raise NotImplementedError(f"{self.name}: requires SM90")
         try:
@@ -201,4 +215,92 @@ class KdaSummaryHopperCudaEngine(BaseEngine):
         handle = ctx.handle if ctx is not None else None
         device = handle.device.ordinal if hasattr(handle, "device") else None
         with build_device(device):
-            return KdaSummaryHopperPlan(graph, graph._facts_for(analyze))
+            return self.plan_class(graph, graph._facts_for(analyze))
+
+
+class KdaSummaryHopperTensorCorePlan(KdaSummaryHopperPlan):
+    """BT16 direct-M BF16 MMA summaries with FP32 state carry.
+
+    The binding, stream and empty-span contracts match the FP32 plan. A parallel
+    coefficient pass precedes the recurrence on the caller's stream. Workspace
+    is caller-owned, 32-byte aligned and disjoint from every nonempty operand.
+    For T tokens, N sequences and H heads, it uses (T//16+N)*H tiles of 10400
+    forward or 15456 reverse bytes; empty inputs require no workspace. Device
+    offsets may change within those declared capacities under graph replay.
+    Projection/update operands are rounded to BF16. A device-side per-tile
+    range check uses the direct FP32 recurrence for unsafe gate prefixes.
+    This changes numerical results; select this plan explicitly when the
+    measured mixed-precision error meets the caller's accuracy requirements.
+    """
+
+    plan_name = "kda_summary_hopper_tc"
+    rows_per_cta = 16
+    threads = 128
+    kernel_prefix = "cudnn_kda_summary_tc_"
+
+    def __init__(self, graph, facts):
+        super().__init__(graph, facts)
+        self.chunks = facts.total_t // 16 + facts.n_seq
+        self.workspace_bytes = self.chunks * self.heads * (15456 if self.is_bwd else 10400) if facts.total_t and self.seqs else 0
+        self.prepare = self.library.function(self.kernel_prefix + ("prepare_bwd" if self.is_bwd else "prepare_fwd"))
+
+    def get_workspace_size(self):
+        return self.workspace_bytes
+
+    def _launch(self, params, x, spans, variant_pack, ctx):
+        from cudnn.frost.workspace import Workspace
+        from ..cake import compiler
+
+        ptr = 0
+        if self.workspace_bytes:
+            Workspace.over(variant_pack, self.workspace_bytes, self.plan_name, align=32)
+            # VariantPack records the scratch extent, but not its device. For
+            # typed buffers also reject host/foreign-device storage before the
+            # first producer launch. Bare addresses retain the graph API's
+            # caller-owned device/capacity contract.
+            if type(ctx.workspace) is not int:
+                device = getattr(ctx.workspace, "__dlpack_device__", None)
+                if device is not None and tuple(device()) != (2, self.device):
+                    raise ValueError(f"{self.plan_name}: workspace must be on cuda:{self.device}")
+                Workspace(ctx.workspace, self.workspace_bytes, self.plan_name, align=32, device=self.device)
+            ptr = variant_pack.workspace
+            for name, start, end in spans:
+                if start < end and ptr < end and start < ptr + self.workspace_bytes:
+                    raise ValueError(f"{self.plan_name}: workspace overlaps {name}")
+        params.ptr(ptr).i64(self.chunks).i32(self.seqs)
+        if self.seqs:
+            groups = (256 if "transition" in x else 128) // self.rows_per_cta
+            with device_context(self.device):
+                if self.workspace_bytes:
+                    compiler.launch(self.prepare, (self.chunks * self.heads, 1, 1), (128, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
+                compiler.launch(self.function, (self.seqs * self.heads * groups, 1, 1), (self.threads, 1, 1), 0, int(ctx.stream or 0), params, self.plan_name)
+
+    def _load_library(self):
+        from ..cake import compiler
+
+        with _LOCK:
+            if self.device not in _TC_LIBRARIES:
+                _TC_LIBRARIES[self.device] = compiler.KernelLibrary(
+                    Path(__file__).with_name("cuda_kernels") / "kda_summary_tc_sm90.cu", "sm_90", self.device, fast_math=False
+                )
+            return _TC_LIBRARIES[self.device]
+
+
+class KdaSummaryHopperTensorCoreEngine(KdaSummaryHopperCudaEngine):
+    """Optional BF16 Tensor Core provider; the FP32 summary retains precedence."""
+
+    name = "kda_summary_hopper_tc"
+    plan_class = KdaSummaryHopperTensorCorePlan
+    numerical_notes = (cudnn.numerical_note.TENSOR_CORE, cudnn.numerical_note.DOWN_CONVERT_INPUTS)
+
+    def check_support(self, graph):
+        super().check_support(graph)
+        from ..cake import compiler
+
+        facts = graph._facts_for(analyze)
+        chunks = facts.total_t // 16 + facts.n_seq
+        if chunks * facts.h_o >= 2**31 or chunks * facts.h_o * 15456 >= 2**63:
+            raise NotImplementedError(f"{self.name}: coefficient grid or workspace exceeds the addressing range")
+        includes = compiler.cuda_include_dirs()
+        if not all(any((path / header).is_file() for path in includes) for header in ("mma.h", "crt/mma.h")):
+            raise NotImplementedError(f"{self.name}: requires CUDA MMA headers; set CUDA_HOME to a complete CUDA toolkit")

@@ -40,14 +40,14 @@ def make_case(lengths, heads, gate):
     )
 
 
-def candidate(x, backward, handle):
+def candidate(x, backward, handle, plan_name="kda_summary_hopper_cuda"):
     graph = cudnn.pygraph()
     names = ("q", "k", "g", "beta", "dO", "cu_seqlens") if backward else ("k", "v", "g", "beta", "cu_seqlens")
     tensors = {name: graph.tensor_like(x[name]) for name in names}
     h, m = graph.kda_summary_bwd(**tensors, output_transition=True) if backward else graph.kda_summary(**tensors, output_transition=True)
     h.set_data_type(cudnn.data_type.FLOAT).set_output(True)
     m.set_data_type(cudnn.data_type.FLOAT).set_output(True)
-    select_plan(graph, "kda_summary_hopper_cuda")
+    select_plan(graph, plan_name)
     graph.build_plans()
     shape = (x["cu_seqlens"].numel() - 1, x["k"].shape[1], 128, 128)
     outputs = tuple(torch.empty(shape, device="cuda", dtype=torch.float32) for _ in range(2))

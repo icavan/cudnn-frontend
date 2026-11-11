@@ -40,6 +40,7 @@ arbitrary user callbacks.
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `kimi_delta_attention_summary` | state / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
 | `kimi_delta_attention_summary_bwd` | state-gradient / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
+| KDA summaries, explicit `kda_summary_hopper_tc` | forward / reverse state and transition | BF16 MMA, FP32 carry / outputs | Supported | Unsupported | Unsupported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -127,6 +128,17 @@ a row alone and inside a batch under the entry's own picks.
   Both H/G and transition are covered. These non-differentiable summary APIs
   do not provide dQ/dK/dV/dG/dBeta or a backward context; this qualification
   does not establish determinism of the ordinary SM90 KDA apply kernels.
+
+- The optional `kda_summary_hopper_tc` SM90 plan preserves H/G and direct-M
+  bytes across replay, concurrent GPU work and changed THD packing, including
+  empty neighbors. Select it explicitly with FROST engines enabled. Its BF16
+  projection/update operands and FP32 triangular solve define a separate
+  numerical path with separate goldens; determinism does not imply FP32
+  accuracy. Extreme gate tiles use a direct FP32 recurrence. Caller workspace
+  is sized from token/sequence capacity, so device offsets may change under
+  graph replay without recompilation. This qualification covers summaries,
+  not full attention gradients or distributed communication. See the
+  [SM90 Tensor Core summary contract](linear_attention/kda_sm90_tensor_core_summary.md).
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
