@@ -3,6 +3,7 @@
 
 import importlib
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -342,6 +343,27 @@ def test_DSA_indexer_backward_packed_shapes_reuse_compilation(monkeypatch):
         )
         if i == 0:
             monkeypatch.setattr(cute, "compile", forbidden_compile)
+
+
+@pytest.mark.L0
+def test_DSA_indexer_backward_cross_row_dq_completion_is_per_q_buffer():
+    """Pin the cross-row completion protocol without launching a potentially hung kernel.
+
+    A single phase bit shared by both Q ping-pong buffers can wrap twice before
+    the load warp observes the first completion.  The load then waits for a row
+    whose Q it alone can publish.  Keep one completion barrier per Q buffer and
+    derive its wait phase from that buffer's reuse epoch.
+    """
+    kernel = (Path(__file__).resolve().parents[4] / "python/cudnn/deepseek_sparse_attention/indexer_backward/indexer_backward_sm100.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "MBAR_DQ_DONE_0 = 15" in kernel
+    assert "MBAR_DQ_DONE_1 = 16" in kernel
+    assert "mbar + MBAR_DQ_DONE_0 + parity" in kernel
+    assert "Int32((epoch - 1) & 1)" in kernel
+    assert kernel.count("tcgen05.commit(dq_done_barrier)") == 2
+    assert "mbarrier_wait(\n            dq_done_barrier,\n            Int32(gw_ready_phase)," in kernel
 
 
 # ===========================================================================
