@@ -16,7 +16,7 @@ import torch
 
 from ._config import ResolvedMoeEpConfig
 from ._contracts import _ForwardCall
-from ._types import MoeTensor
+from ._types import MoeFormat, MoeTensor
 
 
 class MoeEpBackend(Protocol):
@@ -43,6 +43,9 @@ class BackendUnavailableError(RuntimeError):
 
 def validate_config(config: ResolvedMoeEpConfig) -> None:
     """Run the selected backend's static capability gate lazily."""
+
+    if config.public_config.data_path.compute_format is MoeFormat.NVFP4:
+        raise NotImplementedError("NVFP4 compute is available through the prepared training API")
 
     from ._megamoe_backend._capability import validate_config as validate
 

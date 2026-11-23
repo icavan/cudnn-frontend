@@ -43,6 +43,8 @@ from ._types import (
     MoeEpNativeDiscreteWeight,
     MoeEpNativeForwardWeights,
     MoeEpNativeWeightStorageMode,
+    MoeEpNvfp4BackwardWeights,
+    MoeEpNvfp4ForwardWeights,
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
@@ -178,7 +180,8 @@ class MoeEp:
     combine quantizes each FP32 route accumulator directly before top-k
     reduction. The Rubin training backend requires
     ``apply_topk_in_fc1=True``.
-    Native NVFP4 operands and NVFP4 combine/output are not executable.
+    Blackwell training selects NVFP4 MMA with data_path.compute_format=NVFP4
+    and uses BF16 input, output and combine.
 
     ``__call__`` is the inference-only forward surface. Training uses
     :meth:`prepare_training`, :meth:`training_forward`, and
@@ -1164,23 +1167,39 @@ class MoeEp:
                 raise RuntimeError("MoeEp is unusable after an autotune runtime failure")
             if self._training_state is not None:
                 raise RuntimeError("MoeEp training is already prepared")
-            if self.fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
-                raise ValueError("prepare_training requires " "fc1_weight_layout=GATE_UP_INTERLEAVED_32")
             execution_state = self._execution_state
-            weight_storage_mode = execution_state.resolved_config.public_config.training_weight_storage_mode
-            resolved_device = _resolve_training_device(device)
             resolved = execution_state.resolved_config
-            group = resolved.public_config.parallel.ep_group
+            config = resolved.public_config
+            nvfp4 = config.data_path.compute_format is MoeFormat.NVFP4
+            if not nvfp4 and self.fc1_weight_layout is not MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32:
+                raise ValueError("prepare_training requires fc1_weight_layout=GATE_UP_INTERLEAVED_32")
+            resolved_device = _resolve_training_device(device)
+            group = config.parallel.ep_group
             if group is not None:
-                modes: list[str | None] = [None] * resolved.topology.ep_size
-                with torch.cuda.device(resolved_device):
-                    dist.all_gather_object(
-                        modes,
-                        weight_storage_mode.value,
-                        group=group,
+                # Peer kernels derive address offsets from these static fields on each rank.
+                contract = config.training_weight_storage_mode.value
+                if nvfp4:
+                    contract = (
+                        contract,
+                        config.model,
+                        config.data_path,
+                        config.parallel.max_tokens_per_rank,
+                        config.parallel.physical_recv_pool_rows,
+                        config.parallel.drop_on_overflow,
                     )
-                if any(mode != modes[0] for mode in modes[1:]):
-                    raise RuntimeError("MoeEpConfig.training_weight_storage_mode must match " "on every expert-parallel rank; modes by rank: " f"{modes}")
+                contracts = [None] * resolved.topology.ep_size
+                with torch.cuda.device(resolved_device):
+                    dist.all_gather_object(contracts, contract, group=group)
+                if any(peer != contract for peer in contracts):
+                    raise RuntimeError(f"training precision, storage mode and peer layout must match on every expert-parallel rank: {contracts}")
+            if nvfp4:
+                from ._nvfp4_training import Nvfp4Training
+
+                with torch.cuda.device(resolved_device):
+                    state = Nvfp4Training(resolved, resolved_device)
+                self._training_state = state
+                self._training_requirements = state.requirements.copy()
+                return self._training_requirements
             _validate_training_assert_capability(resolved)
             from . import _backend
 
@@ -1260,7 +1279,7 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
-        weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights,
+        weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights | MoeEpNvfp4ForwardWeights,
         out: MoeEpTrainingForwardOutputs,
     ) -> torch.Tensor:
         """Run forward sequentially on this instance's training CUDA stream."""
@@ -1269,6 +1288,9 @@ class MoeEp:
             self._require_training_prepared()
             assert self._training_state is not None
             assert self._training_requirements is not None
+            if self.config.data_path.compute_format is MoeFormat.NVFP4:
+                with torch.cuda.device(self._training_state.device):
+                    return self._training_state.forward(activation, topk_idx, topk_weights, weights, out)
             execution_state = self._execution_state
             assert execution_state.backend is not None
             device = execution_state.backend.device
@@ -1345,13 +1367,17 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
-        weights: MoeEpNativeBackwardWeights | MoeEpNativeDiscreteBackwardWeights,
-        fc1_preact: torch.Tensor,
+        weights: MoeEpNativeBackwardWeights | MoeEpNativeDiscreteBackwardWeights | MoeEpNvfp4BackwardWeights,
+        fc1_preact: torch.Tensor | None = None,
         fc1_a: torch.Tensor | None = None,
         fc1_sfa: torch.Tensor | None = None,
         valid_route_counts: torch.Tensor | None = None,
         expert_offsets: torch.Tensor | None = None,
         out: MoeEpTrainingBackwardOutputs | None = None,
+        forward_record: MoeEpTrainingForwardOutputs | None = None,
+        overlap: bool = True,
+        dw1: torch.Tensor | None = None,
+        dw2: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1362,6 +1388,15 @@ class MoeEp:
         with self._lifecycle_lock:
             self._require_training_prepared()
             assert self._training_state is not None
+            if self.config.data_path.compute_format is MoeFormat.NVFP4:
+                if any(value is not None for value in (fc1_preact, fc1_a, fc1_sfa, valid_route_counts, expert_offsets)):
+                    raise ValueError("supply the matching NVFP4 forward_record as a bundle")
+                if not isinstance(overlap, bool):
+                    raise TypeError("overlap must be a bool")
+                with torch.cuda.device(self._training_state.device):
+                    return self._training_state.backward(grad_output, topk_idx, topk_weights, weights, forward_record, out, overlap, dw1, dw2)
+            if forward_record is not None or dw1 is not None or dw2 is not None or not overlap:
+                raise ValueError("forward_record, scheduled wgrad and overlap selection require NVFP4 training")
             execution_state = self._execution_state
             assert execution_state.backend is not None
             device = execution_state.backend.device
@@ -1468,6 +1503,15 @@ class MoeEp:
                     out=backward_output,
                 )
 
+    def training_wgrad(self, operands: MoeEpTrainingWgradOperands, *, dw1: torch.Tensor, dw2: torch.Tensor) -> None:
+        """Write local FP32 master gradients, overwriting the supplied buffers."""
+        with self._lifecycle_lock:
+            self._require_training_prepared()
+            if self.config.data_path.compute_format is not MoeFormat.NVFP4:
+                raise ValueError("training_wgrad requires NVFP4 training")
+            with torch.cuda.device(self._training_state.device):
+                self._training_state.wgrad(operands, dw1, dw2)
+
     def close(self) -> None:
         """Release compiled-backend instance resources; idempotent."""
 
@@ -1483,6 +1527,8 @@ class MoeEp:
             self._validated_topk_idx = None
             self._validated_topk_version = None
             self._validated_discrete_pointer_tables.clear()
+            if self._training_state is not None and self.config.data_path.compute_format is MoeFormat.NVFP4:
+                self._training_state.close()
             self._training_state = None
             self._training_requirements = None
             self._closed = True

@@ -474,6 +474,10 @@ def test_training_bundle_fields_match_public_contracts():
         "fc1_sfa",
         "valid_route_counts",
         "expert_offsets",
+        "saved_a",
+        "saved_sfa",
+        "route_slots",
+        "activation_norms",
     ]
     assert [field.name for field in fields(MoeEpTrainingBackwardOutputs)] == [
         "grad_activation",
@@ -484,6 +488,8 @@ def test_training_bundle_fields_match_public_contracts():
         "fc2_sfa",
         "fc2_b",
         "fc2_sfb",
+        "fc1_wgrad_a",
+        "fc1_wgrad_sfa",
     ]
 
 

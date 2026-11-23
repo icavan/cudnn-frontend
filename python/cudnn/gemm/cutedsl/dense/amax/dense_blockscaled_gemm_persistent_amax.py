@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Type, Tuple, Union
+from typing import Optional, Type, Tuple, Union
 
 import cuda.bindings.driver as cuda
 
@@ -351,6 +351,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        weight_expert: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -573,6 +574,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            weight_expert,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -609,6 +611,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        weight_expert: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -852,12 +855,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
                 # ((atom_v, rest_v), RestK)
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                weight_batch = mma_tile_coord_mnl[2]
+                if cutlass.const_expr(weight_expert is not None):
+                    weight_batch = weight_expert[0].to(cutlass.Int32)
+                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, weight_batch)]
 
                 # ((atom_v, rest_v), RestK)
                 tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None, weight_batch)]
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
@@ -1324,20 +1330,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Dealloc the tensor memory buffer
             #
-            # Ensure all epilogue warps complete their writes before block reduction
+            # Only the allocating warp owns the permit and frees the columns.
+            # All epilogue warps must finish reading before those columns can be reused.
+            if warp_idx == self.epilog_warp_id[0]:
+                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
             self.epilog_sync_barrier.arrive_and_wait()
-
-            # Coordinate dealloc across 2-CTA instruction mode
-            if use_2cta_instrs:
-                cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
-                cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-
-            # Actually deallocate TMEM
-            cute.arch.dealloc_tmem(
-                acc_tmem_ptr,
-                self.num_tmem_alloc_cols,
-                is_two_cta=use_2cta_instrs,
-            )
+            if warp_idx == self.epilog_warp_id[0]:
+                if use_2cta_instrs:
+                    cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
+                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
+                cute.arch.dealloc_tmem(acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs)
             #
             # Wait for C store complete
             #

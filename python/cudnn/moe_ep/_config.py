@@ -98,8 +98,19 @@ class MoeEpDataPathConfig:
     apply_topk_in_fc1: bool = True
     fc1_weight_layout: MoeEpFc1WeightLayout = MoeEpFc1WeightLayout.GATE_THEN_UP
     gate_up_clamp: float | None = None
+    compute_format: MoeFormat = MoeFormat.MXFP8
+    dy_norm: float = 1.0
+    dgu_norm: float = 1.0
+    x_wgrad_norm: float = 1.0
+    a_wgrad_norm: float = 1.0
 
     def __post_init__(self) -> None:
+        if self.compute_format not in (MoeFormat.MXFP8, MoeFormat.NVFP4) or not isinstance(self.compute_format, MoeFormat):
+            raise ValueError("compute_format must be MoeFormat.MXFP8 or MoeFormat.NVFP4")
+        for name in ("dy_norm", "dgu_norm", "x_wgrad_norm", "a_wgrad_norm"):
+            norm = getattr(self, name)
+            if isinstance(norm, bool) or not isinstance(norm, Real) or not math.isfinite(norm) or norm <= 0:
+                raise ValueError(f"{name} must be a finite positive encoding multiplier")
         for name in ("output_format", "combine_format"):
             value = getattr(self, name)
             if not isinstance(value, MoeFormat):
@@ -255,7 +266,7 @@ def _resolve_receive_capacity(
     if raw_route_count > _MAX_KERNEL_ROUTE_INDEX:
         raise ValueError("raw route count exceeds the kernel Int32 route-index limit: " f"R={raw_route_count}, limit={_MAX_KERNEL_ROUTE_INDEX}")
 
-    training_padding = _PHYSICAL_RECV_POOL_ALIGNMENT
+    training_padding = 256 if config.data_path.compute_format is MoeFormat.NVFP4 else _PHYSICAL_RECV_POOL_ALIGNMENT
     inference_padding = parallel.token_padding_size
     if parallel.physical_recv_pool_rows is None:
         canonical_rows = max(

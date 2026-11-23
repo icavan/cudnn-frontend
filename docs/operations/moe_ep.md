@@ -670,7 +670,171 @@ configured capacity.
 Private instance resources cannot grow during replay. Capacity changes require a
 new operator preparation; caller-address changes require recapture.
 
+## Blackwell NVFP4 training
+
+Set `MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4)` for EP1 or
+eight GPUs in one NVLink domain. Use BF16 inputs and combine, contiguous local
+experts, FP32 routing probabilities and `apply_topk_in_fc1=True`. Set an explicit
+`max_tokens_per_rank`. The shared expert runs in the caller. The forward contract
+follows [TRT-LLM MegaMoE at 933366a](https://github.com/NVIDIA/TensorRT-LLM/blob/933366ab65d4e75085dd8d1c11b1898cdbadf286/tensorrt_llm/_torch/moe/fused_moe/mega_moe/mega_moe_cute_dsl.py).
+
+```python
+import torch
+from dataclasses import fields
+from cudnn.moe_ep import (
+    MoeEpNvfp4ForwardWeights, MoeEpNvfp4BackwardWeights,
+    MoeEpTrainingForwardOutputs, MoeEpTrainingBackwardOutputs,
+)
+
+# trt_view is the local checkpoint's MegaMoECuteDslWeightView. It can also
+# be a plain object with the seven tensor attributes of that view.
+fw = MoeEpNvfp4ForwardWeights.from_trtllm(
+    trt_view, fc31_input_scale, input_channel_scale=fc31_act_scale,
+)
+# w1 has logical gate-then-up rows [E_local,2I,H]. w2 is [E_local,H,I].
+# Refresh both sets of weight operands after a master-weight update.
+bw = MoeEpNvfp4BackwardWeights.from_master(w1, w2, w1_norm=1., w2_norm=1.)
+req = op.prepare_training(device=x.device)
+
+def allocate(bundle_type):
+    return bundle_type(**{
+        f.name: torch.empty_strided(req[f.name][0], req[f.name][1],
+                                    dtype=req[f.name][2], device=x.device)
+        for f in fields(bundle_type)
+    })
+
+record = allocate(MoeEpTrainingForwardOutputs)
+grad = allocate(MoeEpTrainingBackwardOutputs)
+y = op.training_forward(x, ids, probabilities, weights=fw, out=record)
+dx, dp, operands = op.training_backward(
+    dy, ids, probabilities, weights=bw, forward_record=record, out=grad,
+    dw1=master_grad1, dw2=master_grad2,
+)
+```
+
+Supply the owning module’s `fc31_act_scale` explicitly. Pass `None` when absent. The importer decodes the 16-row
+gate/up interleave and the 128×4 scale layout, preserving checkpoint payload
+bytes. It rejects checkpoints requiring an input channel multiplier. Independently
+prepared logical forward weights can be supplied directly through the same type.
+
+FC1 and FC2 multiply their raw FP32 accumulators by `fc31_alpha[e]` and
+`fc2_alpha[e]`. The FC2 input is quantized *after* multiplying the clamped
+SwiGLU result by the routing probability, using `fc1_norm_const[e]` as its
+encoding multiplier. Give each live microbatch a separate forward record and
+pass its matching routing tensors to backward. The record contains FP32 preactivations,
+the actual X/A bytes and scales, and rank-major flattened token/slot indices.
+Its expert offsets are exclusive ends of 256-row padded segments.
+
+All four backward GEMMs consume E2M1 payloads with one E4M3 scale per
+16 reduction elements and accumulate in FP32. The data-path options
+`dy_norm`, `dgu_norm`, `x_wgrad_norm` and `a_wgrad_norm` are encoding
+multipliers. Each defaults to one. The activation STE passes gradients through
+quantization. The explicit clamp derivative is zero at either active boundary.
+Each route publishes FP32 dp to its source slot. The last arrival for each
+(token, 128-feature chunk) sums its FP32 route gradients in top-k slot order
+and writes a BF16 dX chunk on the source rank. Each backward overwrites
+contiguous FP32 master-gradient buffers in logical weight order. To defer wgrad, omit both gradient buffers
+and call `op.training_wgrad(operands, dw1=master_grad1, dw2=master_grad2)`
+before reusing the backward bundle.
+The NVFP4 mapping from `training_symmetric_buffers()` exposes optional local
+`output` and `grad_activation` buffers, plus `backward_input` and `dprob`
+views of the peer exchange heap.
+
+EP8 uses a prepared peer-mapped PyTorch symmetric heap for backward transport.
+`overlap=False` runs the same tile arithmetic on one stream. All ranks must
+execute the same collective sequence and keep plans, graph-captured tensors,
+and their process group alive through replay. Destroy captured graphs before
+tearing down the process group. Backward preparation allocates the tile packs,
+scale layout scratch, and peer return buffers. Forward routing and combine use
+PyTorch temporaries. Records and backward bundles reserve worst-case capacity.
+The final expert offset bounds the live prefix of 256-row tiles. Two CUDA Graph
+WHILE nodes process full windows of up to 16 tiles and the remaining individual
+tiles. An empty rank participates in the exchange barriers and skips tile work.
+
+Dgrad selects the expert in the weight and scale TMA descriptors. With contiguous,
+16-byte aligned weights, an enclosing CUDA Graph reads the caller's packed
+weights directly. Eager execution stages each bank once for the prepared graph. Both paths
+reorder weight scales once per bank per call. For wgrad, each expert's packed
+token-axis operands are laid out contiguously in K, with separate swizzled block
+scales. Two grouped GEMMs write the caller's FP32 gradients. This also applies
+to deferred `training_wgrad`.
+
+The return kernel publishes each FP32 route chunk before incrementing a
+system-scope acquire/release arrival counter. Only the last of the token's top-k
+slots reduces that chunk. At the end of the exchange the source copies the
+combined result to the caller's output. Barriers separate counter initialization,
+publication and consumption across generations.
+
+The benchmark reports CUDA Graph replay latency for the slowest rank, per-rank
+storage in bytes, and replay allocation counts. With `--verify` it compares every
+gradient byte across schedules outside the timed region. Run on one NVLink domain:
+
+```bash
+torchrun --standalone --nproc-per-node=8 benchmark/bench_nvfp4_moe_ep.py --graph --verify --repeats 7
+torchrun --standalone --nproc-per-node=8 benchmark/bench_deepgemm_bf16_moe_ep.py --repeats 7
+torchrun --standalone --nproc-per-node=8 test/python/moe_ep/nvfp4_distributed_worker.py
+```
+
+The single-device numerical tests are in `test/python/moe_ep/test_nvfp4_training.py`
+and `test_nvfp4_trtllm.py`. Both frozen forward fixtures run with FE alone.
+To repeat the live MegaMoE comparison, set `TRTLLM_MEGAMOE_KERNELS` to
+`tensorrt_llm/_torch/moe/kernels` in the pinned checkout.
+
+On eight B300 GPUs in one NVLink domain, the benchmark used H=7168,
+I=2048, 256 experts and top-k 8. Both benchmarks used the same synthetic
+constant weights (6/256), PyTorch 2.12.1+cu130 and CuTeDSL 4.8.1. The
+timed W4A4 runs used unit encoding multipliers. Each time below is the median of seven replays, taking the
+maximum across ranks on each replay.
+
+The external baseline combines [DeepGEMM BF16 grouped kernels at 559d79f](https://github.com/deepseek-ai/DeepGEMM/blob/559d79fb6994a58b8a15b4b93bf13ccc16edf247/csrc/apis/gemm.hpp)
+with NCCL all-to-all. The timed graph dispatches dY, runs two M-grouped dgrads,
+computes SwiGLU and routing gradients, runs two K-grouped FP32-output wgrads,
+and returns and combines route gradients. Both implementations use identical BF16
+inputs, gradients, logical weights and routing draws. Both have prepared forward
+records. The BF16 graph specializes its NCCL split sizes and aligned expert
+lengths to that forward's route handle. FE reserves worst-case capacity so its
+graph can replay changed routes.
+
+| Full backward (ms), cumulative changes | 512 tokens/rank | 2048 tokens/rank | 4096 tokens/rank |
+|---|---:|---:|---:|
+| DeepGEMM BF16 + NCCL | 4.04 | 6.18 | 8.54 |
+| Original W4A4 backward | 51.82 | 226.78 | 580.69 |
+| Skip empty 256-route tiles | 11.96 | 36.73 | 78.02 |
+| Group FC2 and FC1 wgrad by expert | 9.59 | 29.79 | 66.40 |
+| Read dgrad weights by expert index | 6.34 | 21.26 | 50.76 |
+| Reduce newly ready dX chunks | 6.43 | 16.25 | 28.95 |
+| Final W4A4 / DeepGEMM latency | 1.59× | 2.63× | 3.39× |
+
+Rank 0 had 32, 81 and 144 active tiles at the three sizes, against capacities
+of 159, 543 and 1,055. At 4096 tokens/rank it received 32,754 routes, or 36,864
+rows after FE expert alignment. The BF16 baseline used 35,840 aligned rows.
+The table includes dispatch, route-gradient return and both master gradients.
+Each W4A4 row passed serial-versus-overlap byte comparisons at all three sizes.
+Each optimization also passed the EP8 independent FP4 reference with changed
+routes, repeated expert slots, empty ranks and a delayed publisher.
+
+| Tokens/rank | Serial backward (ms) | Overlapped backward (ms) | dX ready (ms) | wgrad ready (ms) | Prepared workspace¹ (GiB) | Saved forward record² (GiB) | Backward bundle (GiB) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 6.99 | 6.43 | 5.69 | 6.42 | 1.546 | 0.818 | 0.444 |
+| 2048 | 17.80 | 16.25 | 15.18 | 16.24 | 3.009 | 2.793 | 1.519 |
+| 4096 | 31.60 | 28.95 | 27.66 | 28.95 | 4.964 | 5.427 | 2.952 |
+
+¹ Per-rank prepared PyTorch storage plus the registered peer heap. This includes
+the window scratch, eager weight staging and ragged grouped-GEMM operand buffers.
+² Per-rank caller-owned record excluding the BF16 model output. Weights, FP32
+master gradients, allocator reserves and driver graph metadata are outside these
+columns. All measured W4A4 replays had zero additional PyTorch allocations.
+
+At 512 tokens/rank the last-arrival change added 0.08 ms to the full backward.
+At 2048 and 4096 it reduced latency by 5.01 and 21.81 ms. A separate 512-token
+Nsight Systems trace on rank 0 recorded 32 receives, 64 dgrad GEMMs and
+32 returns. Receiving tile 1 overlapped tile 0's FC2 dgrad by 11.712 µs.
+Returning tile 30 overlapped tile 31's FC2 dgrad by 27.808 µs. Profiling was
+disabled for all measurements in the tables.
+
 ## Execution support
+
+The following limits apply to the default MXFP8 backend.
 
 - NVIDIA Rubin SM107 GPUs (compute capability 10.7).
 - CUDA and PyTorch execution.
@@ -706,7 +870,7 @@ Inference activation and expert weights accept:
 - BF16, FP16, or FP32 plain tensors, staged internally to MXFP8; or
 - MXFP8 `BlockScaledTensor` values with logical block axis 1.
 
-The current executable output format is BF16. The expert-combine path accepts
+The Rubin executable output format is BF16. The Rubin expert-combine path accepts
 BF16 or MXFP8. NVFP4 types are represented by the public API but native NVFP4
 operands, combine, and output are not executable by this backend.
 
