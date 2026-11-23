@@ -103,10 +103,18 @@ class MoeEpDataPathConfig:
     dgu_norm: float = 1.0
     x_wgrad_norm: float = 1.0
     a_wgrad_norm: float = 1.0
+    fc1_ring_slots: int = 0
+    fc1_ring_overlap: bool = True
 
     def __post_init__(self) -> None:
         if self.compute_format not in (MoeFormat.MXFP8, MoeFormat.NVFP4) or not isinstance(self.compute_format, MoeFormat):
             raise ValueError("compute_format must be MoeFormat.MXFP8 or MoeFormat.NVFP4")
+        if type(self.fc1_ring_slots) is not int or self.fc1_ring_slots < 0:
+            raise ValueError("fc1_ring_slots must be a nonnegative integer")
+        if type(self.fc1_ring_overlap) is not bool:
+            raise TypeError("fc1_ring_overlap must be a bool")
+        if self.fc1_ring_slots and self.compute_format is not MoeFormat.NVFP4:
+            raise ValueError("fc1_ring_slots requires NVFP4 training")
         for name in ("dy_norm", "dgu_norm", "x_wgrad_norm", "a_wgrad_norm"):
             norm = getattr(self, name)
             if isinstance(norm, bool) or not isinstance(norm, Real) or not math.isfinite(norm) or norm <= 0:

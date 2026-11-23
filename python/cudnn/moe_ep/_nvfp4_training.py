@@ -84,10 +84,11 @@ class Nvfp4Training:
             stride = torch.empty(shape, device="meta").stride()
             self.requirements[name] = (shape, stride, dtype, 16)
 
-        for name, dim in (("fc1_a", h), ("saved_a", i)):
-            spec(name, (p, dim // 2), u8)
-        for name, dim in (("fc1_sfa", h), ("saved_sfa", i)):
-            spec(name, (p, dim // 16), sf)
+        source_rows = t * self.topology.ep_size if self.path.fc1_ring_slots else p
+        spec("fc1_a", (source_rows, h // 2), u8)
+        spec("fc1_sfa", (source_rows, h // 16), sf)
+        spec("saved_a", (p, i // 2), u8)
+        spec("saved_sfa", (p, i // 16), sf)
         for name, dim in (("fc1_wgrad_a", h), ("fc1_b", 2 * i), ("fc2_a", i), ("fc2_b", h)):
             spec(name, (tiles, dim, TILE // 2), u8)
         for name, dim in (("fc1_wgrad_sfa", h), ("fc1_sfb", 2 * i), ("fc2_sfa", i), ("fc2_sfb", h)):
@@ -167,7 +168,11 @@ class Nvfp4Training:
             shape, _, dtype, _ = self.requirements[name]
             self.window_outputs[name] = torch.empty((self.window, *shape[1:]), device=device, dtype=dtype)
 
-        self.read_window = WindowBindings(self.window_inputs, self.window, device, write=False)
+        read_fields = dict(self.window_inputs)
+        if self.path.fc1_ring_slots:
+            for name in ("fc1_a", "fc1_sfa"):
+                del read_fields[name]
+        self.read_window = WindowBindings(read_fields, self.window, device, write=False)
         self.write_window = WindowBindings(self.window_outputs, self.window, device, write=True)
         self.record_norms = torch.empty((e, 2), dtype=torch.float32, device=device)
         self.dgrad_divisors = torch.ones(2, dtype=torch.float32, device=device)
@@ -175,6 +180,11 @@ class Nvfp4Training:
         self.more_tiles = torch.empty((), dtype=torch.bool, device=device)
         # Eager uses the same device-side route count without a D2H read. The
         # two prepared graphs bind caller-owned records through a pointer table.
+        self.fc1_ring = None
+        if self.path.fc1_ring_slots:
+            from ._nvfp4_ring import Fc1Ring
+
+            self.fc1_ring = Fc1Ring(self, TILE, min(self.path.fc1_ring_slots, tiles), self.path.fc1_ring_overlap)
         eager_banks = tuple(self.gemms[TILE, n, kk].fallback_weights.view(torch.float4_e2m1fn_x2).permute(1, 2, 0) for n, kk in ((h, 2 * i), (i, h)))
         self.eager_graphs = {}
         for overlap in (False, True):
@@ -186,6 +196,7 @@ class Nvfp4Training:
     def close(self):
         with torch.cuda.device(self.device):
             self.eager_graphs.clear()
+            self.fc1_ring = None
             self.conditions.close()
 
     def _live_windows(self, banks, overlap):
@@ -198,6 +209,10 @@ class Nvfp4Training:
             torch.ge(self.remaining_tiles, n, out=self.more_tiles)
             with self.conditions.while_true(self.more_tiles) as update_condition:
                 self.read_window.copy(self.run_base, n)
+                if self.fc1_ring is not None:
+                    for tile in range(n):
+                        rows = slice(tile * TILE, (tile + 1) * TILE)
+                        self.fc1_ring.source.load(record.route_slots[rows], record.fc1_a[rows], record.fc1_sfa[rows])
                 torch.add(self.window_ids[:n], self.run_base, out=self.window_index[:n])
                 torch.index_select(self.tile_experts, 0, self.window_index[:n], out=self.window_experts[:n])
                 self._tile_run(record, out, self.dgrad_divisors, banks, overlap, n, self.window_experts)
@@ -303,6 +318,9 @@ class Nvfp4Training:
         out.activation_norms[:, 0].copy_(weights.input_norm.reshape(()))
         out.activation_norms[:, 1].copy_(weights.fc1_norm_const)
         routes = x.new_empty((self.rows, self.h))
+        if self.fc1_ring is not None:
+            self.fc1_ring.run(self, x, prob, weights, out, routes)
+            return self.combine(routes, slots, out.output, count)
         for _, rows, e in self.tiles(ends):
             slot = slots[rows]
             ix = slot.clamp_min(0)
@@ -341,6 +359,8 @@ class Nvfp4Training:
         torch.searchsorted(record.expert_offsets, self.tile_starts, right=True, out=self.tile_experts)
         torch.div(record.expert_offsets[-1], TILE, rounding_mode="floor", out=self.live_tiles)
         self.read_window.bind(record)
+        if self.fc1_ring is not None:
+            self.fc1_ring.source.bind(record)
         self.write_window.bind(out)
         self.record_norms.copy_(record.activation_norms)
         self.dgrad_divisors[0].fill_(self.path.dgu_norm * weights.w1_norm)

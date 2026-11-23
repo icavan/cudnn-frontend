@@ -244,3 +244,110 @@ def test_training(count, h, i, record_property):
             relative = ((value.float() - baseline.float()).norm() / baseline.float().norm()).item()
             record_property(f"bf16_relative_l2_{name}", relative)
     op.close()
+
+
+@pytest.mark.parametrize("slots,overlap", [(1, False), (2, False), (2, True)])
+def test_fc1_ring_wrap_and_replay(slots, overlap, monkeypatch):
+    """Change expert order, wrap count and empty experts without moving any graph input."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    t, h, i, e, k = 513, 160, 128, 4, 2
+    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0)
+    config = MoeEpConfig(
+        model=MoeEpModelConfig(num_experts=e, top_k=k, hidden_size=h, intermediate_size=i),
+        parallel=MoeEpParallelConfig(max_tokens_per_rank=t),
+        data_path=path,
+        validation_mode="trusted",
+    )
+    full = MoeEp(config)
+    ring = MoeEp(replace(config, data_path=replace(path, fc1_ring_slots=slots, fc1_ring_overlap=overlap)))
+    full_req = full.prepare_training(device=device)
+    req = ring.prepare_training(device=device)
+    assert req["fc1_a"][0] == (t, h // 2) and req["fc1_sfa"][0] == (t, h // 16)
+    fw, bw, w1, w2 = fixture(e, h, i, device)
+    x, dy = [torch.randn(t, h, dtype=torch.bfloat16, device=device) for _ in range(2)]
+    ids = torch.zeros(t, k, dtype=torch.int32, device=device)
+    p = torch.rand(t, k, device=device)
+    ref, rec = [buffers(spec, MoeEpTrainingForwardOutputs, device) for spec in (full_req, req)]
+    grads = [buffers(spec, MoeEpTrainingBackwardOutputs, device) for spec in (full_req, req)]
+
+    def observe_fc2(op, spec):
+        routes_out = torch.empty((spec["route_slots"][0][0], h), dtype=torch.bfloat16, device=device)
+        combine = op._training_state.combine
+
+        def save(routes, *args, **kwargs):
+            routes_out.copy_(routes)
+            return combine(routes, *args, **kwargs)
+
+        monkeypatch.setattr(op._training_state, "combine", save)
+        return routes_out
+
+    ref_fc2 = observe_fc2(full, full_req)
+    ring_fc2 = observe_fc2(ring, req)
+    graph = torch.cuda.CUDAGraph()
+    ring.training_forward(x, ids, p, weights=fw, out=rec)
+    from cutlass import cute
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("FC1 ring compiled a new kernel after preparation")
+
+    monkeypatch.setattr(cute, "compile", unexpected_compile)
+    captured_windows = []
+    if overlap:
+        # Delay each producer and the final FC1 feature reader before
+        # retirement. Capture the delays only in the stressed graph.
+        def delayed(fn):
+            def run(*args, **kwargs):
+                torch.cuda._sleep(100_000)
+                result = fn(*args, **kwargs)
+                torch.cuda._sleep(100_000)
+                return result
+
+            return run
+
+        plan = ring._training_state.fc1_ring
+        window = plan.window
+
+        def observe_window(state, n):
+            captured_windows.append(n)
+            return window(state, n)
+
+        monkeypatch.setattr(plan, "window", observe_window)
+        monkeypatch.setattr(plan.source, "load", delayed(plan.source.load))
+        monkeypatch.setattr(plan.gemm1.op, "execute", delayed(plan.gemm1.op.execute))
+    with torch.cuda.graph(graph):
+        ring.training_forward(x, ids, p, weights=fw, out=rec)
+    if overlap:
+        # A packet must wrap inside the conditional body to exercise per-slot retirement.
+        assert 2 * slots in captured_windows
+    row = torch.arange(t, device=device)
+    for offset in (0, 1, 3):
+        ids[:, 0] = (row // (t if offset == 0 else 129) + offset) % e
+        ids[:, 1] = (ids[:, 0] + offset) % e
+        x.neg_()
+        full.training_forward(x, ids, p, weights=fw, out=ref)
+        ring._training_state.fc1_ring.payload.fill_(255)
+        ring._training_state.fc1_ring.sf.view(torch.uint8).fill_(127)
+        graph.replay()
+        valid = ref.route_slots >= 0
+        src = ref.route_slots[valid] // k
+        assert torch.equal(ref.route_slots, rec.route_slots)
+        for name in ("fc1_a", "fc1_sfa"):
+            assert torch.equal(getattr(ref, name).view(torch.uint8)[valid], getattr(rec, name).view(torch.uint8)[src])
+        for name in ("fc1_preact", "saved_a", "saved_sfa"):
+            lhs, rhs = (getattr(v, name) for v in (ref, rec))
+            assert torch.equal(lhs.view(torch.uint8)[valid], rhs.view(torch.uint8)[valid])
+        assert torch.equal(ref_fc2[valid], ring_fc2[valid])
+        assert torch.equal(ref.output, rec.output)
+    # Another microbatch wraps every slot before deferred backward consumes rec.
+    other = buffers(req, MoeEpTrainingForwardOutputs, device)
+    ring.training_forward(-x, (ids + 1) % e, p, weights=fw, out=other)
+    results = []
+    for op, record, grad in zip((full, ring), (ref, rec), grads):
+        dw1, dw2 = torch.empty_like(w1), torch.empty_like(w2)
+        dx, dp, operands = op.training_backward(dy, ids, p, weights=bw, forward_record=record, out=grad)
+        op.training_wgrad(operands, dw1=dw1, dw2=dw2)
+        results.append((dx, dp, dw1, dw2))
+    assert all(torch.equal(a, b) for a, b in zip(*results))
+    del graph
+    full.close()
+    ring.close()

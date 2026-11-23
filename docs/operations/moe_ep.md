@@ -740,6 +740,40 @@ The NVFP4 mapping from `training_symmetric_buffers()` exposes optional local
 `output` and `grad_activation` buffers, plus `backward_input` and `dprob`
 views of the peer exchange heap.
 
+### Bounded FC1 inputs in NVFP4 training
+
+Set `fc1_ring_slots=S` in `MoeEpDataPathConfig` to enable the bounded FC1 dispatch path.
+The default `0` keeps the route-indexed input record. Each slot holds 256 rows,
+matching one FE training GEMM. A positive value is capped at the prepared
+number of logical tiles. Set `fc1_ring_overlap=False` to run the same windows
+on one stream. The overlapped schedule handles up to two turns per packet. Its copy stream
+refills an individual slot as soon as the previous FC1 launch using it retires,
+overlapping subsequent FC2 and FC1 work. Short tails run on the compute stream.
+
+In ring mode the caller's `fc1_a` and `fc1_sfa` record the exact packed
+activation and scales once per global source token. Query their shapes from
+`prepare_training()`. Row `route_slots[r] // top_k` is the input to logical
+route `r` when the slot is valid. Quantization uses the destination's original
+input multiplier after the existing BF16 all-gather. Repeated routes share these
+bytes. FC1 preactivations, FC2 inputs, return values and WGrad operands keep
+their logical expert ordering. Backward reconstructs only its current window.
+A record remains usable for deferred backward after subsequent forward calls.
+
+Each physical FC1 slot uses `256 × (H/2 + H/16)` bytes in addition to the
+source-token record. The existing GEMM transforms a slot's scale bytes into
+its native scale layout before issuing MMA. Stream events hand completed
+payload and scales to compute. Retirement is published after the complete
+FC1 kernel, including all output-feature tiles. The compute stream waits for
+each slot it consumes, joining all reader work by the packet boundary. Order
+calls and graph replays that share a prepared instance on the same stream or
+use an independent instance for each concurrent stream. The window loop
+requires only device-local synchronization. At EP8, H=7168 and 4,096 tokens/rank, the
+source-token record is 126 MiB. Sixteen 256-row slots add 15.75 MiB of input
+staging. The forward plan also uses bounded output staging for the logical
+FC1/FC2 records. Use `benchmark/bench_nvfp4_moe_ep.py --forward-only --graph`
+with `--fc1-ring-slots` and optionally `--serial-ring` for complete forward
+latency and measured memory, including the remaining training allocations.
+
 EP8 uses a prepared peer-mapped PyTorch symmetric heap for backward transport.
 `overlap=False` runs the same tile arithmetic on one stream. All ranks must
 execute the same collective sequence and keep plans, graph-captured tensors,

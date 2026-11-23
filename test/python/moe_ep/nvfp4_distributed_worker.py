@@ -3,6 +3,7 @@
 
 """Eight-rank NVLink equivalence and mutable-routing CUDA Graph regression."""
 
+import argparse
 import os
 from datetime import timedelta
 import torch
@@ -23,6 +24,9 @@ from test_nvfp4_training import (
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fc1-ring-slots", type=int, default=0)
+    args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -30,7 +34,7 @@ def main():
     t, h, i, k = 33, 128, 128, 2
     local_experts = 2
     experts = 8 * local_experts
-    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0)
+    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0, fc1_ring_slots=args.fc1_ring_slots)
     op = MoeEp(
         MoeEpConfig(
             model=MoeEpModelConfig(num_experts=experts, hidden_size=h, intermediate_size=i, top_k=k),

@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 import statistics
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import torch
 import torch.distributed as dist
@@ -39,7 +39,7 @@ def measure(args, t, rank, device):
 
     e, h, i, k = args.experts, args.hidden, args.intermediate, args.top_k
     local = e // dist.get_world_size()
-    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=7.0)
+    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=7.0, fc1_ring_slots=args.fc1_ring_slots, fc1_ring_overlap=not args.serial_ring)
     config = MoeEpConfig(
         model=MoeEpModelConfig(num_experts=e, hidden_size=h, intermediate_size=i, top_k=k),
         parallel=MoeEpParallelConfig(ep_group=dist.group.WORLD, max_tokens_per_rank=t),
@@ -51,11 +51,10 @@ def measure(args, t, rank, device):
     requirements = op.prepare_training(device=device)
     prepared = torch.cuda.memory_allocated() - before
 
-    def bundle(cls):
-        return cls(**{f.name: torch.empty(requirements[f.name][0], dtype=requirements[f.name][2], device=device) for f in fields(cls)})
+    def bundle(cls, spec=requirements):
+        return cls(**{f.name: torch.empty(spec[f.name][0], dtype=spec[f.name][2], device=device) for f in fields(cls)})
 
     rec = bundle(MoeEpTrainingForwardOutputs)
-    out = bundle(MoeEpTrainingBackwardOutputs)
 
     # Constant master weights have exact independent packs in both directions. E2M1 code 7
     # represents 6, and SF=2^-8 gives master value 6/256 in each position.
@@ -68,6 +67,78 @@ def measure(args, t, rank, device):
     fw = MoeEpNvfp4ForwardWeights(matrix(2 * i, h), matrix(h, i), one[0], one, one, one)
     bw = MoeEpNvfp4BackwardWeights(matrix(h, 2 * i), matrix(i, h), 1.0, 1.0)
     x, dy, ids, p = workload(t, h, e, k, rank, device)
+    if args.forward_only:
+
+        def forward():
+            return op.training_forward(x, ids, p, weights=fw, out=rec)
+
+        forward()
+        graph = None
+        if args.graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                forward()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        samples = []
+        for iteration in range(args.repeats):
+            dist.barrier()
+            profile = args.profile and rank == 0 and iteration == 0
+            if profile:
+                torch.cuda.cudart().cudaProfilerStart()
+            torch.cuda.reset_peak_memory_stats()
+            start.record()
+            if graph is None:
+                forward()
+            else:
+                graph.replay()
+            end.record()
+            end.synchronize()
+            if profile:
+                torch.cuda.cudart().cudaProfilerStop()
+            metrics = torch.tensor([start.elapsed_time(end), torch.cuda.max_memory_allocated()], device=device, dtype=torch.float64)
+            dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
+            samples.append(metrics.tolist())
+        ring = op._training_state.fc1_ring
+        saved_x = rec.fc1_a.nbytes + rec.fc1_sfa.nbytes
+        if args.verify and ring is not None:
+            oracle = MoeEp(replace(config, data_path=replace(path, fc1_ring_slots=0)))
+            ref = bundle(MoeEpTrainingForwardOutputs, oracle.prepare_training(device=device))
+            oracle.training_forward(x, ids, p, weights=fw, out=ref)
+            assert torch.equal(ref.route_slots, rec.route_slots)
+            valid_rows = torch.where(ref.route_slots >= 0)[0]
+            src = ref.route_slots[valid_rows] // k
+            for name in ("fc1_a", "fc1_sfa", "fc1_preact", "saved_a", "saved_sfa"):
+                index = src if name in ("fc1_a", "fc1_sfa") else valid_rows
+                expected = getattr(ref, name).view(torch.uint8).index_select(0, valid_rows)
+                actual = getattr(rec, name).view(torch.uint8).index_select(0, index)
+                assert torch.equal(actual, expected), (rank, t, name)
+            assert torch.equal(rec.output, ref.output), (rank, t, "output")
+            oracle.close()
+        if rank == 0:
+            print(
+                json.dumps(
+                    dict(
+                        tokens_per_rank=t,
+                        slots=args.fc1_ring_slots,
+                        overlap=not args.serial_ring,
+                        forward_ms=statistics.median(v[0] for v in samples),
+                        peak_torch_bytes=int(max(v[1] for v in samples)),
+                        prepared_bytes=prepared,
+                        fc1_pool_bytes=saved_x if ring is None else ring.payload.nbytes + ring.sf.nbytes,
+                        saved_input_bytes=saved_x,
+                        saved_record_bytes=sum(getattr(rec, f.name).nbytes for f in fields(rec) if f.name != "output"),
+                        full_pool_verified=bool(args.verify and ring is not None),
+                        live_blocks_rank0=int(rec.expert_offsets[-1]) // 256,
+                        full_capacity_rows=rec.route_slots.numel(),
+                    )
+                ),
+                flush=True,
+            )
+        del graph
+        op.close()
+        return
+
+    out = bundle(MoeEpTrainingBackwardOutputs)
     w1, w2 = [torch.empty(shape, dtype=torch.float32, device=device) for shape in ((local, 2 * i, h), (local, h, i))]
     op.training_forward(x, ids, p, weights=fw, out=rec)
     bundle_bytes = sum(getattr(out, f.name).nbytes for f in fields(out))
@@ -172,6 +243,9 @@ def measure(args, t, rank, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", nargs="+", type=int, default=[512, 2048, 4096])
+    parser.add_argument("--fc1-ring-slots", type=int, default=0)
+    parser.add_argument("--serial-ring", action="store_true")
+    parser.add_argument("--forward-only", action="store_true")
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=2048)
     parser.add_argument("--experts", type=int, default=256)
