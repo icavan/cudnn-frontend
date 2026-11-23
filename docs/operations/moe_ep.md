@@ -774,6 +774,55 @@ FC1/FC2 records. Use `benchmark/bench_nvfp4_moe_ep.py --forward-only --graph`
 with `--fc1-ring-slots` and optionally `--serial-ring` for complete forward
 latency and measured memory, including the remaining training allocations.
 
+#### B300 forward measurements
+
+Eight B300s in one NVLink domain ran H=7168, I=2048, 256 experts and top-k 8
+with the synthetic weights and route generator in the benchmark. Each entry
+is the median of seven unprofiled complete training-forward CUDA Graph replays,
+taking the slowest rank on each replay. The serial and rolling columns use the
+same source-token record, live-tile selection and numerical kernels.
+
+| Tokens/rank | Full pool (ms) | 16 slots, serial (ms) | 4 slots, rolling (ms) | 16 slots, rolling (ms) | Forward peak, full → 16 rolling (GiB) |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 7.01 | — | — | 3.74 | 2.72 → 2.71 |
+| 512 | 31.30 | 5.42 | 5.43 | 5.32 | 3.74 → 3.62 |
+| 2048 | 105.88 | 15.21 | 15.08 | 15.10 | 6.87 → 6.43 |
+| 4096 | 206.16 | 29.40 | 29.44 | 28.78 | 11.05 → 10.18 |
+
+Peak is the maximum PyTorch-allocated memory on any rank during forward with
+a prepared training plan. At 4096 tokens/rank the full-pool FC1 input record
+uses 1038.52 MiB per rank. Rolling uses 126 MiB for the saved input and
+15.75 MiB for its 16 slots (3.94 MiB for four). Total saved forward state falls
+from 5.43 to 4.54 GiB. Prepared allocations grow from 3.98 to 4.00 GiB,
+including the ring's reusable scratch. At this size the 16-slot path reduces
+full-forward latency by 7.16×, with 2.1% lower latency than serial windows.
+The large improvement is already present with live windows and shared input
+quantization on one stream.
+
+A separate rank-0 Nsight Systems replay at 4096 tokens/rank recorded 144
+gathers and 288 GEMMs. All 64 within-packet refills started after the previous
+FC1 for their slot completed. Twelve gathers overlapped FC1 for a total of
+38.2 µs. This trace recorded zero gather/FC2 overlap. For the 64 refills there
+was a total of 5.88 ms between the previous gather's completion and the old
+slot's FC1 completion during which refill was impossible. This producer-side
+estimate is specific to the instrumented trace and can include time on the
+compute stream's critical path. To inspect another single-replay rank-0
+capture, export it with `nsys export -t sqlite` and run:
+
+```bash
+python benchmark/analyze_nvfp4_fc1_ring_trace.py trace.sqlite --slots 16 --capacity-blocks 1055 --live-blocks 144
+```
+
+The source-token record also changes the FC1 input gather for backward. A
+separate seven-replay measurement timed complete backward including both
+weight gradients with the overlapped backward schedule. In token-count order
+512, 2048 and 4096, the full-pool times were 6.57, 16.40 and 29.06 ms.
+The 16-slot record took 6.59, 16.63 and 29.56 ms. All four gradients matched
+between the serial and overlapped rolling-record backward schedules at all
+three sizes. The measured replay allocation count was zero.
+
+#### Backward storage and measurements
+
 EP8 uses a prepared peer-mapped PyTorch symmetric heap for backward transport.
 `overlap=False` runs the same tile arithmetic on one stream. All ranks must
 execute the same collective sequence and keep plans, graph-captured tensors,
