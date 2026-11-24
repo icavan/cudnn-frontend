@@ -104,6 +104,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
+        self.fc1_ring_slots = impl_desc.get("fc1_ring_slots", 0)
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.fallback_cluster_shape_mn = impl_desc.get("fallback_cluster_shape_mn")
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -1328,10 +1329,12 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 iket.range_push("tma_token_fc1")
                 iket.range_push("tma_token_fc1_wait")
                 kernel_extension.wait_for_input(work_tile)
+                if cutlass.const_expr(self.fc1_ring_slots > 0):
+                    cute.arch.fence_proxy("async.global")
                 iket.range_pop()
                 k_tile_count = self.fc1_k_tile_count
-                real_b, b_descriptor_ptr = kernel_extension.get_gmem_tensor("b", fc1_tma_b_tensor, work_tile)
-                real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor("sfb", fc1_tma_sfb_tensor, work_tile)
+                real_b, b_descriptor_ptr = kernel_extension.get_gmem_tensor("b", fc1_tma_b_tensor, work_tile, self.fc1_ring_slots > 0)
+                real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor("sfb", fc1_tma_sfb_tensor, work_tile, self.fc1_ring_slots > 0)
 
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
@@ -1364,8 +1367,11 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 partitioned_smem_sfb = cute.filter_zeros(partitioned_smem_sfb)
                 partitioned_global_sfb = cute.filter_zeros(partitioned_global_sfb)
 
-                global_b_slice = partitioned_global_b[(None, work_tile.tile_n_idx, None, 0)]
-                sfb_tile_n_index = work_tile.tile_n_idx
+                input_tile = work_tile.tile_n_idx
+                if cutlass.const_expr(self.fc1_ring_slots > 0):
+                    input_tile = (work_tile.cumulative_token_block_count + input_tile) % Int32(self.fc1_ring_slots)
+                global_b_slice = partitioned_global_b[(None, input_tile, None, 0)]
+                sfb_tile_n_index = input_tile
                 if cutlass.const_expr(self.cta_tile_n == 64):
                     sfb_tile_n_index = work_tile.tile_n_idx // Int32(2)
                 global_sfb_slice = partitioned_global_sfb[(None, sfb_tile_n_index, None, 0)]

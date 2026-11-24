@@ -178,6 +178,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.swiglu_beta = problem_desc.get("swiglu_beta")
         self.world_size = problem_desc["world_size"]
         self.save_training = impl_desc.get("save_training", False)
+        self.fc1_ring_slots = impl_desc.get("fc1_ring_slots", 0)
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
@@ -316,6 +317,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "preferred_cluster_count": self.preferred_cluster_count,
                 "fallback_cluster_count": self.fallback_cluster_count,
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
+                "ring_fc1_readers": ceil_div(self.intermediate_gateup_size, self.mma_tiler_mnk[0] // mma_cta_count),
+                "ring_fc1_done_region": self.fc1_done_counter_region,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
                 "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
                 "token_back_schedule_mode": ("atomic_counter" if self.work_id_mode == "atomic_counter" else "static"),
@@ -327,6 +330,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if self.internode:
             raise ValueError("the FE training port supports a single NVLink domain")
         self.token_comm = TokenCommNonDeterministic(problem_desc, token_comm_impl_desc)
+        if self.fc1_ring_slots and (
+            self.fc1_ring_slots < 2 or self.mma_tiler_mnk[1] not in (128, 256)
+            or self.schedule_mode != "grouped" or self.work_id_mode != "grid_stride"
+            or self.cluster_shape_mn != (2, 1) or not self.use_2cta_instrs or self.fuse_shared
+            or self.epi_flag_batches[0] != 1 or self.token_comm.cta_specialized
+            or self.token_comm.token_in_stage_split or self.token_comm.dispatch_stage_depth != 1
+            or self.token_comm.token_back_mode != "epi_warps"
+        ):
+            raise ValueError("FC1 ring requires the grouped single-stage NVLink swap-AB training tactic")
         # CTA layout: 12 warps, or 16 when warps 12-15 host standalone token-back or the
         # component's relay group. Both wide layouts use the standalone register budget
         # (4 x 256 + 12 x 64 registers per thread-slot fits the 64K register file).
@@ -755,7 +767,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'_tailpar' if self.token_comm.tail_parity else ''}"
             # Empty for the NVLink-domain component: the internode=False kernel keeps main's name.
             + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
-            + "_dlb_v1" + ("_fe_training" if self.save_training else "")
+            + "_dlb_v1" + ("_fe_training" if self.save_training else "") + (f"_ring{self.fc1_ring_slots}" if self.fc1_ring_slots else "")
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
@@ -1125,7 +1137,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_b = cute.make_tensor(
             activation_pool.iterator,
             cute.make_layout(
-                (token_rows, cutlass.Int32(hidden), singleton),
+                (self.token_comm.fc1_payload_rows, cutlass.Int32(hidden), singleton),
                 stride=(activation_pool.stride[0], activation_pool.stride[1], 0),
             ),
         )
@@ -1138,12 +1150,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
 
         sf_vec_size = self.sf_vec_size
-        padded_token_rows = self.token_comm.worst_case_sf_token_count
         padded_hidden = hidden
         fc1_sfb = cute.make_tensor(
             activation_sf_pool.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
+                (self.token_comm.fc1_scale_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
             ),
         )
         padded_intermediate_gateup = cute.round_up(intermediate_gateup, 128)

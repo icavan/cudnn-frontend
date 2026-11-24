@@ -353,12 +353,13 @@ def test_fc1_ring_wrap_and_replay(slots, overlap, monkeypatch):
     ring.close()
 
 
-def test_megamoe_training_tape_replay_and_deferred_backward(monkeypatch):
+@pytest.mark.parametrize("slots", (0, 2))
+def test_megamoe_training_tape_replay_and_deferred_backward(monkeypatch, slots):
     from cutlass import cute
     from cudnn.moe_ep import MoeEpNvfp4FusedForwardWeights
 
     device = torch.device("cuda", torch.cuda.current_device())
-    t, h, i, e, k = 33, 256, 256, 2, 2
+    t, h, i, e, k = 257 if slots else 33, 256, 256, 2, 2
     path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0)
     config = MoeEpConfig(
         model=MoeEpModelConfig(num_experts=e, top_k=k, hidden_size=h, intermediate_size=i),
@@ -367,7 +368,7 @@ def test_megamoe_training_tape_replay_and_deferred_backward(monkeypatch):
         validation_mode="trusted",
     )
     reference = MoeEp(config)
-    fused = MoeEp(replace(config, data_path=replace(path, nvfp4_fused_forward=True)))
+    fused = MoeEp(replace(config, data_path=replace(path, nvfp4_fused_forward=True, fc1_ring_slots=slots)))
     req_ref = reference.prepare_training(device=device)
     req = fused.prepare_training(device=device)
     logical, bw, w1, w2 = fixture(e, h, i, device)

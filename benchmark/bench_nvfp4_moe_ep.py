@@ -112,6 +112,12 @@ def measure(args, t, rank, device):
         ring = op._training_state.fc1_ring
         fused = op._training_state.fused
         saved_x = rec.fc1_a.nbytes + rec.fc1_sfa.nbytes
+        pool_bytes = saved_x
+        if fused is not None:
+            comm = fused.kernel.token_comm
+            pool_bytes = sum(fused.kernel._device_workspace.nbytes(region) for region in (comm.fc1_activation_region, comm.fc1_activation_sf_region))
+        elif ring is not None:
+            pool_bytes = ring.payload.nbytes + ring.sf.nbytes
         if args.verify and (ring is not None or fused is not None):
             oracle = MoeEp(replace(config, data_path=replace(path, fc1_ring_slots=0, nvfp4_fused_forward=False)))
             ref = bundle(MoeEpTrainingForwardOutputs, oracle.prepare_training(device=device))
@@ -136,7 +142,7 @@ def measure(args, t, rank, device):
                         forward_ms=statistics.median(v[0] for v in samples),
                         peak_torch_bytes=int(max(v[1] for v in samples)),
                         prepared_bytes=prepared,
-                        fc1_pool_bytes=(None if fused is not None else saved_x) if ring is None else ring.payload.nbytes + ring.sf.nbytes,
+                        fc1_pool_bytes=pool_bytes,
                         fused_forward=fused is not None,
                         fused_local_workspace_bytes=fused.local.nbytes if fused else None,
                         fused_symmetric_arena_bytes=fused.arena.nbytes if fused else None,

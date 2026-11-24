@@ -742,8 +742,7 @@ views of the peer exchange heap.
 
 ### Fused Blackwell NVFP4 training forward
 
-Set `nvfp4_fused_forward=True` with `compute_format=MoeFormat.NVFP4` and
-`fc1_ring_slots=0` to use the Blackwell MegaMoE scheduler and native NVLink
+Set `nvfp4_fused_forward=True` with `compute_format=MoeFormat.NVFP4` to use the Blackwell MegaMoE scheduler and native NVLink
 dispatch for the training forward. The implementation is derived from
 [TensorRT-LLM main at 50251c2](https://github.com/NVIDIA/TensorRT-LLM/tree/50251c23a58de21e6a7a853007eb8ffb8255a060).
 Training runs with FE and CuTeDSL. It accepts BF16 activations, BF16 combine,
@@ -799,6 +798,59 @@ Reproduce the FE column with
 Verification compares every live saved row, scale byte and output against the
 FE full-pool reference after timing. The independent EP8 gradient oracle also
 exercises repeated slots, empty experts and changing routes under graph replay.
+
+#### Native FC1 ring
+
+Use `fc1_ring_slots=0` for the original full dispatch pool. With the fused forward,
+`fc1_ring_slots=32` selects 32 reusable input blocks in the persistent kernel.
+The slot spans the tactic's FC1 token tile (128 or 256 rows). Each slot includes
+the TMA payload and its swizzled block scales. Source metadata, readiness and FC1
+completion counters, the FC2 operand and caller-owned training records all use
+the original logical indices. The training record can outlive many ring turns.
+
+Dispatch and FC1 use the same physical index: logical token-block ID modulo the
+slot count. A dispatch warp about to overwrite block `b - slots` acquires that
+block's existing FC1 completion counter. The threshold counts every FC1
+output-feature CTA for the block. A waiting warp first publishes its pending
+ready counts, so that its own earlier token copies can feed the workers it
+awaits. The writer completes the bulk payload store and orders generic scale
+stores before publishing ready. The FC1 TMA warp observes ready before reading
+the physical slot. Invocation drainage and counter reset use the native protocol.
+
+The supported native tactic uses grouped grid-stride scheduling, two-CTA MMA,
+single-stage dispatch and epilogue token return. It requires at least two slots
+and overlapped execution. The original FE window schedule is available with
+`nvfp4_fused_forward=False`.
+
+The following inference-only comparison used the same BF16 inputs, random
+NVFP4 weights, routing, and BF16 combine on 8×B300, H=7168, I=2048, E=256,
+top-k=8. Each column includes BF16 input quantization and route staging.
+Each sample is the slowest rank. The table gives medians of 15 graph replays
+with rotating measurement order. Graphs replayed balanced, concentrated and
+duplicate routes with bitwise output checks before timing balanced routes.
+
+| Tokens/rank | Original TRT (ms) | FE full pool (ms) | 16 slots (ms) | 32 slots (ms) | 64 slots (ms) | Full → 32-slot FC1 payload + scales (MiB/rank) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 0.240 | 0.240 | 0.243 | 0.239 | 0.240 | 134.48 → 15.75 |
+| 2048 | 0.618 | 0.613 | 0.630 | 0.607 | 0.619 | 512.48 → 31.50 |
+| 4096 | 1.104 | 1.105 | 1.184 | 1.110 | 1.105 | 1016.48 → 31.50 |
+
+With training records enabled, the same three sizes took 0.532 / 1.081 /
+1.753 ms with the full pool and 0.532 / 1.088 / 1.769 ms with 32 slots
+(11 graph replays per configuration). On a separate 4096-token rank-0
+trace of the 32-slot training path, the three all-gathers for X payload,
+X scales and route IDs occupied 184, 47 and 26 μs. The interval from the
+start of the stable route sort to the end of the inverse-map scatter was
+193 μs, including 143 μs of GPU kernels. This work prepares the caller's
+deferred-backward record for both pool configurations.
+
+To reproduce, put the pinned TensorRT-LLM checkout's
+`tensorrt_llm/_torch/moe/kernels` on `PYTHONPATH` and run
+`torchrun --standalone --nproc-per-node=8 benchmark/bench_nvfp4_native_fc1_ring.py`.
+For the full FE training forward, add `--fc1-ring-slots 32` to the training
+benchmark above. Its reported FC1 pool bytes cover the two device workspace
+regions. Separate fields report the native local workspace, symmetric arena
+and caller's training record.
 
 ### Bounded FC1 inputs in NVFP4 training
 

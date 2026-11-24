@@ -124,12 +124,14 @@ class BlockScaledSwapAbFc12Extension:
 
     @cute.jit
     def get_gmem_tensor(
-        self, tensor_name: TensorRole, tensor: cute.Tensor, work_tile: SwapAbFc12WorkTileInfo
+        self, tensor_name: TensorRole, tensor: cute.Tensor, work_tile: SwapAbFc12WorkTileInfo, physical_fc1: cutlass.Constexpr = False
     ) -> Tuple[cute.Tensor, Optional[Pointer]]:
         """Resolve one kernel tensor to its current expert/task-tile view."""
         expert_idx = work_tile.expert_idx
         data_token_offset = work_tile.cumulative_data_physical_row
         sf_token_offset = work_tile.cumulative_sf_physical_row
+        if cutlass.const_expr(physical_fc1):
+            data_token_offset = sf_token_offset = Int32(0)
         shape = tensor.shape
         stride = tensor.stride
         singleton = Int32(1)

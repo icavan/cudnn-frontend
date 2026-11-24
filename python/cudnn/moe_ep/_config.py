@@ -112,12 +112,14 @@ class MoeEpDataPathConfig:
             raise ValueError("compute_format must be MoeFormat.MXFP8 or MoeFormat.NVFP4")
         if type(self.nvfp4_fused_forward) is not bool:
             raise ValueError("nvfp4_fused_forward must be a bool")
-        if self.nvfp4_fused_forward and (self.compute_format is not MoeFormat.NVFP4 or self.fc1_ring_slots):
-            raise ValueError("nvfp4_fused_forward requires NVFP4 and its native FC1 workspace (fc1_ring_slots=0)")
+        if self.nvfp4_fused_forward and self.compute_format is not MoeFormat.NVFP4:
+            raise ValueError("nvfp4_fused_forward requires NVFP4")
         if type(self.fc1_ring_slots) is not int or self.fc1_ring_slots < 0:
             raise ValueError("fc1_ring_slots must be a nonnegative integer")
         if type(self.fc1_ring_overlap) is not bool:
             raise TypeError("fc1_ring_overlap must be a bool")
+        if self.nvfp4_fused_forward and self.fc1_ring_slots and not self.fc1_ring_overlap:
+            raise ValueError("the native FC1 ring executes inside the overlapped MegaMoE kernel")
         if self.fc1_ring_slots and self.compute_format is not MoeFormat.NVFP4:
             raise ValueError("fc1_ring_slots requires NVFP4 training")
         for name in ("dy_norm", "dgu_norm", "x_wgrad_norm", "a_wgrad_norm"):

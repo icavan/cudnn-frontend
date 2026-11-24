@@ -182,7 +182,7 @@ class Nvfp4Training:
         # Eager uses the same device-side route count without a D2H read. The
         # two prepared graphs bind caller-owned records through a pointer table.
         self.fc1_ring = None
-        if self.path.fc1_ring_slots:
+        if self.path.fc1_ring_slots and not self.path.nvfp4_fused_forward:
             from ._nvfp4_ring import Fc1Ring
 
             self.fc1_ring = Fc1Ring(self, TILE, min(self.path.fc1_ring_slots, tiles), self.path.fc1_ring_overlap)

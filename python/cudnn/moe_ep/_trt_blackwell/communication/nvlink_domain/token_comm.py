@@ -19,7 +19,7 @@ from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from ...api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc
 from ...helpers.device_workspace import DeviceWorkspace
-from ...helpers.dsl_helpers import mark_alignment, smem_exclusive_prefix
+from ...helpers.dsl_helpers import mark_alignment, smem_exclusive_prefix, spin_peek, spin_wait
 from ...helpers.iket_compat import iket
 from ...helpers.flag_batch import make_flag_batch_tracker
 from ...helpers.software_sync import NvlinkBarrier
@@ -1405,6 +1405,9 @@ class TokenCommNonDeterministic(KernelComponent):
         self.token_padding_block = impl_desc["token_padding_block"]
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.tokens_per_fc1_ready_slot = impl_desc["tokens_per_fc1_ready_slot"]
+        self.fc1_ring_slots = impl_desc.get("fc1_ring_slots", 0)
+        self.ring_fc1_readers = impl_desc.get("ring_fc1_readers", 0)
+        self.ring_fc1_done_region = impl_desc.get("ring_fc1_done_region")
         self.fc2_done_signals_per_token_tile = impl_desc["fc2_done_signals_per_token_tile"]
         self.promised_launchable_sm_count = impl_desc["promised_launchable_sm_count"]
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
@@ -1645,6 +1648,14 @@ class TokenCommNonDeterministic(KernelComponent):
     @property
     def worst_case_sf_token_count(self) -> int:
         return self._router.worst_case_padded_tokens(self.sf_padding_block)
+
+    @property
+    def fc1_payload_rows(self) -> int:
+        return self.fc1_ring_slots * self.tokens_per_fc1_ready_slot if self.fc1_ring_slots else self.worst_case_token_count
+
+    @property
+    def fc1_scale_rows(self) -> int:
+        return self.fc1_ring_slots * self.tokens_per_fc1_ready_slot if self.fc1_ring_slots else self.worst_case_sf_token_count
 
     @property
     def max_fc1_ready_slot_count(self) -> int:
@@ -1974,7 +1985,7 @@ class TokenCommNonDeterministic(KernelComponent):
             buffer_space="local",
             reset="tail_reset",
         )
-        activation_element_count = self.worst_case_token_count * self.hidden_size
+        activation_element_count = self.fc1_payload_rows * self.hidden_size
         workspace.register(
             self.fc1_activation_region,
             self.activation_dtype,
@@ -1983,7 +1994,7 @@ class TokenCommNonDeterministic(KernelComponent):
             byte_alignment=128,
         )
         if self.activation_is_quantized:
-            activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
+            activation_sf_element_count = self.fc1_scale_rows * self.activation_sf_hidden_padded
             workspace.register(
                 self.fc1_activation_sf_region,
                 self.activation_sf_dtype,
@@ -2173,7 +2184,7 @@ class TokenCommNonDeterministic(KernelComponent):
     def fc1_activation_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         return cute.make_tensor(
             device_workspace.ptr(self.fc1_activation_region),
-            cute.make_layout((self.worst_case_token_count, self.hidden_size), stride=(self.hidden_size, 1)),
+            cute.make_layout((self.fc1_payload_rows, self.hidden_size), stride=(self.hidden_size, 1)),
         )
 
     @cute.jit
@@ -2181,7 +2192,7 @@ class TokenCommNonDeterministic(KernelComponent):
         if cutlass.const_expr(not self.activation_is_quantized):
             return None
         layout = tile_atom_to_shape_SF(
-            (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
+            (self.fc1_scale_rows, self.hidden_size, 1), self.activation_sf_vector_size
         )
         return cute.make_tensor(device_workspace.ptr(self.fc1_activation_sf_region), cute.select(layout, mode=[0, 1]))
 
@@ -2709,6 +2720,24 @@ class TokenCommNonDeterministic(KernelComponent):
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
 
+                payload_row = pool_token_idx
+                if cutlass.const_expr(self.fc1_ring_slots > 0):
+                    block_rows = Int32(self.tokens_per_fc1_ready_slot)
+                    payload_row = (ready_slot_idx % Int32(self.fc1_ring_slots)) * block_rows + token_in_expert % block_rows
+                    if ready_slot_idx >= Int32(self.fc1_ring_slots):
+                        done = self._device_workspace.ptr(self.ring_fc1_done_region) + (ready_slot_idx - Int32(self.fc1_ring_slots))
+                        # The counter is indexed by the previous logical block, so no delayed turn can satisfy it.
+                        # Flush this warp's earlier ready messages before waiting for their consumers.
+                        if not cute.arch.vote_all_sync(spin_peek(done, lambda v: v >= Int32(self.ring_fc1_readers))):
+                            flag_tracker.fire()
+                            flag_tracker = make_flag_batch_tracker(
+                                use_async=self.token_in_flag_batch == 1, flag_address=Int64(0), accumulated_flags=Int32(0),
+                                phase=Int32(0), thread_idx=lane_idx,
+                            )
+                            spin_wait(done, lambda v: v >= Int32(self.ring_fc1_readers))
+                        # Order the generation acquire before the async payload overwrite.
+                        fence_proxy_async_global()
+
                 self.wait_for_pool_record(local_expert, token_in_expert)
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes),
@@ -2781,7 +2810,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
                     destination_activation = cute.make_ptr(
                         self.activation_dtype,
-                        fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                        fc1_activation_pointer.toint() + Int64(payload_row) * Int64(self.bytes_per_token),
                         AddressSpace.gmem,
                         assumed_align=16,
                     )
@@ -2792,6 +2821,8 @@ class TokenCommNonDeterministic(KernelComponent):
 
                 if cutlass.const_expr(self.activation_is_quantized):
                     sf_token_idx = expert_sf_begin + token_in_expert
+                    if cutlass.const_expr(self.fc1_ring_slots > 0):
+                        sf_token_idx = payload_row
                     destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
                     destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
                     destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
@@ -2807,7 +2838,11 @@ class TokenCommNonDeterministic(KernelComponent):
                             )
 
                 if cutlass.const_expr(not self.token_in_stage_split):
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    if cutlass.const_expr(self.fc1_ring_slots > 0):
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        fence_proxy_async_global()
+                    else:
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
                     cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)

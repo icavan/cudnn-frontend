@@ -72,6 +72,7 @@ class FusedForward:
         impl = ImplDesc(
             dict(
                 save_training=True,
+                fc1_ring_slots=state.path.fc1_ring_slots,
                 mma_tiler_mnk=(256, 128 if t <= 1024 else 256, 256),
                 cluster_shape_mn=(2, 1),
                 use_2cta_instrs=True,
