@@ -344,6 +344,7 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
     "MoeEpNvfp4ForwardWeights",
+    "MoeEpNvfp4FusedForwardWeights",
     "MoeEpNvfp4BackwardWeights",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
@@ -419,6 +420,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     ),
     "MoeEpTrainingBackwardOutputs": (".moe_ep", "MoeEpTrainingBackwardOutputs"),
     "MoeEpNvfp4ForwardWeights": (".moe_ep", "MoeEpNvfp4ForwardWeights"),
+    "MoeEpNvfp4FusedForwardWeights": (".moe_ep", "MoeEpNvfp4FusedForwardWeights"),
     "MoeEpNvfp4BackwardWeights": (".moe_ep", "MoeEpNvfp4BackwardWeights"),
     "MoeEpTrainingForwardOutputs": (".moe_ep", "MoeEpTrainingForwardOutputs"),
     "MoeEpTrainingWgradOperands": (

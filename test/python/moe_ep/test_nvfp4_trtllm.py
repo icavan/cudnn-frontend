@@ -56,21 +56,26 @@ def test_pinned_bf16_input_quantization():
             assert torch.equal(sf[:active].view(torch.uint8), torch.from_numpy(frozen[f"sf{j}"]).cuda())
 
 
-def test_frozen_blackwell_forward():
+@pytest.mark.parametrize("fused", [False, True], ids=["logical", "fused_checkpoint"])
+def test_frozen_blackwell_forward(fused):
     """Replay the operands and workspace outputs of the pinned TRT-LLM device kernel."""
     device = torch.device("cuda", torch.cuda.current_device())
     with np.load(Path(__file__).with_name("data") / "trtllm_933366a_nvfp4.npz", allow_pickle=False) as frozen:
         tensors = {key: torch.from_numpy(frozen[key]).to(device) for key in frozen.files}
-    fw = MoeEpNvfp4ForwardWeights.from_trtllm(SimpleNamespace(**tensors), tensors["input_norm"], input_channel_scale=None)
+    from cudnn.moe_ep import MoeEpNvfp4FusedForwardWeights
+
+    bank_type = MoeEpNvfp4FusedForwardWeights if fused else MoeEpNvfp4ForwardWeights
+    fw = bank_type.from_trtllm(SimpleNamespace(**tensors), tensors["input_norm"], input_channel_scale=None)
     x = tensors["x"].view(torch.bfloat16)
     ids, p = tensors["ids"], tensors["p"]
     t, h = x.shape
-    e, _, i = fw.fc2.shape
+    e, _, packed_i = tensors["fc2_weight"].shape
+    i = 2 * packed_i
     op = MoeEp(
         MoeEpConfig(
             model=MoeEpModelConfig(num_experts=e, hidden_size=h, intermediate_size=i, top_k=ids.shape[1]),
             parallel=MoeEpParallelConfig(max_tokens_per_rank=t),
-            data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0),
+            data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0, nvfp4_fused_forward=fused),
         )
     )
     rec = buffers(op.prepare_training(device=device), MoeEpTrainingForwardOutputs, device)
@@ -78,8 +83,9 @@ def test_frozen_blackwell_forward():
     assert_combined_output(y, tensors["y"].view(torch.bfloat16))
     for expert in range(e):
         rows = slice(expert * 256, expert * 256 + t)
-        assert torch.equal(rec.fc1_a[rows], tensors["input_payload"])
-        assert torch.equal(rec.fc1_sfa[rows].view(torch.uint8), tensors["input_sf"])
+        source_rows = slice(0, t) if fused else rows
+        assert torch.equal(rec.fc1_a[source_rows], tensors["input_payload"])
+        assert torch.equal(rec.fc1_sfa[source_rows].view(torch.uint8), tensors["input_sf"])
         assert torch.equal(rec.saved_a[rows], tensors["a_payload"][expert].expand(t, -1))
         assert torch.equal(rec.saved_sfa[rows].view(torch.uint8), tensors["a_sf"][expert].expand(t, -1))
     for slot in range(ids.shape[1]):

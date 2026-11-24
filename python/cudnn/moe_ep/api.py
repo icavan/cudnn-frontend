@@ -45,6 +45,7 @@ from ._types import (
     MoeEpNativeWeightStorageMode,
     MoeEpNvfp4BackwardWeights,
     MoeEpNvfp4ForwardWeights,
+    MoeEpNvfp4FusedForwardWeights,
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
@@ -1279,7 +1280,7 @@ class MoeEp:
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         *,
-        weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights | MoeEpNvfp4ForwardWeights,
+        weights: MoeEpNativeForwardWeights | MoeEpNativeDiscreteForwardWeights | MoeEpNvfp4ForwardWeights | MoeEpNvfp4FusedForwardWeights,
         out: MoeEpTrainingForwardOutputs,
     ) -> torch.Tensor:
         """Run forward sequentially on this instance's training CUDA stream."""

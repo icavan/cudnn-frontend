@@ -25,6 +25,7 @@ from test_nvfp4_training import (
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trt-fused-forward", action="store_true")
     parser.add_argument("--fc1-ring-slots", type=int, default=0)
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
@@ -34,7 +35,9 @@ def main():
     t, h, i, k = 33, 128, 128, 2
     local_experts = 2
     experts = 8 * local_experts
-    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0, fc1_ring_slots=args.fc1_ring_slots)
+    path = MoeEpDataPathConfig(
+        compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0, fc1_ring_slots=args.fc1_ring_slots, nvfp4_fused_forward=args.trt_fused_forward
+    )
     op = MoeEp(
         MoeEpConfig(
             model=MoeEpModelConfig(num_experts=experts, hidden_size=h, intermediate_size=i, top_k=k),
@@ -112,6 +115,10 @@ def main():
         for idx, (r, s, ref) in enumerate(zip(recorded, serial, expected[:5])):
             assert torch.equal(r.view(torch.uint8), s.view(torch.uint8)), (rank, hot, idx)
             torch.testing.assert_close(r, ref[src] if idx < 3 else ref[rank * local_experts : (rank + 1) * local_experts], rtol=5e-5, atol=5e-5)
+    if args.trt_fused_forward:
+        for live in (rank, t - rank):
+            observed = op.training_forward(x[:live], ids[src][:live], prob[src][:live], weights=fw, out=rec)
+            torch.testing.assert_close(observed, expected[0][src][:live], rtol=5e-5, atol=5e-5)
     dist.barrier()
     if rank == 0:
         print("EP8 serial/overlap bitwise equal; three changed-route graph replays match independent FP4 oracle", flush=True)

@@ -740,6 +740,66 @@ The NVFP4 mapping from `training_symmetric_buffers()` exposes optional local
 `output` and `grad_activation` buffers, plus `backward_input` and `dprob`
 views of the peer exchange heap.
 
+### Fused Blackwell NVFP4 training forward
+
+Set `nvfp4_fused_forward=True` with `compute_format=MoeFormat.NVFP4` and
+`fc1_ring_slots=0` to use the Blackwell MegaMoE scheduler and native NVLink
+dispatch for the training forward. The implementation is derived from
+[TensorRT-LLM main at 50251c2](https://github.com/NVIDIA/TensorRT-LLM/tree/50251c23a58de21e6a7a853007eb8ffb8255a060).
+Training runs with FE and CuTeDSL. It accepts BF16 activations, BF16 combine,
+pre-FC2 top-k weighting, H and I divisible by 128 and top-k up to 16.
+Use one checkpoint input multiplier across the EP group. The native dispatch
+allocates its own prepared workspace. Query training-record shapes after
+selecting the path.
+
+For checkpoint-native banks, use the original interleaved weight and scale
+storage directly. For logical FE weights, convert once per weight update.
+
+```python
+from cudnn.moe_ep import MoeEpNvfp4FusedForwardWeights
+
+weights = MoeEpNvfp4FusedForwardWeights.from_trtllm(
+    trt_view, fc31_input_scale, input_channel_scale=fc31_act_scale,
+)
+# For an existing logical FE bank:
+# weights = MoeEpNvfp4FusedForwardWeights.from_logical(logical_weights)
+y = op.training_forward(x, ids, probabilities, weights=weights, out=record)
+```
+
+Keep the banks and record alive at their captured addresses during graph replay.
+Passing logical weights directly to the fused forward also works and pays for
+conversion on each call. Each simultaneously live microbatch owns its record.
+
+FC1 saves the alpha-scaled gate/up accumulators before clamp from the epilogue
+registers. The same epilogue stores the post-weight, post-SwiGLU NVFP4 activation
+and E4M3 block scales used by FC2. The source rank, token and top-k slot in the
+native dispatch metadata identify the canonical expert row in the caller's
+record. This keeps token-axis wgrad packing reproducible while allowing native
+dispatch and work scheduling to select their own physical row order. The FE
+wrapper also gathers one copy of each source token's input and scales and
+builds the inverse route mapping. The ordinary training backward and
+`training_wgrad` consume this record.
+
+On one 8×B300 NVLink domain, H=7168, I=2048, E=256 and top-k=8, the three
+sizes below selected metadata push. Times are in milliseconds, taking the
+maximum rank per CUDA Graph replay and then the median of seven replays.
+All columns start with routing decisions available and prepared weights.
+The BF16-entry measurements include input quantization. The TRT measurement
+uses the native kernels with an external FE-compatible quantizer and route
+staging. The full FE measurement also produces a reusable training record.
+
+| Tokens/rank | Native TRT, packed input | Native TRT, BF16 entry | FE fused training, BF16 entry | Prior FE ring training, BF16 entry |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 0.227 | 0.242 | 0.532 | 5.354 |
+| 2048 | 0.575 | 0.611 | 1.082 | 14.980 |
+| 4096 | 1.038 | 1.105 | 1.757 | 28.940 |
+
+Reproduce the FE column with
+`torchrun --standalone --nproc-per-node=8 benchmark/bench_nvfp4_moe_ep.py --trt-fused-forward --prepack-weights --graph --forward-only --verify --repeats 7`.
+Verification compares every live saved row, scale byte and output against the
+FE full-pool reference after timing. The independent EP8 gradient oracle also
+exercises repeated slots, empty experts and changing routes under graph replay.
+
 ### Bounded FC1 inputs in NVFP4 training
 
 Set `fc1_ring_slots=S` in `MoeEpDataPathConfig` to enable the bounded FC1 dispatch path.

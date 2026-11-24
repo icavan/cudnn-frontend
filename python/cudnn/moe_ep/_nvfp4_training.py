@@ -17,6 +17,7 @@ from ._nvfp4 import TileGemm
 from ._types import (
     MoeEpNvfp4BackwardWeights,
     MoeEpNvfp4ForwardWeights,
+    MoeEpNvfp4FusedForwardWeights,
     MoeEpNativeWeightStorageMode,
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
@@ -84,7 +85,7 @@ class Nvfp4Training:
             stride = torch.empty(shape, device="meta").stride()
             self.requirements[name] = (shape, stride, dtype, 16)
 
-        source_rows = t * self.topology.ep_size if self.path.fc1_ring_slots else p
+        source_rows = t * self.topology.ep_size if self.path.fc1_ring_slots or self.path.nvfp4_fused_forward else p
         spec("fc1_a", (source_rows, h // 2), u8)
         spec("fc1_sfa", (source_rows, h // 16), sf)
         spec("saved_a", (p, i // 2), u8)
@@ -169,7 +170,7 @@ class Nvfp4Training:
             self.window_outputs[name] = torch.empty((self.window, *shape[1:]), device=device, dtype=dtype)
 
         read_fields = dict(self.window_inputs)
-        if self.path.fc1_ring_slots:
+        if self.path.fc1_ring_slots or self.path.nvfp4_fused_forward:
             for name in ("fc1_a", "fc1_sfa"):
                 del read_fields[name]
         self.read_window = WindowBindings(read_fields, self.window, device, write=False)
@@ -185,6 +186,15 @@ class Nvfp4Training:
             from ._nvfp4_ring import Fc1Ring
 
             self.fc1_ring = Fc1Ring(self, TILE, min(self.path.fc1_ring_slots, tiles), self.path.fc1_ring_overlap)
+        self.fused = None
+        self.source_rows = self.fc1_ring.source if self.fc1_ring is not None else None
+        if self.path.nvfp4_fused_forward:
+            from ._nvfp4_fused import FusedForward
+            from ._nvfp4_ring import SourceRows
+
+            self.invalid_window = torch.empty((self.window * TILE, 1), dtype=torch.bool, device=device)
+            self.fused = FusedForward(self)
+            self.source_rows = SourceRows(TILE, h, k, device)
         eager_banks = tuple(self.gemms[TILE, n, kk].fallback_weights.view(torch.float4_e2m1fn_x2).permute(1, 2, 0) for n, kk in ((h, 2 * i), (i, h)))
         self.eager_graphs = {}
         for overlap in (False, True):
@@ -196,7 +206,7 @@ class Nvfp4Training:
     def close(self):
         with torch.cuda.device(self.device):
             self.eager_graphs.clear()
-            self.fc1_ring = None
+            self.fc1_ring = self.fused = self.source_rows = None
             self.conditions.close()
 
     def _live_windows(self, banks, overlap):
@@ -209,10 +219,16 @@ class Nvfp4Training:
             torch.ge(self.remaining_tiles, n, out=self.more_tiles)
             with self.conditions.while_true(self.more_tiles) as update_condition:
                 self.read_window.copy(self.run_base, n)
-                if self.fc1_ring is not None:
+                if self.fused is not None:
+                    invalid = self.invalid_window[: n * TILE]
+                    torch.lt(record.route_slots[: n * TILE, None], 0, out=invalid)
+                    record.fc1_preact[: n * TILE].masked_fill_(invalid, 0)
+                    record.saved_a[: n * TILE].masked_fill_(invalid, 0)
+                    record.saved_sfa[: n * TILE].view(torch.uint8).masked_fill_(invalid, 0)
+                if self.source_rows is not None:
                     for tile in range(n):
                         rows = slice(tile * TILE, (tile + 1) * TILE)
-                        self.fc1_ring.source.load(record.route_slots[rows], record.fc1_a[rows], record.fc1_sfa[rows])
+                        self.source_rows.load(record.route_slots[rows], record.fc1_a[rows], record.fc1_sfa[rows])
                 torch.add(self.window_ids[:n], self.run_base, out=self.window_index[:n])
                 torch.index_select(self.tile_experts, 0, self.window_index[:n], out=self.window_experts[:n])
                 self._tile_run(record, out, self.dgrad_divisors, banks, overlap, n, self.window_experts)
@@ -247,6 +263,10 @@ class Nvfp4Training:
 
     def check_weight(self, weights, backward):
         e, h, i = self.topology.experts_per_rank, self.h, self.i
+        if not backward and isinstance(weights, MoeEpNvfp4FusedForwardWeights):
+            if self.fused is None or weights.fc1_weight.shape != (e, 2 * i, h // 2) or weights.fc1_weight.device != self.device:
+                raise ValueError("TRT-native weights require a matching fused forward plan")
+            return {n: getattr(weights, n) for n in ("fc1_weight", "fc1_weight_sf", "fc2_weight", "fc2_weight_sf")}
         cls = MoeEpNvfp4BackwardWeights if backward else MoeEpNvfp4ForwardWeights
         if not isinstance(weights, cls):
             raise TypeError(f"expected {cls.__name__}")
@@ -309,6 +329,8 @@ class Nvfp4Training:
         writable = self.validate_bundle(out, MoeEpTrainingForwardOutputs)
         weight_tensors = self.check_weight(weights, False)
         validate_training_non_aliasing(dict(writable, x=x, ids=ids, prob=prob, **weight_tensors))
+        if self.fused is not None:
+            return self.fused.forward(self, x, ids, prob, weights, out)
         ids = self.gather(ids, self.resolved.public_config.model.num_experts)
         x, prob = self.gather(x), self.gather(prob).flatten()
         slots, counts, ends = route_table(ids, self.topology.ep_rank * self.topology.experts_per_rank, self.topology.experts_per_rank, self.rows)
@@ -359,8 +381,8 @@ class Nvfp4Training:
         torch.searchsorted(record.expert_offsets, self.tile_starts, right=True, out=self.tile_experts)
         torch.div(record.expert_offsets[-1], TILE, rounding_mode="floor", out=self.live_tiles)
         self.read_window.bind(record)
-        if self.fc1_ring is not None:
-            self.fc1_ring.source.bind(record)
+        if self.source_rows is not None:
+            self.source_rows.bind(record)
         self.write_window.bind(out)
         self.record_norms.copy_(record.activation_norms)
         self.dgrad_divisors[0].fill_(self.path.dgu_norm * weights.w1_norm)

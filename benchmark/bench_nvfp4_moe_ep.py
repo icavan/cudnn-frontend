@@ -39,7 +39,13 @@ def measure(args, t, rank, device):
 
     e, h, i, k = args.experts, args.hidden, args.intermediate, args.top_k
     local = e // dist.get_world_size()
-    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=7.0, fc1_ring_slots=args.fc1_ring_slots, fc1_ring_overlap=not args.serial_ring)
+    path = MoeEpDataPathConfig(
+        compute_format=MoeFormat.NVFP4,
+        gate_up_clamp=7.0,
+        fc1_ring_slots=args.fc1_ring_slots,
+        fc1_ring_overlap=not args.serial_ring,
+        nvfp4_fused_forward=args.trt_fused_forward,
+    )
     config = MoeEpConfig(
         model=MoeEpModelConfig(num_experts=e, hidden_size=h, intermediate_size=i, top_k=k),
         parallel=MoeEpParallelConfig(ep_group=dist.group.WORLD, max_tokens_per_rank=t),
@@ -65,6 +71,11 @@ def measure(args, t, rank, device):
 
     one = torch.ones(local, dtype=torch.float32, device=device)
     fw = MoeEpNvfp4ForwardWeights(matrix(2 * i, h), matrix(h, i), one[0], one, one, one)
+    logical_fw = fw
+    if args.prepack_weights:
+        from cudnn.moe_ep import MoeEpNvfp4FusedForwardWeights
+
+        fw = MoeEpNvfp4FusedForwardWeights.from_logical(fw)
     bw = MoeEpNvfp4BackwardWeights(matrix(h, 2 * i), matrix(i, h), 1.0, 1.0)
     x, dy, ids, p = workload(t, h, e, k, rank, device)
     if args.forward_only:
@@ -99,11 +110,12 @@ def measure(args, t, rank, device):
             dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
             samples.append(metrics.tolist())
         ring = op._training_state.fc1_ring
+        fused = op._training_state.fused
         saved_x = rec.fc1_a.nbytes + rec.fc1_sfa.nbytes
-        if args.verify and ring is not None:
-            oracle = MoeEp(replace(config, data_path=replace(path, fc1_ring_slots=0)))
+        if args.verify and (ring is not None or fused is not None):
+            oracle = MoeEp(replace(config, data_path=replace(path, fc1_ring_slots=0, nvfp4_fused_forward=False)))
             ref = bundle(MoeEpTrainingForwardOutputs, oracle.prepare_training(device=device))
-            oracle.training_forward(x, ids, p, weights=fw, out=ref)
+            oracle.training_forward(x, ids, p, weights=logical_fw, out=ref)
             assert torch.equal(ref.route_slots, rec.route_slots)
             valid_rows = torch.where(ref.route_slots >= 0)[0]
             src = ref.route_slots[valid_rows] // k
@@ -124,10 +136,13 @@ def measure(args, t, rank, device):
                         forward_ms=statistics.median(v[0] for v in samples),
                         peak_torch_bytes=int(max(v[1] for v in samples)),
                         prepared_bytes=prepared,
-                        fc1_pool_bytes=saved_x if ring is None else ring.payload.nbytes + ring.sf.nbytes,
+                        fc1_pool_bytes=(None if fused is not None else saved_x) if ring is None else ring.payload.nbytes + ring.sf.nbytes,
+                        fused_forward=fused is not None,
+                        fused_local_workspace_bytes=fused.local.nbytes if fused else None,
+                        fused_symmetric_arena_bytes=fused.arena.nbytes if fused else None,
                         saved_input_bytes=saved_x,
                         saved_record_bytes=sum(getattr(rec, f.name).nbytes for f in fields(rec) if f.name != "output"),
-                        full_pool_verified=bool(args.verify and ring is not None),
+                        full_pool_verified=bool(args.verify and (ring is not None or fused is not None)),
                         live_blocks_rank0=int(rec.expert_offsets[-1]) // 256,
                         full_capacity_rows=rec.route_slots.numel(),
                     )
@@ -245,6 +260,8 @@ def main():
     parser.add_argument("--tokens", nargs="+", type=int, default=[512, 2048, 4096])
     parser.add_argument("--fc1-ring-slots", type=int, default=0)
     parser.add_argument("--serial-ring", action="store_true")
+    parser.add_argument("--prepack-weights", action="store_true")
+    parser.add_argument("--trt-fused-forward", action="store_true")
     parser.add_argument("--forward-only", action="store_true")
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=2048)
@@ -255,6 +272,8 @@ def main():
     parser.add_argument("--graph", action="store_true", help="Measure CUDA Graph replay")
     parser.add_argument("--profile", action="store_true", help="Mark rank 0's first overlapped iteration with cudaProfilerStart/Stop")
     args = parser.parse_args()
+    if args.prepack_weights and not args.trt_fused_forward:
+        parser.error("--prepack-weights requires --trt-fused-forward")
     rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)

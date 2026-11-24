@@ -351,3 +351,60 @@ def test_fc1_ring_wrap_and_replay(slots, overlap, monkeypatch):
     del graph
     full.close()
     ring.close()
+
+
+def test_megamoe_training_tape_replay_and_deferred_backward(monkeypatch):
+    from cutlass import cute
+    from cudnn.moe_ep import MoeEpNvfp4FusedForwardWeights
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    t, h, i, e, k = 33, 256, 256, 2, 2
+    path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, gate_up_clamp=2.0)
+    config = MoeEpConfig(
+        model=MoeEpModelConfig(num_experts=e, top_k=k, hidden_size=h, intermediate_size=i),
+        parallel=MoeEpParallelConfig(max_tokens_per_rank=t),
+        data_path=path,
+        validation_mode="trusted",
+    )
+    reference = MoeEp(config)
+    fused = MoeEp(replace(config, data_path=replace(path, nvfp4_fused_forward=True)))
+    req_ref = reference.prepare_training(device=device)
+    req = fused.prepare_training(device=device)
+    logical, bw, w1, w2 = fixture(e, h, i, device)
+    weights = MoeEpNvfp4FusedForwardWeights.from_logical(logical)
+    x, dy = [torch.randn(t, h, device=device, dtype=torch.bfloat16) for _ in range(2)]
+    ids = torch.zeros(t, k, device=device, dtype=torch.int32)
+    prob = torch.rand(t, k, device=device)
+    prob[0].zero_()
+    rec, other = [buffers(req, MoeEpTrainingForwardOutputs, device) for _ in range(2)]
+    ref = buffers(req_ref, MoeEpTrainingForwardOutputs, device)
+    monkeypatch.setattr(cute, "compile", lambda *a, **kw: pytest.fail("recompiled prepared fused forward"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused.training_forward(x, ids, prob, weights=weights, out=rec)
+    for mode in (0, 1, 2):
+        ids[:, 0].fill_(mode % 2)
+        ids[:, 1].copy_((torch.arange(t, device=device) + mode) % e)
+        x.neg_()
+        rec.fc1_preact.fill_(float("nan"))
+        rec.saved_sfa.view(torch.uint8).fill_(127)
+        graph.replay()
+        reference.training_forward(x, ids, prob, weights=logical, out=ref)
+        mask = ref.route_slots >= 0
+        assert torch.equal(ref.route_slots, rec.route_slots)
+        for name in ("fc1_preact", "saved_a", "saved_sfa"):
+            a, b = (getattr(r, name).view(torch.uint8) for r in (rec, ref))
+            assert torch.equal(a[mask], b[mask]), name
+        torch.testing.assert_close(rec.output, ref.output, rtol=0.01, atol=0.005)
+    fused.training_forward(-x, 1 - ids, prob, weights=weights, out=other)
+    grads = []
+    for op, rec_i, spec in ((reference, ref, req_ref), (fused, rec, req)):
+        out = buffers(spec, MoeEpTrainingBackwardOutputs, device)
+        dw1, dw2 = torch.empty_like(w1), torch.empty_like(w2)
+        dx, dp, operand = op.training_backward(dy, ids, prob, weights=bw, forward_record=rec_i, out=out)
+        op.training_wgrad(operand, dw1=dw1, dw2=dw2)
+        grads.append((dx, dp, dw1, dw2))
+    assert all(torch.equal(a, b) for a, b in zip(*grads))
+    del graph
+    fused.close()
+    reference.close()

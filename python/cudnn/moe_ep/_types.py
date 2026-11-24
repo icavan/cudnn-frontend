@@ -398,6 +398,62 @@ class MoeEpNvfp4ForwardWeights:
 
 
 @dataclass(frozen=True)
+class MoeEpNvfp4FusedForwardWeights:
+    """TRT-native gate/up interleave and SM100 scale atoms, ready for TMA."""
+
+    fc1_weight: torch.Tensor
+    fc1_weight_sf: torch.Tensor
+    fc2_weight: torch.Tensor
+    fc2_weight_sf: torch.Tensor
+    input_norm: torch.Tensor
+    fc1_norm_const: torch.Tensor
+    fc31_alpha: torch.Tensor
+    fc2_alpha: torch.Tensor
+
+    def __post_init__(self):
+        e, n, b = self.fc1_weight.shape
+        h, i = 2 * b, n // 2
+        if min(e, h, i) < 1 or n != 2 * i:
+            raise ValueError("expected nonempty native FC1 weights with 2I rows")
+        for payload, sf, rows, width in ((self.fc1_weight, self.fc1_weight_sf, 2 * i, h), (self.fc2_weight, self.fc2_weight_sf, h, i)):
+            if (
+                h % 128
+                or i % 128
+                or payload.shape != (e, rows, width // 2)
+                or sf.shape != (e, rows * width // 16)
+                or payload.dtype not in (torch.uint8, torch.float4_e2m1fn_x2)
+                or sf.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            ):
+                raise ValueError("invalid TRT-native NVFP4 matrix or scale geometry")
+            for t in (payload, sf):
+                if not t.is_contiguous() or t.device != self.fc1_weight.device or t.data_ptr() % 16:
+                    raise ValueError("TRT-native weight and scale banks must be contiguous, colocated and 16-byte aligned")
+        for name in ("input_norm", "fc1_norm_const", "fc31_alpha", "fc2_alpha"):
+            v = getattr(self, name)
+            if v.device != self.fc1_weight.device or v.dtype != torch.float32 or (v.numel() != 1 if name == "input_norm" else v.shape != (e,)):
+                raise ValueError(f"invalid checkpoint scale {name}")
+            if not bool((torch.isfinite(v) & (v > 0)).all()):
+                raise ValueError(f"{name} must contain finite positive checkpoint scales")
+
+    @classmethod
+    def from_trtllm(cls, view, input_norm, *, input_channel_scale):
+        if input_channel_scale is not None or getattr(view, "fc31_act_scale", None) is not None:
+            raise ValueError("NVFP4 training does not implement the input channel scale gradient")
+        return cls(view.fc1_weight, view.fc1_weight_sf, view.fc2_weight, view.fc2_weight_sf, input_norm, view.fc1_norm_const, view.fc31_alpha, view.fc2_alpha)
+
+    @classmethod
+    def from_logical(cls, weights):
+        """Materialize once per version of the logical weights, before graph capture."""
+        from ._nvfp4_fused import make_native_banks, pack_weights
+
+        e, n, b = weights.fc1.data.shape
+        banks = make_native_banks(e, 2 * b, n // 2, weights.fc1.device)
+        pack_weights(weights, banks)
+        (w1, s1), (w2, s2) = banks
+        return cls(w1, s1.view(e, -1), w2, s2.view(e, -1), weights.input_norm, weights.fc1_norm_const, weights.fc31_alpha, weights.fc2_alpha)
+
+
+@dataclass(frozen=True)
 class MoeEpNvfp4BackwardWeights:
     """Independent reduction-axis packs made from one version of the logical master weights."""
 
