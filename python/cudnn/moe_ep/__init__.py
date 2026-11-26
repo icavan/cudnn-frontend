@@ -30,6 +30,8 @@ from ._types import (
     MoeEpTrainingBackwardOutputs,
     MoeEpTrainingForwardOutputs,
     MoeEpTrainingWgradOperands,
+    MoeEpNvfp4ForwardWeights,
+    MoeEpNvfp4BackwardWeights,
     MoeFormat,
     MoeTensor,
 )
@@ -61,6 +63,8 @@ __all__ = [
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
     "MoeEpTuningConfig",
+    "MoeEpNvfp4ForwardWeights",
+    "MoeEpNvfp4BackwardWeights",
     "MoeFormat",
     "MoeTensor",
     "pack_backward_weights",

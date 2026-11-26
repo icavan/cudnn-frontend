@@ -474,6 +474,10 @@ def test_training_bundle_fields_match_public_contracts():
         "fc1_sfa",
         "valid_route_counts",
         "expert_offsets",
+        "saved_a",
+        "saved_sfa",
+        "route_slots",
+        "activation_norms",
     ]
     assert [field.name for field in fields(MoeEpTrainingBackwardOutputs)] == [
         "grad_activation",
@@ -484,6 +488,10 @@ def test_training_bundle_fields_match_public_contracts():
         "fc2_sfa",
         "fc2_b",
         "fc2_sfb",
+        "fc1_wgrad_a",
+        "fc1_wgrad_sfa",
+        "wgrad_expert_offsets",
+        "wgrad_valid_route_counts",
     ]
 
 
@@ -706,9 +714,9 @@ def test_prepare_training_rejects_cross_rank_storage_mode_mismatch(
     )
 
     def gather(output, value, *, group):
-        assert value == "discrete"
+        assert value[0] == "discrete"
         assert group is op.config.parallel.ep_group
-        output[:] = ["discrete", "contiguous"]
+        output[:] = [value, ("contiguous", *value[1:])]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="must match on every"):

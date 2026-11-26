@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Type, Tuple, Union
+from typing import Optional, Type, Tuple, Union
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, get_smem_capacity_in_bytes
+from cudnn._cutlass_helpers.named_barrier import sync_warps
 from cudnn._cutlass_helpers.static_persistent_tile_scheduler import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir.dialects import math, nvvm, llvm
@@ -138,6 +139,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        collect_amax: bool = True,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -164,6 +166,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
+        self.collect_amax = collect_amax
         self.mma_tiler = (*mma_tiler_mn, 1)
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -179,19 +182,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.mma_warp_id = 4
         self.tma_warp_id = 5
         self.threads_per_cta = 32 * len((self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id))
-        # Set barrier id for cta sync, epilogue sync and tmem ptr sync
+        # Barrier IDs for the full CTA and the four epilogue warps
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.threads_per_cta,
         )
-        self.epilog_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=2,
-            num_threads=32 * len(self.epilog_warp_id),
-        )
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=3,
-            num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
-        )
+        self.epilog_barrier_id = 2
 
         # Amax reduction configuration
         self.num_epilog_warps = len(self.epilog_warp_id)
@@ -339,6 +335,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.num_c_stage,
         )
 
+    def _scale_layout(self, shape):
+        mn, k, batch = shape
+        if cute.is_static(shape) and mn <= 128 and k <= 4 * self.sf_vec_size and batch == 1:
+            # One 128 x 4 scale atom would fold into a 1D TMA load. Keep
+            # the batch coordinate in the descriptor with its actual extent.
+            shape = (mn, k, cutlass.Int32(batch))
+        return blockscaled_utils.tile_atom_to_shape_SF(shape, self.sf_vec_size)
+
     @cute.jit
     def __call__(
         self,
@@ -351,6 +355,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        weight_expert: Optional[cute.Tensor] = None,
+        route_bounds: Optional[cute.Tensor] = None,
+        route_offset: cutlass.Int32 = 0,
+        store_subtile: cutlass.Constexpr = None,
+        store_args: Optional[Tuple[cute.Tensor, ...]] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -397,11 +406,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-        sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a_tensor.shape, self.sf_vec_size)
+        sfa_layout = self._scale_layout(a_tensor.shape)
         sfa_tensor = cute.make_tensor(sfa_tensor.iterator, sfa_layout)
 
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-        sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b_tensor.shape, self.sf_vec_size)
+        sfb_layout = self._scale_layout(b_tensor.shape)
         sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -573,6 +582,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            weight_expert,
+            route_bounds,
+            route_offset,
+            store_subtile,
+            store_args,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -609,10 +623,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        weight_expert: Optional[cute.Tensor] = None,
+        route_bounds: Optional[cute.Tensor] = None,
+        route_offset: cutlass.Int32 = 0,
+        store_subtile: cutlass.Constexpr = None,
+        store_args: Optional[Tuple[cute.Tensor, ...]] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+        if cutlass.const_expr(route_bounds is not None):
+            # All three warp roles use the same M extent. Keep divisors
+            # nonzero for a completely empty group and give it zero batches.
+            m, n, _ = tile_sched_params.problem_shape_ntile_mnl
+            per_route_tile = 256 // self.cta_tile_shape_mnk[0]
+            left = (route_bounds[1] - route_bounds[0] - route_offset).to(cutlass.Int32)
+            active = max(0, min(m // per_route_tile, left))
+            tile_sched_params = PersistentTileSchedulerParams((max(1, active * per_route_tile), n, (active > 0).to(cutlass.Int32)), (*self.cluster_shape_mn, 1))
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -822,8 +849,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         #
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_wait()
-        else:
-            self.cta_sync_barrier.arrive_and_wait()
+        # Publish the allocator warp's shared pointer at one converged CTA barrier
+        # before MMA, TMA and epilogue warps enter their independent loops.
+        if warp_idx == self.epilog_warp_id[0]:
+            cute.arch.alloc_tmem(self.num_tmem_alloc_cols, tmem_holding_buf, is_two_cta=use_2cta_instrs)
+        self.cta_sync_barrier.arrive_and_wait()
 
         #
         # Specialized TMA load warp
@@ -852,12 +882,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
                 # ((atom_v, rest_v), RestK)
-                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                weight_batch = mma_tile_coord_mnl[2]
+                if cutlass.const_expr(weight_expert is not None):
+                    weight_batch = weight_expert[mma_tile_coord_mnl[0] * self.mma_tiler[0] // 256].to(cutlass.Int32)
+                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, weight_batch)]
 
                 # ((atom_v, rest_v), RestK)
                 tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
                 # ((atom_v, rest_v), RestK)
-                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
+                tBgSFB_slice = tBgSFB[(None, mma_tile_coord_mnl[1], None, weight_batch)]
 
                 # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
@@ -922,11 +955,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            #
-            # Bar sync for retrieve tensor memory ptr from shared mem
-            # Synchronize MMA + epilogue warps to ensure alloc completed and pointer written
-            self.tmem_alloc_barrier.arrive_and_wait()
-
             #
             # Retrieving tensor memory ptr and make accumulator/SFA/SFB tensor
             #
@@ -1112,22 +1140,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         #
         if warp_idx < self.mma_warp_id:
             #
-            # Alloc tensor memory buffer (only first epilogue warp performs the alloc)
-            #
-            if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.alloc_tmem(
-                    self.num_tmem_alloc_cols,
-                    tmem_holding_buf,
-                    is_two_cta=use_2cta_instrs,
-                )
-
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            # Synchronize MMA + epilogue warps to make TMEM pointer visible
-            #
-            self.tmem_alloc_barrier.arrive_and_wait()
-
-            #
             # Retrieving tensor memory ptr and make accumulator tensor
             #
             acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
@@ -1225,19 +1237,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-                    # Accumulate thread-level amax across all subtiles in this tile
-                    # Note: We need absolute value maximum, so take abs first
-                    acc_values = tTR_rAcc.load()
-                    # Apply element-wise absolute value using math.absf (supports vectors)
-                    abs_acc_values_ir = math.absf(acc_values.ir_value())  # operand (positional)
-                    abs_acc_values = type(acc_values)(abs_acc_values_ir, acc_values.shape, acc_values.dtype)
-                    subtile_amax = abs_acc_values.reduce(
-                        cute.ReductionOp.MAX,
-                        cutlass.Float32(0.0),
-                        0,  # Use 0.0 as init for abs values
-                    )
-                    thread_tile_amax = cute.arch.fmax(thread_tile_amax, subtile_amax)
-
+                    if cutlass.const_expr(self.collect_amax):
+                        # Accumulate thread-level amax across all subtiles in this tile
+                        # Note: We need absolute value maximum, so take abs first
+                        acc_values = tTR_rAcc.load()
+                        # Apply element-wise absolute value using math.absf (supports vectors)
+                        abs_acc_values_ir = math.absf(acc_values.ir_value())  # operand (positional)
+                        abs_acc_values = type(acc_values)(abs_acc_values_ir, acc_values.shape, acc_values.dtype)
+                        subtile_amax = abs_acc_values.reduce(
+                            cute.ReductionOp.MAX,
+                            cutlass.Float32(0.0),
+                            0,  # Use 0.0 as init for abs values
+                        )
+                        thread_tile_amax = cute.arch.fmax(thread_tile_amax, subtile_amax)
                     #
                     # Convert to C type
                     #
@@ -1259,12 +1271,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         "async.shared",
                         space="cta",
                     )
-                    self.epilog_sync_barrier.arrive_and_wait()
+                    sync_warps(self.epilog_barrier_id, 32 * self.num_epilog_warps)
 
                     #
-                    # TMA store C to global memory
+                    # Store the staged subtile using the prepared output path
                     #
-                    if warp_idx == self.epilog_warp_id[0]:
+                    if cutlass.const_expr(store_subtile is not None):
+                        store_subtile(
+                            sC, c_buffer, epi_tidx, 32 * self.num_epilog_warps, cur_tile_coord, self.cta_tile_shape_mnk, epi_tile, subtile_idx, store_args
+                        )
+                    elif warp_idx == self.epilog_warp_id[0]:
                         cute.copy(
                             tma_atom_c,
                             bSG_sC[(None, c_buffer)],
@@ -1273,41 +1289,42 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
-                    self.epilog_sync_barrier.arrive_and_wait()
+                    sync_warps(self.epilog_barrier_id, 32 * self.num_epilog_warps)
 
-                # Perform amax reduction after all subtiles are processed
-                warp_amax = cute.arch.warp_redux_sync(
-                    value=thread_tile_amax,
-                    kind="fmax",
-                    mask_and_clamp=0xFFFFFFFF,
-                    nan=True,
-                )
-
-                # Each epilogue warp's lane 0 writes warp amax to shared memory
-                if cute.arch.lane_idx() == 0:
-                    sAmax[warp_idx] = cutlass.Float32(warp_amax)
-
-                # Ensure all epilogue warps complete their writes before block reduction
-                self.epilog_sync_barrier.arrive_and_wait()
-
-                # Block-level reduction: only first epilogue warp's lane 0 handles this
-                if warp_idx == self.epilog_warp_id[0] and cute.arch.lane_idx() == 0:
-                    block_amax = cutlass.Float32(0.0)  # Initial value for absolute maximum
-                    for i in cutlass.range(self.num_epilog_warps):
-                        warp_amax_val = sAmax[i]
-                        block_amax = cute.arch.fmax(block_amax, warp_amax_val)
-
-                    # Global atomic max (accumulates across all tiles for final tensor amax)
-                    # Since we compute absolute values, all values are non-negative
-                    _value_int = llvm.bitcast(T.i32(), block_amax.ir_value(), loc=None, ip=None)
-                    _old_value_int = nvvm.atomicrmw(
-                        op=nvvm.AtomicOpKind.MAX,
-                        ptr=mAmax.iterator.llvm_ptr,
-                        a=_value_int,
-                        loc=None,
-                        ip=None,
+                if cutlass.const_expr(self.collect_amax):
+                    # Perform amax reduction after all subtiles are processed
+                    warp_amax = cute.arch.warp_redux_sync(
+                        value=thread_tile_amax,
+                        kind="fmax",
+                        mask_and_clamp=0xFFFFFFFF,
+                        nan=True,
                     )
-                    _ = cutlass.Float32(llvm.bitcast(T.f32(), _old_value_int, loc=None, ip=None))
+
+                    # Each epilogue warp's lane 0 writes warp amax to shared memory
+                    if cute.arch.lane_idx() == 0:
+                        sAmax[warp_idx] = cutlass.Float32(warp_amax)
+
+                    # Ensure all epilogue warps complete their writes before block reduction
+                    sync_warps(self.epilog_barrier_id, 32 * self.num_epilog_warps)
+
+                    # Block-level reduction: only first epilogue warp's lane 0 handles this
+                    if warp_idx == self.epilog_warp_id[0] and cute.arch.lane_idx() == 0:
+                        block_amax = cutlass.Float32(0.0)  # Initial value for absolute maximum
+                        for i in cutlass.range(self.num_epilog_warps):
+                            warp_amax_val = sAmax[i]
+                            block_amax = cute.arch.fmax(block_amax, warp_amax_val)
+
+                        # Global atomic max (accumulates across all tiles for final tensor amax)
+                        # Since we compute absolute values, all values are non-negative
+                        _value_int = llvm.bitcast(T.i32(), block_amax.ir_value(), loc=None, ip=None)
+                        _old_value_int = nvvm.atomicrmw(
+                            op=nvvm.AtomicOpKind.MAX,
+                            ptr=mAmax.iterator.llvm_ptr,
+                            a=_value_int,
+                            loc=None,
+                            ip=None,
+                        )
+                        _ = cutlass.Float32(llvm.bitcast(T.f32(), _old_value_int, loc=None, ip=None))
                 #
                 # Async arrive accumulator buffer empty
                 #
@@ -1324,20 +1341,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Dealloc the tensor memory buffer
             #
-            # Ensure all epilogue warps complete their writes before block reduction
-            self.epilog_sync_barrier.arrive_and_wait()
-
-            # Coordinate dealloc across 2-CTA instruction mode
-            if use_2cta_instrs:
-                cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
-                cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-
-            # Actually deallocate TMEM
-            cute.arch.dealloc_tmem(
-                acc_tmem_ptr,
-                self.num_tmem_alloc_cols,
-                is_two_cta=use_2cta_instrs,
-            )
+            # Only the allocating warp owns the permit and frees the columns.
+            # All epilogue warps must finish reading before those columns can be reused.
+            if warp_idx == self.epilog_warp_id[0]:
+                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
+            sync_warps(self.epilog_barrier_id, 32 * self.num_epilog_warps)
+            if warp_idx == self.epilog_warp_id[0]:
+                if use_2cta_instrs:
+                    cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
+                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
+                cute.arch.dealloc_tmem(acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs)
             #
             # Wait for C store complete
             #

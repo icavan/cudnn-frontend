@@ -343,6 +343,8 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "MoeEpNativeWeightLayout",
     "MoeEpNativeWeightStorageMode",
     "MoeEpTrainingBackwardOutputs",
+    "MoeEpNvfp4ForwardWeights",
+    "MoeEpNvfp4BackwardWeights",
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
     "MoeEpTuningConfig",
@@ -416,6 +418,8 @@ _LAZY_OPTIONAL_IMPORTS = {
         "MoeEpNativeWeightStorageMode",
     ),
     "MoeEpTrainingBackwardOutputs": (".moe_ep", "MoeEpTrainingBackwardOutputs"),
+    "MoeEpNvfp4ForwardWeights": (".moe_ep", "MoeEpNvfp4ForwardWeights"),
+    "MoeEpNvfp4BackwardWeights": (".moe_ep", "MoeEpNvfp4BackwardWeights"),
     "MoeEpTrainingForwardOutputs": (".moe_ep", "MoeEpTrainingForwardOutputs"),
     "MoeEpTrainingWgradOperands": (
         ".moe_ep",

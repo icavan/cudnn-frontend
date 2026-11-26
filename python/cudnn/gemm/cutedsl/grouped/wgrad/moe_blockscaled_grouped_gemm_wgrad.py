@@ -31,6 +31,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
+from cudnn._cutlass_helpers.named_barrier import sync_warps
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -844,7 +845,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # TMEM allocator
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_alloc_sync_bar_id,
-            num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
+            num_threads=self.threads_per_cta,
         )
         tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -933,6 +934,9 @@ class BlockScaledMoEGroupedGemmWgradKernel:
 
         # Cluster wait
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        # All roles observe the TMEM allocation before scheduler and GEMM work diverge.
+        tmem.allocate(self.num_tmem_alloc_cols)
+        tmem.wait_for_alloc()
 
         # =================================================================
         # Scheduler warp (warp 6)
@@ -1210,7 +1214,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             tCrA = tiled_mma.make_fragment_A(sA)
             tCrB = tiled_mma.make_fragment_B(sB)
 
-            tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
@@ -1436,8 +1439,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
         # Epilogue warps (warps 0-3)
         # =================================================================
         if warp_idx < self.mma_warp_id:
-            tmem.allocate(self.num_tmem_alloc_cols)
-            tmem.wait_for_alloc()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
 
@@ -1448,11 +1449,6 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                 32 * len(self.epilogue_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(num_stages=self.num_c_stage, producer_group=c_producer_group)
-
-            epilog_sync_barrier = pipeline.NamedBarrier(
-                barrier_id=self.epilog_sync_bar_id,
-                num_threads=32 * len(self.epilogue_warp_id),
-            )
 
             tCtAcc_transformed = transform_partitioned_tensor_layout(tCtAcc_base)
 
@@ -1581,7 +1577,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                     c_buffer = (num_prev_subtiles + subtile_idx) % self.num_c_stage
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    epilog_sync_barrier.arrive_and_wait()
+                    sync_warps(self.epilog_sync_bar_id, 32 * len(self.epilogue_warp_id))
 
                     if warp_idx == self.epilogue_warp_id[0]:
                         cute.copy(
@@ -1592,7 +1588,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
                         )
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
-                    epilog_sync_barrier.arrive_and_wait()
+                    sync_warps(self.epilog_sync_bar_id, 32 * len(self.epilogue_warp_id))
 
                 if cutlass.const_expr(not self.overlapping_accum):
                     if k_tile_cnt > 0:
@@ -1615,7 +1611,7 @@ class BlockScaledMoEGroupedGemmWgradKernel:
             c_pipeline.producer_tail()
 
             tmem.relinquish_alloc_permit()
-            epilog_sync_barrier.arrive_and_wait()
+            sync_warps(self.epilog_sync_bar_id, 32 * len(self.epilogue_warp_id))
             tmem.free(acc_tmem_ptr)
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

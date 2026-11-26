@@ -673,6 +673,13 @@ def validate_training_non_aliasing(
         ranges.append((byte_start, byte_end, name))
 
 
+def validate_readonly_against_outputs(readonly: Mapping[str, torch.Tensor], outputs: Mapping[str, torch.Tensor]) -> None:
+    """Read-only views may share storage with one another."""
+    ranges = [(*_tensor_byte_range(value), name) for name, value in outputs.items() if value.numel()]
+    for name, value in readonly.items():
+        _assert_no_overlap(name, _tensor_byte_range(value), ranges)
+
+
 def validate_training_forward_outputs(
     output: MoeEpTrainingForwardOutputs,
     requirements: Mapping[str, tuple[Tuple[int, ...], Tuple[int, ...], torch.dtype, int]],

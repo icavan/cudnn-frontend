@@ -298,6 +298,19 @@ valid-memory control with and without that option before diagnosing a kernel
 error from the count alone. Use a known-bad memory/race canary to verify the
 detector, and retain a normal run of the real capture test without launch dumps.
 
+For a Blackwell block-scaled GEMM, exercise a singleton batch with both matrix
+dimensions at or below 128 and K spanning at most four scale groups. An SF
+tensor then fits in one 128-by-4 atom. A descriptor that folds all outer
+coordinates can issue a faulting 1D TMA load even when larger GEMMs pass.
+The NVFP4 MoE training regression uses H=I=32 and checks all four gradients.
+
+When Initcheck flags the first consumer of a TMA output, run a standalone
+shared-to-global TMA store into a fresh allocation and check every result in
+a second kernel. Repeat with a poison fill and with the store omitted. On
+B300, Initcheck 2025.3 and 2026.2.1 reported uninitialized reads after a
+correct store to fresh memory. Prefilling alone also masks a genuinely
+missing store, so compare every overwritten element to its expected value.
+
 ### CUDA Graph test lifetimes
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
@@ -938,3 +951,43 @@ a different GPU current; include changed-input capture replay. The detector is
 `test_direct_standalone_with_another_device_current` in the SM100 backward
 staging suite; it exercises both standalone adapters with a real host. A test
 that intercepts entry before launch provides a safe RED control for this bug.
+
+### Deferred MoE weight gradients
+
+To test metadata ownership, run backward for a microbatch routed to expert A.
+Reuse its forward record for expert B and run B's backward into separate
+destinations. Consume A's deferred operands and compare both master gradients
+per expert with A's immediate results. Keep the total route count identical
+across batches so only the segment boundaries distinguish them. Repeat after
+CUDA Graph replay with the expert IDs changed in place. The NVFP4 regression
+is `test_deferred_wgrad_survives_forward_reuse`.
+
+### NVFP4 rounding boundaries
+
+Compare the master-weight packer with the device backward packer byte for byte
+on E4M3 scale midpoints and E2M1 payload midpoints. Include both adjacent FP32
+values and a non-power-of-two encoding multiplier. A PyTorch CUDA division by
+a Python scalar can use reciprocal multiplication. An independent reference
+can perform the division in FP64 and explicitly round the quotient back to
+FP32 before the low-precision cast. The detector is
+`test_master_weight_encoding_matches_device_midpoints`. Also mix signed zeros
+and subnormals in one block at a large finite multiplier. An overflowing
+inverse can otherwise encode zero as the largest FP4 magnitude.
+
+For saved activations, include a non-power-of-two checkpoint multiplier in
+the token-axis repack test. In `test_saved_activation_decode_before_token_axis_repack`,
+rounding the block scale divided by seven before multiplying by an E2M1 three
+changes a payload nibble. Compare the decoded value and the new payload against
+the independent reference.
+
+Exercise a counted barrier under Compute Sanitizer Synccheck with each warp
+role at its actual program location. A numerical pass or a clean Racecheck
+does not verify convergence. `test_peer_dgrad_store_replay` exercises dense
+MMA and epilogue roles, and
+`test_two_cta_grouped_wgrad_reuses_tmem_across_expert_boundaries` changes the
+expert boundaries between CUDA Graph replays.
+When a Synccheck finding appears only inside a CUDA Graph WHILE body, run the
+identical kernel in a plain graph and check the native conditional replay and
+Memcheck separately. On B300, Synccheck 2025.3 also reports divergence for an
+independent CUDA SDK WHILE body containing a 32-lane sum with an unconditional
+barrier. A conditional-graph finding alone cannot localize the defective warp.
