@@ -52,7 +52,7 @@ def mma_operand(data):
 class TileGemm:
     """Prepared C = A @ B.T. The caller handles the two global factors in FP32."""
 
-    def __init__(self, m, n, k, device, *, expert_weights=False, communication_sms=0):
+    def __init__(self, m, n, k, device, *, communication_sms=0):
         from cudnn.gemm.cutedsl.dense.amax.api import GemmAmaxSm100
 
         def sample(rows):
@@ -68,16 +68,8 @@ class TileGemm:
         self.op.num_cluster_overlap_margin = max(self.op.num_cluster_overlap_margin, communication_sms)
         self.blocked = (sfa, sfb)
         self.padded = tuple(torch.zeros((t.shape[1] * 128, t.shape[2] * 4), dtype=torch.uint8, device=device) for t in self.blocked)
-        if expert_weights:
-            self.weight_data = b.permute(2, 0, 1).view(torch.uint8)
-            self.weight_sf = torch.empty((1, n, k // 16), dtype=torch.uint8, device=device)
         self.op.check_support()
         self.op.compile()
-
-    def select_expert(self, weight, expert):
-        torch.index_select(weight.data, 0, expert, out=self.weight_data)
-        torch.index_select(weight.scale.view(torch.uint8), 0, expert, out=self.weight_sf)
-        return self.weight_data[0], self.weight_sf[0].view(torch.float8_e4m3fn)
 
     def prepare_expert_bank(self, experts, n, k, device):
         self.expert_sf = torch.empty((experts, *self.blocked[1].shape[1:]), device=device, dtype=torch.float8_e4m3fn)
@@ -141,6 +133,15 @@ class TileGemm:
         )
 
     def bind_dgrad(self, weight, *, fixed_address=False):
+        """Bind a bank, staging only for an address-stable eager graph or a view.
+
+        The two prebuilt eager WHILE graphs contain TMA descriptors whose base
+        addresses were captured during prepare_training(), before caller weights
+        existed. They cannot consume a newly returned tensor address: eager replay
+        must refresh fallback_weights. An enclosing caller graph instead captures
+        the caller's aligned contiguous address directly. Strided/unaligned views
+        use an explicit prepared staging path in this training convenience API.
+        """
         sf = weight.scale.view(torch.uint8)
         if self.expert_sf_pad is not None:
             self.expert_sf_pad[:, : sf.shape[1], : sf.shape[2]].copy_(sf)

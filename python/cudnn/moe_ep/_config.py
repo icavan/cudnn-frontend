@@ -280,7 +280,7 @@ def _resolve_receive_capacity(
                 padding_block=inference_padding,
             ),
         )
-        physical_rows = (canonical_rows + _PHYSICAL_RECV_POOL_ALIGNMENT - 1) // _PHYSICAL_RECV_POOL_ALIGNMENT * _PHYSICAL_RECV_POOL_ALIGNMENT
+        physical_rows = (canonical_rows + training_padding - 1) // training_padding * training_padding
     else:
         physical_rows = parallel.physical_recv_pool_rows
     if physical_rows > _MAX_KERNEL_ROUTE_INDEX:

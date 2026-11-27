@@ -80,7 +80,7 @@ class Nvfp4Training:
             raise ValueError("NVFP4 training requires contiguous experts and dense routing")
         raw = t * k * self.topology.ep_size
         needed = _required_padded_rows(raw, experts_per_rank=e, padding_block=TILE)
-        self.rows = p = config.parallel.physical_recv_pool_rows or needed
+        self.rows = p = resolved.receive_capacity.physical_recv_pool_rows
         if p < needed or p % TILE:
             raise ValueError(f"NVFP4 physical_recv_pool_rows must cover {needed} rows in multiples of {TILE}")
         tiles = p // TILE
@@ -114,11 +114,13 @@ class Nvfp4Training:
         }
         comm_sms = 4 if self.topology.ep_size > 1 else 0
         self.gemms = {
-            shape: TileGemm(*shape, device, expert_weights=True, communication_sms=comm_sms)
-            for shape in sorted({(TILE, 2 * i, h), (TILE, h, i), (TILE, i, h), (TILE, h, 2 * i)})
+            shape: TileGemm(*shape, device, communication_sms=comm_sms) for shape in sorted({(TILE, 2 * i, h), (TILE, h, i), (TILE, i, h), (TILE, h, 2 * i)})
         }
 
-        for n, k_dim in {(i, h), (h, 2 * i)}:
+        direct_shapes = {(i, h), (h, 2 * i)}
+        if h % 128 or i % 128:
+            direct_shapes.update(((2 * i, h), (h, i)))
+        for n, k_dim in sorted(direct_shapes):
             self.gemms[TILE, n, k_dim].prepare_dgrad(e, n, k_dim, device)
 
         from ._nvfp4_wgrad import GroupedWgrad
@@ -229,10 +231,18 @@ class Nvfp4Training:
         # two prepared graphs bind caller-owned records through a pointer table.
         eager_banks = tuple(self.gemms[TILE, n, kk].fallback_weights.view(torch.float4_e2m1fn_x2).permute(1, 2, 0) for n, kk in ((h, 2 * i), (i, h)))
         self.eager_graphs = {}
+        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device))
         for overlap in (False, True):
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                self._live_windows(eager_banks, overlap)
+            # torch.cuda.graph.__enter__ synchronizes the whole device. Explicit
+            # capture preserves setup ordering without waiting for unrelated work.
+            with torch.cuda.stream(capture_stream):
+                graph.capture_begin()
+                try:
+                    self._live_windows(eager_banks, overlap)
+                finally:
+                    graph.capture_end()
             self.eager_graphs[overlap] = graph
 
     def close(self):
@@ -400,20 +410,20 @@ class Nvfp4Training:
             return self.grouped_forward.run(self.exchange, x, prob, weights, out)
         x, prob = self.gather(x), self.gather(prob).flatten()
         routes = x.new_empty((self.rows, self.h))
+        fc1, fc2 = self.gemms[TILE, 2 * self.i, self.h], self.gemms[TILE, self.h, self.i]
+        bank1, bank2 = fc1.bind_dgrad(weights.fc1), fc2.bind_dgrad(weights.fc2)
         for _, rows, e in self.tiles(ends):
             slot = slots[rows]
             ix = slot.clamp_min(0)
             xt = torch.where(slot[:, None] >= 0, x[ix // self.k], 0)
             xp = out.fc1_a[rows], out.fc1_sfa[rows]
             self.pack_x.run(xt, weights.input_norm, *xp)
-            fc1 = self.gemms[TILE, 2 * self.i, self.h]
-            pre = fc1(xp, fc1.select_expert(weights.fc1, e)) * weights.fc31_alpha.index_select(0, e)
+            pre = fc1.dgrad(xp, bank1, e) * weights.fc31_alpha.index_select(0, e)
             out.fc1_preact[rows].copy_(pre)
             weighted = self.activation_fwd.run(pre, torch.where(slot >= 0, prob[ix], 0.0))
             ap = out.saved_a[rows], out.saved_sfa[rows]
             self.pack_a.run(weighted, weights.fc1_norm_const.index_select(0, e), *ap)
-            fc2 = self.gemms[TILE, self.h, self.i]
-            routes[rows].copy_(fc2(ap, fc2.select_expert(weights.fc2, e)) * weights.fc2_alpha.index_select(0, e))
+            routes[rows].copy_(fc2.dgrad(ap, bank2, e) * weights.fc2_alpha.index_select(0, e))
         return self.combine(routes, slots, out.output, count)
 
     @torch.no_grad()

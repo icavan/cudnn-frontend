@@ -147,11 +147,18 @@ def measure(args, t, rank, device):
             with torch.cuda.graph(graph):
                 run()
         samples = []
+        if args.profile and overlap:
+            dist.barrier()
+            if rank == 0:
+                torch.cuda.cudart().cudaProfilerStart()
+            try:
+                run() if graph is None else graph.replay()
+                torch.cuda.synchronize()
+            finally:
+                if rank == 0:
+                    torch.cuda.cudart().cudaProfilerStop()
         for iteration in range(args.repeats):
             dist.barrier()
-            profile = args.profile and overlap and iteration == 0 and rank == 0
-            if profile:
-                torch.cuda.cudart().cudaProfilerStart()
             resident = torch.cuda.memory_allocated()
             torch.cuda.reset_peak_memory_stats()
             allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -163,8 +170,6 @@ def measure(args, t, rank, device):
             stop.record()
             stop.synchronize()
             allocations = torch.cuda.memory_stats()["allocation.all.allocated"] - allocations
-            if profile:
-                torch.cuda.cudart().cudaProfilerStop()
             stats = torch.tensor(
                 [
                     start.elapsed_time(op._training_state.dx_ready),
@@ -240,7 +245,7 @@ def main():
     parser.add_argument("--verify", action="store_true", help="Compare every gradient byte after timing both schedules")
     parser.add_argument("--graph", action="store_true", help="Measure CUDA Graph replay")
     parser.add_argument("--measure-step", action="store_true", help="Also time eager forward followed by the overlapped backward")
-    parser.add_argument("--profile", action="store_true", help="Mark rank 0's first overlapped iteration with cudaProfilerStart/Stop")
+    parser.add_argument("--profile", action="store_true", help="Profile an extra untimed overlapped replay on rank 0")
     args = parser.parse_args()
     configure_model(args)
     rank = int(os.environ["LOCAL_RANK"])

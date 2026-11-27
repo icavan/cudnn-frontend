@@ -70,6 +70,8 @@ class GroupedOperand:
                     cute.arch.store(dest, cute.arch.load(source, cutlass.Uint32))
             job += cute.arch.grid_dim()[0]
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def reorder(
         self, data: cute.Tensor, sf: cute.Tensor, experts: cute.Tensor, ends: cute.Tensor, ordered: cute.Tensor, blocked: cute.Tensor, stream: cuda.CUstream

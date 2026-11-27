@@ -47,7 +47,7 @@ def fp8_operand(value, token_axis):
         blocks = value.view(-1, 32, cols).float()
         axis = 1
     else:
-        blocks = value.view(rows, -1, 128).float()
+        blocks = value.view(rows, cols // 128, 128).float()
         axis = 2
     sf = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(axis).clamp_min(1e-4) / 448)))
     return (blocks / sf.unsqueeze(axis)).to(torch.float8_e4m3fn).view_as(value), sf

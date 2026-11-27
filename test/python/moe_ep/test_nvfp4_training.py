@@ -24,6 +24,7 @@ from cudnn.moe_ep import (
     MoeEpTrainingBackwardOutputs,
 )
 from cudnn.moe_ep._nvfp4 import pack
+from nvfp4_test_support import nvfp4_gpu, owned_graph
 
 pytestmark = pytest.mark.L0
 
@@ -69,6 +70,7 @@ def test_packing_boundaries():
     torch.testing.assert_close(BlockScaledTensor(data, sf, MoeFormat.NVFP4, x.shape).dequantize(), dense)
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 @pytest.mark.parametrize("hidden", [160, 1056, 2080])
 def test_peer_publish_divides_before_reduction(hidden):
     from cuda.bindings import driver as cuda
@@ -86,25 +88,26 @@ def test_peer_publish_divides_before_reduction(hidden):
     dx = torch.randn((256, hidden), generator=torch.Generator(device=device).manual_seed(47), device=device)
     dp = torch.arange(256, device=device, dtype=torch.float32)
     denom = torch.tensor([3.7], device=device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        exchange.flags.zero_()
-        if exchange.drain is not None:
-            exchange.done.zero_()
-        publish(exchange.ptrs, slots, dx, dp, exchange.gen, denom, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
-        exchange.combine_ready(torch.cuda.current_stream())
-    for norm in (3.7, 1.0):
-        denom.fill_(norm)
-        exchange.dx.fill_(float("nan"))
-        exchange.combined.fill_(float("nan"))
-        graph.replay()
-        expected = dx[:4] / denom
-        assert torch.equal(exchange.dx[slots[:4]].view(torch.uint8), expected.view(torch.uint8))
-        assert torch.equal(exchange.dp.view(-1)[slots[:4]], dp[:4])
-        combined = torch.stack((expected[3] + expected[1], expected[0] + expected[2])).bfloat16()
-        assert torch.equal(exchange.combined.view(torch.uint8), combined.view(torch.uint8))
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            exchange.flags.zero_()
+            if exchange.drain is not None:
+                exchange.done.zero_()
+            publish(exchange.ptrs, slots, dx, dp, exchange.gen, denom, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+            exchange.combine_ready(torch.cuda.current_stream())
+        for norm in (3.7, 1.0):
+            denom.fill_(norm)
+            exchange.dx.fill_(float("nan"))
+            exchange.combined.fill_(float("nan"))
+            graph.replay()
+            expected = dx[:4] / denom
+            assert torch.equal(exchange.dx[slots[:4]].view(torch.uint8), expected.view(torch.uint8))
+            assert torch.equal(exchange.dp.view(-1)[slots[:4]], dp[:4])
+            combined = torch.stack((expected[3] + expected[1], expected[0] + expected[2])).bfloat16()
+            assert torch.equal(exchange.combined.view(torch.uint8), combined.view(torch.uint8))
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_peer_dgrad_store_replay():
     from cuda.bindings import driver as cuda
     from cudnn.moe_ep._nvfp4 import TileGemm, mma_operand
@@ -113,7 +116,7 @@ def test_peer_dgrad_store_replay():
     device = torch.device("cuda", torch.cuda.current_device())
     tiles, rows, hidden, inner = 2, 512, 1024, 512
     rng = torch.Generator(device=device).manual_seed(179)
-    op = TileGemm(256, hidden, inner, device, expert_weights=True)
+    op = TileGemm(256, hidden, inner, device)
     op.prepare_dgrad(2, hidden, inner, device)
     local = op.compile_dgrad(2, hidden, inner, tiles, live=True)
     remote = op.compile_dgrad(2, hidden, inner, tiles, live=True, peer_store=PeerDgradStore(2, rows // 2, hidden))
@@ -129,27 +132,28 @@ def test_peer_dgrad_store_replay():
     bounds = torch.tensor([0, 2], device=device)
     slots = torch.empty(rows, device=device, dtype=torch.int64)
     divisor = torch.ones(1, device=device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        local(values, bank, sf, op.expert_sf, reference, op.amax, stream, owners, bounds, 0)
-        remote(values, bank, sf, op.expert_sf, layout, op.amax, stream, owners, bounds, 0, (peers, slots, divisor))
-    for live, scale in ((2, 1.0), (1, 3.7), (0, 2.0), (2, 4.3)):
-        slots.copy_(torch.randperm(rows, device=device, generator=rng))
-        slots[::7] = -1
-        bounds[1].fill_(live)
-        divisor.fill_(scale)
-        planes.fill_(12345.0)
-        layout.fill_(-17.0)
-        graph.replay()
-        expected = torch.full_like(planes.view(rows, hidden), 12345.0)
-        active_slots = slots[: live * 256]
-        valid = active_slots >= 0
-        expected[active_slots[valid]] = reference[: live * 256, :, 0][valid] / divisor
-        assert torch.equal(planes.view(torch.uint8).reshape(rows, -1), expected.view(torch.uint8))
-        assert (layout == -17.0).all()
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            local(values, bank, sf, op.expert_sf, reference, op.amax, stream, owners, bounds, 0)
+            remote(values, bank, sf, op.expert_sf, layout, op.amax, stream, owners, bounds, 0, (peers, slots, divisor))
+        for live, scale in ((2, 1.0), (1, 3.7), (0, 2.0), (2, 4.3)):
+            slots.copy_(torch.randperm(rows, device=device, generator=rng))
+            slots[::7] = -1
+            bounds[1].fill_(live)
+            divisor.fill_(scale)
+            planes.fill_(12345.0)
+            layout.fill_(-17.0)
+            graph.replay()
+            expected = torch.full_like(planes.view(rows, hidden), 12345.0)
+            active_slots = slots[: live * 256]
+            valid = active_slots >= 0
+            expected[active_slots[valid]] = reference[: live * 256, :, 0][valid] / divisor
+            assert torch.equal(planes.view(torch.uint8).reshape(rows, -1), expected.view(torch.uint8))
+            assert (layout == -17.0).all()
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_peer_drain_crosses_int32_element_offset():
     from cudnn.moe_ep._nvfp4_peer import PeerKernels, TileExchange
 
@@ -160,21 +164,25 @@ def test_peer_drain_crosses_int32_element_offset():
     if torch.cuda.mem_get_info(device)[0] < kernel.nbytes + 2**30:
         pytest.skip("the FP32 route plane crosses the 8 GiB boundary")
     state = SimpleNamespace(max_tokens=tokens, h=h, k=k, topology=SimpleNamespace(ep_size=1), device=device, rows=256)
-    exchange = TileExchange(state)
+    try:
+        exchange = TileExchange(state)
+    except torch.OutOfMemoryError:
+        pytest.skip("insufficient memory for the 8 GiB route-offset probe")
     exchange.flags[-2 * kernel.chunks :].fill_(k)
     last = exchange.dx[-2 * k :].view(2, k, h)
     slots = torch.arange(2 * k, dtype=torch.float32, device=device).view(2, k, 1)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        exchange.done.zero_()
-        exchange.combine_ready(torch.cuda.current_stream())
-    for bias in (1, 17):
-        last.copy_(slots + bias)
-        exchange.combined[-2:].fill_(float("nan"))
-        graph.replay()
-        assert torch.equal(exchange.combined[-2:], last.sum(1).bfloat16())
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            exchange.done.zero_()
+            exchange.combine_ready(torch.cuda.current_stream())
+        for bias in (1, 17):
+            last.copy_(slots + bias)
+            exchange.combined[-2:].fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(exchange.combined[-2:], last.sum(1).bfloat16())
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 @pytest.mark.parametrize("limit", [None, 2.0])
 def test_fused_swiglu_packs_and_dp(limit):
     from cudnn.moe_ep._nvfp4_pack import DualPack, SwiGLUBackward
@@ -209,11 +217,14 @@ def test_fused_swiglu_packs_and_dp(limit):
             kernel.run(gu, norm, ptr, base, 1)
         else:
             kernel.run_swiglu(pre_ptr, da, prob, divisor, norm, ptr, base, 1, dp)
+        assert torch.all(data[0] == 0x5A)
+        assert torch.all(sf[0] == 0xA5)
         outputs.append((kernel.payload, kernel.sf, data, sf, dp))
     for actual, expected in zip(outputs[1], outputs[0]):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_partial_window_replay():
     from cuda.bindings import driver as cuda
     from cudnn.moe_ep._nvfp4_schedule import WindowRoutes
@@ -226,19 +237,20 @@ def test_partial_window_replay():
     bounds = torch.tensor([1, 3], device=device)
     slots = torch.empty(4 * 256, device=device, dtype=torch.int64)
     experts = torch.empty(4, device=device, dtype=torch.int64)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        routes.fn(table, owners, bounds, slots, experts, 4, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
-    for begin, end in ((0, 3), (2, 3), (3, 3), (0, 1)):
-        bounds.copy_(bounds.new_tensor([begin, end]))
-        graph.replay()
-        live = end - begin
-        assert torch.equal(slots[: live * 256], saved[begin * 256 : end * 256])
-        assert torch.equal(experts[:live], owners[begin:end])
-        assert (slots[live * 256 :] == -1).all()
-        assert (experts[live:] == 0).all()
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            routes.fn(table, owners, bounds, slots, experts, 4, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        for begin, end in ((0, 3), (2, 3), (3, 3), (0, 1)):
+            bounds.copy_(bounds.new_tensor([begin, end]))
+            graph.replay()
+            live = end - begin
+            assert torch.equal(slots[: live * 256], saved[begin * 256 : end * 256])
+            assert torch.equal(experts[:live], owners[begin:end])
+            assert (slots[live * 256 :] == -1).all()
+            assert (experts[live:] == 0).all()
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_swiglu_clamp_boundaries():
     from cudnn.moe_ep._nvfp4_pack import SwiGLUBackward
 
@@ -398,6 +410,7 @@ def test_trtllm_weight_view():
         MoeEpNvfp4ForwardWeights.from_trtllm(view, fw.input_norm, input_channel_scale=torch.ones(64))
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 @pytest.mark.parametrize("count,h,i", [(n, 128, 128) for n in (15, 16, 17, 255, 256, 257)] + [(17, 32, 32), (17, 160, 288)])
 def test_training(count, h, i, record_property):
     e = 3
@@ -464,13 +477,14 @@ def test_training(count, h, i, record_property):
         assert all(getattr(compact, field.name).data_ptr() != getattr(rec, field.name).data_ptr() for field in fields(rec))
         for field in fields(rec):
             getattr(rec, field.name).zero_()
-        snapshot_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(snapshot_graph):
-            op.training_backward(dy, ids, p, weights=bw, forward_record=compact, out=out, dw1=dw1, dw2=dw2)
-        snapshot_graph.replay()
-        for result, reference in zip((compact.output, dx, dp, dw1, dw2), expected[:5]):
-            torch.testing.assert_close(result, reference, rtol=3e-5, atol=3e-5)
-        del snapshot_graph
+        with owned_graph() as snapshot_graph:
+            with torch.cuda.graph(snapshot_graph):
+                op.training_backward(dy, ids, p, weights=bw, forward_record=compact, out=out, dw1=dw1, dw2=dw2)
+            for value in (dx, dp, dw1, dw2):
+                value.fill_(float("nan"))
+            snapshot_graph.replay()
+            for result, reference in zip((compact.output, dx, dp, dw1, dw2), expected[:5]):
+                torch.testing.assert_close(result, reference, rtol=3e-5, atol=3e-5)
         op.training_forward(x, ids, p, weights=fw, out=rec)
         # A contiguous view may start one byte into its allocation. Both this
         # bank and a strided bank must remain readable on every captured replay.
@@ -487,20 +501,33 @@ def test_training(count, h, i, record_property):
         views = replace(
             bw, w1_transpose=replace(bw.w1_transpose, data=unaligned, scale=offset_sf), w2_transpose=replace(bw.w2_transpose, data=strided, scale=strided_sf)
         )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            op.training_backward(dy, ids, p, weights=views, forward_record=rec, out=out, dw1=dw1, dw2=dw2)
-        graph.replay()
-        for result, reference in zip((dx, dp, dw1, dw2), expected[1:5]):
-            torch.testing.assert_close(result, reference, rtol=3e-5, atol=3e-5)
-        offset_sf.zero_()
-        graph.replay()
-        assert torch.count_nonzero(dx) == 0
-        offset_sf.copy_(left_sf)
-        unaligned.zero_()
-        graph.replay()
-        assert torch.count_nonzero(dx) == 0
-        del graph
+        with owned_graph() as graph:
+            with torch.cuda.graph(graph):
+                op.training_backward(dy, ids, p, weights=views, forward_record=rec, out=out, dw1=dw1, dw2=dw2)
+            graph.replay()
+            for result, reference in zip((dx, dp, dw1, dw2), expected[1:5]):
+                torch.testing.assert_close(result, reference, rtol=3e-5, atol=3e-5)
+            offset_sf.zero_()
+            graph.replay()
+            assert torch.count_nonzero(dx) == 0
+            offset_sf.copy_(left_sf)
+            unaligned.zero_()
+            graph.replay()
+            assert torch.count_nonzero(dx) == 0
+            unaligned.copy_(left)
+            for carrier, original in ((strided, right), (strided_sf, right_sf)):
+                carrier.zero_()
+                for value in (dx, dp, dw1, dw2):
+                    value.fill_(float("nan"))
+                graph.replay()
+                assert torch.count_nonzero(dx) == 0
+                assert torch.count_nonzero(dp) == 0
+                assert torch.count_nonzero(dw1) == 0
+                torch.testing.assert_close(dw2, expected[4], rtol=3e-5, atol=3e-5)
+                carrier.copy_(original)
+                graph.replay()
+                for value, reference in zip((dx, dp, dw1, dw2), expected[1:5]):
+                    torch.testing.assert_close(value, reference, rtol=3e-5, atol=3e-5)
     if count == 17:
         # Cover both forward implementations. A padding row that borrows
         # slot zero's negative probability would encode negative zero nibbles.
@@ -531,6 +558,7 @@ def test_training(count, h, i, record_property):
     op.close()
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_deferred_wgrad_survives_forward_reuse():
     device = torch.device("cuda", torch.cuda.current_device())
     e, h, i, count = 2, 128, 128, 17
@@ -576,28 +604,32 @@ def test_deferred_wgrad_survives_forward_reuse():
             torch.testing.assert_close(value, reference, rtol=3e-5, atol=3e-5)
         expected.append((dw1.clone(), dw2.clone()))
         forward(1 - expert)
+        dw1.fill_(float("nan"))
+        dw2.fill_(float("nan"))
         op.training_wgrad(operands, dw1=dw1, dw2=dw2)
         for result, reference in zip((dw1, dw2), expected[-1]):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
     other = buffers(req, MoeEpTrainingBackwardOutputs, device)
     for dest in (out, replace(out, wgrad_expert_offsets=None, wgrad_valid_route_counts=None)):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            _, _, operands = op.training_backward(dy, ids, p, out=dest, **kwargs)
-        for expert in (0, 1, 0):
-            forward(expert)
-            graph.replay()
-            forward(1 - expert)
-            op.training_backward(dy, ids, p, out=other, **kwargs)
-            assert operands.valid_route_counts.tolist() == ([count, 0] if expert == 0 else [0, count])
-            op.training_wgrad(operands, dw1=dw1, dw2=dw2)
-            for result, reference in zip((dw1, dw2), expected[expert]):
-                torch.testing.assert_close(result, reference, rtol=0, atol=0)
-        del graph
+        with owned_graph() as graph:
+            with torch.cuda.graph(graph):
+                _, _, operands = op.training_backward(dy, ids, p, out=dest, **kwargs)
+            for expert in (0, 1, 0):
+                forward(expert)
+                graph.replay()
+                forward(1 - expert)
+                op.training_backward(dy, ids, p, out=other, **kwargs)
+                assert operands.valid_route_counts.tolist() == ([count, 0] if expert == 0 else [0, count])
+                dw1.fill_(float("nan"))
+                dw2.fill_(float("nan"))
+                op.training_wgrad(operands, dw1=dw1, dw2=dw2)
+                for result, reference in zip((dw1, dw2), expected[expert]):
+                    torch.testing.assert_close(result, reference, rtol=0, atol=0)
     op.close()
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 @pytest.mark.parametrize("norm", [1.0, 3.0, 7.0])
 def test_master_weight_encoding_matches_device_midpoints(norm):
     from cudnn.moe_ep._nvfp4_pack import PackTile
@@ -629,6 +661,7 @@ def test_master_weight_encoding_matches_device_midpoints(norm):
         assert torch.equal(sf[: len(value)].view(torch.uint8), scale.view(torch.uint8))
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_singleton_expert_views_and_wgrad_division():
     device = torch.device("cuda", torch.cuda.current_device())
     path = MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4, dgu_norm=3.0, dy_norm=3.0)
@@ -656,13 +689,14 @@ def test_singleton_expert_views_and_wgrad_division():
     expected = [v.clone() for v in run(fw, bw)[0]]
     fw = replace(fw, fc1=odd_stride(fw.fc1), fc2=odd_stride(fw.fc2))
     bw = replace(bw, w1_transpose=odd_stride(bw.w1_transpose), w2_transpose=odd_stride(bw.w2_transpose))
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        values, operands = run(fw, bw)
-    graph.replay()
-    for value, reference in zip(values, expected):
-        torch.testing.assert_close(value, reference, rtol=0, atol=0)
-    del graph
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            values, operands = run(fw, bw)
+        for value in values:
+            value.fill_(float("nan"))
+        graph.replay()
+        for value, reference in zip(values, expected):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
     # Five products of exactly one distinguish RN(5/3) from 5 * RN(1/3).
     for data, sf in (
@@ -691,6 +725,7 @@ def test_encoding_norm_must_be_representable_in_fp32(invalid):
         MoeEpNvfp4BackwardWeights.from_master(torch.empty(1, 64, 32), torch.empty(1, 32, 32), w1_norm=invalid)
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_large_encoding_norm_preserves_zero_and_subnormal_inputs():
     from cudnn.moe_ep._nvfp4_pack import DualPack, PackTile
 
@@ -712,21 +747,22 @@ def test_large_encoding_norm_preserves_zero_and_subnormal_inputs():
     dual.run(x, norm, ptrs, torch.zeros(1, dtype=torch.int64, device=device), 0)
     assert torch.equal(dual.payload, expected)
     assert torch.equal(dual.sf.view(torch.uint8), physical_scales(expected_sf.to(torch.float8_e4m3fn)).view(torch.uint8))
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured, captured_sf = pack(x.T, norm)
-    for scale in (1.0, 1e38):
-        norm.fill_(scale)
-        graph.replay()
-        expected_token, expected_token_sf = pack(x.T, scale)
-        assert torch.equal(captured, expected_token) and torch.equal(captured_sf.float(), expected_token_sf.float())
-    assert torch.equal(token_data, captured) and torch.equal(token_sf.float(), captured_sf.float())
-    ref, ref_sf, _ = reference_pack(x, 1e38)
-    for payload, scales in ((master, master_sf), (data, sf), (ref, ref_sf)):
-        assert torch.equal(payload, expected)
-        assert torch.equal(scales.float(), expected_sf)
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            captured, captured_sf = pack(x.T, norm)
+        for scale in (1.0, 1e38):
+            norm.fill_(scale)
+            graph.replay()
+            expected_token, expected_token_sf = pack(x.T, scale)
+            assert torch.equal(captured, expected_token) and torch.equal(captured_sf.float(), expected_token_sf.float())
+        assert torch.equal(token_data, captured) and torch.equal(token_sf.float(), captured_sf.float())
+        ref, ref_sf, _ = reference_pack(x, 1e38)
+        for payload, scales in ((master, master_sf), (data, sf), (ref, ref_sf)):
+            assert torch.equal(payload, expected)
+            assert torch.equal(scales.float(), expected_sf)
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_saved_activation_decode_before_token_axis_repack():
     from cudnn.moe_ep._nvfp4_pack import PackTile, RepackSaved
 
@@ -775,6 +811,7 @@ def test_saved_activation_decode_before_token_axis_repack():
         assert torch.equal(sf.view(torch.uint8), expected_sf.view(torch.uint8))
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_two_cta_grouped_wgrad_reuses_tmem_across_expert_boundaries():
     from cudnn.moe_ep._nvfp4_wgrad import GroupedWgrad
 
@@ -794,15 +831,233 @@ def test_two_cta_grouped_wgrad_reuses_tmem_across_expert_boundaries():
     a, sa, x = operand()
     b, sb, y = operand()
     grad = torch.empty((2, dim, dim), device=device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        op.b.bind(b, sb, owners, ends)
-        op.run(grad, a, sa, owners, ends)
-    for first_end in (256, 0, tiles * 256):
-        ends.copy_(ends.new_tensor([first_end, tiles * 256]))
-        owners.copy_((torch.arange(tiles, device=device) >= first_end // 256).long())
-        grad.fill_(float("nan"))
-        graph.replay()
-        for expert, (start, stop) in enumerate(((0, first_end), (first_end, tiles * 256))):
-            # Small dyadic operands make this entire FP32 dot product exact.
-            torch.testing.assert_close(grad[expert], x[:, start:stop] @ y[:, start:stop].T, rtol=0, atol=0)
+    with owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            op.b.bind(b, sb, owners, ends)
+            op.run(grad, a, sa, owners, ends)
+        for first_end in (256, 0, tiles * 256):
+            ends.copy_(ends.new_tensor([first_end, tiles * 256]))
+            owners.copy_((torch.arange(tiles, device=device) >= first_end // 256).long())
+            grad.fill_(float("nan"))
+            graph.replay()
+            for expert, (start, stop) in enumerate(((0, first_end), (first_end, tiles * 256))):
+                # Small dyadic operands make this entire FP32 dot product exact.
+                torch.testing.assert_close(grad[expert], x[:, start:stop] @ y[:, start:stop].T, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+def test_prepare_on_two_devices(monkeypatch):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible devices")
+    config = MoeEpConfig(
+        model=MoeEpModelConfig(num_experts=1, hidden_size=32, intermediate_size=32, top_k=1),
+        parallel=MoeEpParallelConfig(max_tokens_per_rank=1),
+        data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4),
+    )
+    original_graph = torch.cuda.graph
+    captures = []
+
+    def implicit_capture(*args, **kwargs):
+        captures.append(torch.cuda.current_device())
+        return original_graph(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "graph", implicit_capture)
+    for index in (0, 1):
+        with torch.cuda.device(index), MoeEp(config) as op:
+            device = torch.device("cuda", index)
+            req = op.prepare_training(device=device)
+            rec = buffers(req, MoeEpTrainingForwardOutputs, device)
+            out = buffers(req, MoeEpTrainingBackwardOutputs, device)
+            fw, bw, w1, w2 = fixture(1, 32, 32, device)
+            x = torch.ones(1, 32, device=device, dtype=torch.bfloat16)
+            ids = torch.zeros(1, 1, device=device, dtype=torch.int32)
+            prob = torch.ones(1, 1, device=device)
+            op.training_forward(x, ids, prob, weights=fw, out=rec)
+            actual = op.training_backward(x, ids, prob, weights=bw, forward_record=rec, out=out, dw1=w1, dw2=w2)
+            assert all(torch.isfinite(v).all() for v in (*actual[:2], w1, w2))
+    assert not captures, "internal preparation used the device-synchronizing graph context manager"
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+@pytest.mark.parametrize("padding,capacity", [(128, None), (384, None), (512, None), (128, 768)])
+def test_resolved_receive_capacity(padding, capacity):
+    config = MoeEpConfig(
+        model=MoeEpModelConfig(num_experts=1, hidden_size=32, intermediate_size=32, top_k=1),
+        parallel=MoeEpParallelConfig(max_tokens_per_rank=1, token_padding_size=padding, physical_recv_pool_rows=capacity),
+        data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4),
+    )
+    with MoeEp(config) as op:
+        req = op.prepare_training()
+        expected = capacity or ((max(256, padding) + 255) // 256 * 256)
+        assert op.physical_recv_pool_rows == expected
+        assert req["route_slots"][0] == (expected,)
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+def test_strict_route_validation_does_not_sync():
+    from cudnn.moe_ep._validation import _validate_expert_ids
+
+    with MoeEp(
+        MoeEpConfig(
+            model=MoeEpModelConfig(num_experts=2, hidden_size=32, intermediate_size=32, top_k=1),
+            parallel=MoeEpParallelConfig(max_tokens_per_rank=2),
+            data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4),
+        )
+    ) as op:
+        ids = torch.tensor([[0], [1]], device="cuda", dtype=torch.int32)
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            _validate_expert_ids(op._execution_state.resolved_config, ids)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+def test_small_forward_reads_expert_bank(monkeypatch):
+    config = MoeEpConfig(
+        model=MoeEpModelConfig(num_experts=2, hidden_size=32, intermediate_size=32, top_k=2),
+        parallel=MoeEpParallelConfig(max_tokens_per_rank=257),
+        data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4),
+    )
+    device = torch.device("cuda", torch.cuda.current_device())
+    with MoeEp(config) as op:
+        rec = buffers(op.prepare_training(device=device), MoeEpTrainingForwardOutputs, device)
+        fw, _, w1, w2 = fixture(2, 32, 32, device)
+        x = torch.ones(257, 32, device=device, dtype=torch.bfloat16)
+        ids = torch.tensor([0, 1], device=device, dtype=torch.int32).repeat(257, 1)
+        prob = torch.full((257, 2), 0.375, device=device)
+        original = torch.index_select
+
+        def reject_weight_gather(value, *args, **kwargs):
+            assert value.ndim != 3, "per-tile expert bank gather"
+            return original(value, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "index_select", reject_weight_gather)
+            y = op.training_forward(x, ids, prob, weights=fw, out=rec)
+        ref = oracle(x, x, ids, prob, w1, w2, 4.0, fw.fc1_norm_const, 8.0, 4.0, config.data_path)
+        torch.testing.assert_close(y, ref[0], rtol=3e-5, atol=3e-5)
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+def test_bounded_scheduler_visits_each_live_tile_once():
+    from cuda.bindings import driver as cuda
+    from cudnn.moe_ep._nvfp4_schedule import RouteConditions, WindowRoutes
+    from cudnn.moe_ep._nvfp4_training import Nvfp4Training
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity, window, group = 128, 64, 32
+    saved = torch.arange(capacity * 256, device=device)
+    pointers = torch.tensor([saved.data_ptr()], device=device)
+    bindings = SimpleNamespace(names=("route_slots",), count=1, external=pointers)
+    bounds = torch.zeros(2, dtype=torch.int64, device=device)
+    slots = torch.empty(window * 256, dtype=torch.int64, device=device)
+    experts = torch.empty(window, dtype=torch.int64, device=device)
+    seen = torch.zeros(capacity * 256, dtype=torch.int32, device=device)
+    bad_padding = torch.zeros((), dtype=torch.int32, device=device)
+    indices = torch.arange(window * 256, device=device)
+
+    class Recorder:
+        def run(self, state, record, divisors, banks, overlap, owners, width):
+            actual = record.route_slots[: width * 256]
+            absolute = state.run_base * 256 + indices[: width * 256]
+            live = absolute < state.live_tiles * 256
+            bad_padding.add_((actual != torch.where(live, absolute, -1)).any().int())
+            seen.scatter_add_(0, actual.clamp_min(0), live.int())
+
+    conditions = RouteConditions(device)
+    state = SimpleNamespace(
+        window_inputs={"route_slots": slots, "fc1_preact": torch.empty((window * 256, 0), device=device)},
+        window_outputs={},
+        buffers={"grad_activation": None},
+        run_base=bounds[0],
+        live_tiles=bounds[1],
+        bounds=bounds,
+        bounded_groups=True,
+        group_tiles=group,
+        window_widths=(window, group),
+        remaining_tiles=torch.zeros((), dtype=torch.int64, device=device),
+        more_tiles=torch.zeros((), dtype=torch.bool, device=device),
+        conditions=conditions,
+        routes=WindowRoutes(bindings),
+        read_window=bindings,
+        tile_experts=torch.arange(capacity, device=device),
+        window_experts=experts,
+        batches={window: Recorder(), group: Recorder()},
+        dgrad_divisors=None,
+    )
+    try:
+        with owned_graph() as graph:
+            with torch.cuda.graph(graph):
+                Nvfp4Training._live_windows(state, (), True)
+            for live in (32, 33, 64, 65):
+                bounds[1].fill_(live)
+                seen.zero_()
+                bad_padding.zero_()
+                slots.fill_(-99)
+                graph.replay()
+                assert torch.all(seen[: live * 256] == 1)
+                assert torch.count_nonzero(seen[live * 256 :]) == 0
+                assert bad_padding.item() == 0
+    finally:
+        conditions.close()
+
+
+@pytest.mark.parametrize(
+    "installed,error,cuda_available,capability",
+    [
+        (False, None, False, None),
+        (True, "requires CuTeDSL >=4.7.0", False, None),
+        (True, None, False, None),
+        (True, None, True, (9, 0)),
+    ],
+)
+def test_gpu_environment_gate_skips_before_kernel_import(monkeypatch, installed, error, cuda_available, capability):
+    from cudnn.frost import buffers as device_buffers
+
+    monkeypatch.setattr(device_buffers, "cutedsl_state", lambda: (installed, None))
+    monkeypatch.setattr(device_buffers, "cutedsl_requirement_error", lambda _: error)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    with pytest.raises(pytest.skip.Exception):
+        nvfp4_gpu.__wrapped__()
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+@pytest.mark.parametrize("invalid", [-1, 2])
+def test_strict_cuda_route_validation_rejects_invalid_ids(invalid):
+    # A device assertion poisons its context; never issue one in the pytest process.
+    import subprocess
+    import sys
+
+    script = f"""
+import torch
+from types import SimpleNamespace
+from cudnn.moe_ep._validation import _validate_expert_ids
+config = SimpleNamespace(public_config=SimpleNamespace(model=SimpleNamespace(num_experts=2)))
+_validate_expert_ids(config, torch.tensor([0, {invalid}], device='cuda', dtype=torch.int32))
+torch.cuda.synchronize()
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "valid global expert id" in result.stderr and "device-side assert" in result.stderr
+
+
+@pytest.mark.parametrize("token_axis", [False, True])
+def test_deepgemm_baseline_empty_operand(monkeypatch, token_axis):
+    # The operand preparation has no DeepGEMM calls; exercise the real benchmark
+    # helper even on CPU-only installations without that optional dependency.
+    import importlib.util
+    from pathlib import Path
+    import sys
+    from types import ModuleType
+
+    root = Path(__file__).resolve().parents[3] / "benchmark"
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setitem(sys.modules, "deep_gemm", ModuleType("deep_gemm"))
+    spec = importlib.util.spec_from_file_location("nvfp4_baseline_test", root / "bench_deepgemm_bf16_moe_ep.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    payload, scales = module.fp8_operand.__wrapped__(torch.empty(0, 256), token_axis)
+    assert payload.shape == (0, 256) and scales.shape == ((0, 256) if token_axis else (0, 2))

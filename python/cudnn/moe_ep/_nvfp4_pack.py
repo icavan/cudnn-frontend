@@ -122,6 +122,8 @@ class PackTile:
             sf[row, block] = rounded
             payload[row, block] = word
 
+    quantize.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(self, x: cute.Tensor, source_sf, source_norm, norm: cute.Tensor, payload: cute.Tensor, sf: cute.Tensor, stream: cuda.CUstream):
         groups = self.rows * self.k // 16
@@ -183,6 +185,8 @@ class SwiGLUForward:
         row, col = index // self.width, index % self.width
         g, u, sigmoid = _gate_values(pre[row, col], pre[row, self.width + col], self.limit)
         result[row, col] = ((u * g) * sigmoid) * p[row]
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(self, pre: cute.Tensor, p: cute.Tensor, result: cute.Tensor, stream: cuda.CUstream):
@@ -259,6 +263,8 @@ class SwiGLUBackward:
             for c in cutlass.range_constexpr(1, self.chunks):
                 result += parts[c]
             dp[row] = result
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(
@@ -413,6 +419,8 @@ class DualPack:
         elif lane == 0:
             partials[(rb * 16 + warp) * self.chunks + chunk] = 0.0
 
+    swiglu_pack.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.kernel
     def finish_dp(self, partials, dp):
         row = cute.arch.block_idx()[0] * 128 + cute.arch.thread_idx()[0]
@@ -420,6 +428,8 @@ class DualPack:
         for c in cutlass.range_constexpr(1, self.chunks):
             total += partials[row * self.chunks + c]
         dp[row] = total
+
+    finish_dp.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def swiglu(
@@ -516,6 +526,8 @@ class DualPack:
                 scales = cute.make_ptr(cutlass.Uint8, table[self.scale_field], cute.AddressSpace.gmem)
                 cute.arch.store(data + at, packed)
                 cute.arch.store(scales + at, scale.bitcast(cutlass.Uint8))
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(
@@ -625,6 +637,8 @@ class RepackSaved:
                 sf[out] = scale
             cute.arch.sync_threads()
             job += cute.arch.grid_dim()[0]
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(

@@ -115,6 +115,8 @@ class ForwardPack:
             sf[atom * 512 + row % 32 * 16 + row % 128 // 32 * 4 + block % 4] = rounded
             job += cute.arch.grid_dim()[0] * 128
 
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def __call__(self, peers, slots, owners, bounds, base: cutlass.Int32, prob, norm, alpha, acc, pre, saved_data, saved_sf, data, sf, stream: cuda.CUstream):
         self.kernel(peers, slots, owners, bounds, base, prob, norm, alpha, acc, pre, saved_data, saved_sf, data, sf).launch(
@@ -168,6 +170,8 @@ class ForwardReturn:
                 cute.autovec_copy(result, cute.make_tensor(dst.align(8), cute.make_layout(4)))
             at += cute.arch.grid_dim()[0] * 128
 
+    scatter.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def put(self, peers, slots, owners, bounds, base: cutlass.Int32, acc, alpha, stream: cuda.CUstream):
         self.scatter(peers, slots, owners, bounds, base, acc, alpha).launch(grid=(min(1024, self.rows * self.h // 512), 1, 1), block=(128, 1, 1), stream=stream)
@@ -187,6 +191,8 @@ class ForwardReturn:
                 total += values[first + slot * self.h].to(cutlass.Float32)
             out[at] = total.to(cutlass.BFloat16)
             at += cute.arch.grid_dim()[0] * 128
+
+    sum_slots.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def reduce(self, values, out, count: cutlass.Int32, stream: cuda.CUstream):

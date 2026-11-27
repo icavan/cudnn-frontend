@@ -196,6 +196,8 @@ class MoeEp:
     instance for another device.
 
     ``validation_mode="strict"`` validates expert IDs before eager execution.
+    CUDA value validation is asynchronous: invalid IDs cause a device assertion
+    and the process must be restarted. CPU validation raises ``ValueError``.
     ``validation_mode="trusted"`` skips only that value-range check; callers
     must guarantee that every routing ID belongs to ``[0, num_experts)``.
     Negative IDs and dropped-route sentinels are not supported. CUDA Graph
@@ -1182,6 +1184,7 @@ class MoeEp:
                         config.data_path,
                         config.parallel.max_tokens_per_rank,
                         config.parallel.physical_recv_pool_rows,
+                        resolved.receive_capacity.physical_recv_pool_rows,
                         config.parallel.drop_on_overflow,
                     )
                 contracts = [None] * resolved.topology.ep_size

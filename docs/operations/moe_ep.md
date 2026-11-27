@@ -205,7 +205,9 @@ supported. Private fixed-capacity staging may use `-1` after row `T`; callers
 never pass or consume that tail.
 
 `validation_mode="strict"` checks expert-ID values during eager execution and
-warmup. `"trusted"` skips that device-value check and relies on the caller.
+warmup. On CUDA this uses an asynchronous device assertion; invalid IDs poison
+the CUDA context and require restarting the process. CPU validation raises
+`ValueError`. `"trusted"` skips that device-value check and relies on the caller.
 Structural shape, dtype, device, capacity, aliasing, and output checks stay
 enabled in both modes. CUDA Graph capture and replay perform no semantic
 routing validation, so routing contents updated at captured addresses must
@@ -726,6 +728,10 @@ encoding multiplier. Give each live microbatch a separate forward record and
 pass its matching routing tensors to backward. The record contains FP32 preactivations,
 the actual X/A bytes and scales, and rank-major flattened token/slot indices.
 Its expert offsets are exclusive ends of 256-row padded segments.
+NVFP4 preparation uses the resolved public receive capacity exactly. Automatic
+capacity covers both configured inference padding and 256-row training padding,
+then rounds up to 256 rows. An explicit capacity must cover every possible route
+and be divisible by 256. Every EP rank must resolve the same physical capacity.
 For multiple in-flight microbatches, `saved = op.compact_training_record(record)`
 copies the live padded rows, the output and routing metadata into independent
 storage. Reuse the full forward bundle on the same stream and pass `saved` to
@@ -783,8 +789,11 @@ tail. Smaller workloads use descending window sizes down to a single tile. An em
 
 Dgrad selects the expert in the weight and scale TMA descriptors. With contiguous,
 16-byte aligned weights, an enclosing CUDA Graph reads the caller's packed
-weights directly. Eager execution stages each bank once for the prepared graph. Both paths
-reorder weight scales once per bank per call. For wgrad, each expert's packed
+weights directly. Eager execution stages each bank once because the internal
+graph captures its TMA base address before caller weights exist. The training
+convenience API also stages strided or unaligned payload views into prepared
+storage; callers requiring direct reads should provide aligned contiguous banks
+and capture backward. Both paths reorder weight scales once per bank per call. For wgrad, each expert's packed
 token-axis operands are laid out contiguously in K, with separate swizzled block
 scales. Two grouped GEMMs write the caller's FP32 gradients. This also applies
 to deferred `training_wgrad`.
@@ -943,8 +952,8 @@ The following limits apply to the default MXFP8 backend.
 - NVIDIA Rubin SM107 GPUs (compute capability 10.7).
 - CUDA and PyTorch execution.
 - `nvidia-cutlass-dsl>=4.8.0` for the Rubin kernels. The package-wide
-  `cutedsl` extra retains its 4.5.0 installation floor so other cuDNN Frontend
-  operations remain usable with older compatible DSL versions.
+  base package requires `nvidia-cutlass-dsl[cu13]>=4.6.2`; the `cutedsl` extra
+  adds only `cuda-python`. The higher Rubin requirement is checked at runtime.
 - Fused SwiGLU with contiguous expert sharding.
 - `apply_topk_in_fc1=True`.
 - `hidden_size` divisible by 128.

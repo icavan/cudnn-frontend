@@ -5,6 +5,9 @@
 
 import hashlib
 import os
+import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +30,8 @@ from test_nvfp4_training import (
     MoeFormat,
 )
 
+from nvfp4_test_support import nvfp4_gpu
+
 pytestmark = pytest.mark.L0
 
 
@@ -37,6 +42,7 @@ def assert_combined_output(actual, expected):
     assert torch.quantile(relative, 0.99) < 0.03 and relative.max() < 0.05
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_pinned_bf16_input_quantization():
     """Frozen cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, false> outputs from the pinned CUDA source."""
     from cudnn.moe_ep._nvfp4_pack import PackTile
@@ -55,6 +61,7 @@ def test_pinned_bf16_input_quantization():
             assert torch.equal(sf[:active].view(torch.uint8), torch.from_numpy(frozen[f"sf{j}"]).cuda())
 
 
+@pytest.mark.usefixtures("nvfp4_gpu")
 def test_frozen_blackwell_forward():
     """Replay the operands and workspace outputs of the pinned TRT-LLM device kernel."""
     device = torch.device("cuda", torch.cuda.current_device())
@@ -89,13 +96,31 @@ def test_frozen_blackwell_forward():
     op.close()
 
 
-def test_pinned_blackwell_forward(monkeypatch):
+@pytest.mark.usefixtures("nvfp4_gpu")
+def test_pinned_blackwell_forward():
     root = os.environ.get("TRTLLM_MEGAMOE_KERNELS")
     if not root:
         pytest.skip("set TRTLLM_MEGAMOE_KERNELS for the optional pinned forward comparison")
-    source = Path(root) / "cutedsl_megamoe/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py"
-    assert hashlib.sha256(source.read_bytes()).hexdigest() == "c186861316e70c9995a0f93c3cfe5dddf6fc4d31666553daf84afd9824ae773b"
-    monkeypatch.syspath_prepend(root)
+    validate_pinned_sources(root)
+    # An already imported cutedsl_megamoe can defeat sys.path changes. Isolate
+    # both its Python modules and compiled DSL objects from the pytest process.
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), str(Path(root).resolve())], check=True)
+
+
+def validate_pinned_sources(root):
+    manifest = json.loads((Path(__file__).with_name("data") / "trtllm_933366a_sources.json").read_text())
+    package = Path(root).resolve() / "cutedsl_megamoe"
+    expected = manifest["sha256"]
+    actual = {str(path.relative_to(package)): path for path in package.rglob("*.py")}
+    assert actual.keys() == expected.keys(), f"TRT-LLM {manifest['revision']} source file set differs"
+    for name, digest in expected.items():
+        assert hashlib.sha256(actual[name].read_bytes()).hexdigest() == digest, f"TRT-LLM pinned source differs: {name}"
+    return package
+
+
+def _run_pinned_blackwell_forward(root):
+    package = validate_pinned_sources(root)
+    sys.path.insert(0, str(package.parent))
     import cutlass
     import cutlass.cute as cute
     import cutlass.torch as ct
@@ -240,9 +265,35 @@ def test_pinned_blackwell_forward(monkeypatch):
         torch.testing.assert_close(partial[:, ex], ((dense_a @ dense_w.T) * fw.fc2_alpha[ex]).bfloat16(), rtol=0.01, atol=0.005)
     assert_combined_output(y, target)
     op.close()
+    # Include dependencies loaded lazily by compilation, including epilogues.
+    for name, module in tuple(sys.modules.items()):
+        if name == "cutedsl_megamoe" or name.startswith("cutedsl_megamoe."):
+            assert Path(module.__file__).resolve().is_relative_to(package), f"foreign TRT-LLM module: {name}"
+    validate_pinned_sources(root)
 
 
 def unpack_ref(data, sf):
     from cudnn.moe_ep import BlockScaledTensor
 
     return BlockScaledTensor(data, sf, MoeFormat.NVFP4, (data.shape[0], data.shape[1] * 2)).dequantize()
+
+
+def test_pinned_source_validation_rejects_changed_dependency(tmp_path, monkeypatch):
+    package = tmp_path / "cutedsl_megamoe"
+    package.mkdir()
+    source = package / "epilogue.py"
+    source.write_text("original")
+    manifest = {"revision": "test", "sha256": {"epilogue.py": hashlib.sha256(b"original").hexdigest()}}
+    monkeypatch.setattr(json, "loads", lambda _: manifest)
+    validate_pinned_sources(tmp_path)
+    source.write_text("changed")
+    with pytest.raises(AssertionError, match="epilogue.py"):
+        validate_pinned_sources(tmp_path)
+    source.write_text("original")
+    (package / "extra.py").write_text("")
+    with pytest.raises(AssertionError, match="file set"):
+        validate_pinned_sources(tmp_path)
+
+
+if __name__ == "__main__":
+    _run_pinned_blackwell_forward(sys.argv[1])

@@ -991,3 +991,22 @@ identical kernel in a plain graph and check the native conditional replay and
 Memcheck separately. On B300, Synccheck 2025.3 also reports divergence for an
 independent CUDA SDK WHILE body containing a 32-lane sum with an unconditional
 barrier. A conditional-graph finding alone cannot localize the defective warp.
+
+A prepared helper that captures its own CUDA graphs must select an explicit
+`torch.cuda.Stream(device=...)`: PyTorch caches the implicit `torch.cuda.graph`
+capture stream process-wide, so preparing GPU 0 before GPU 1 can bind
+the second capture to the first GPU. The regression must prepare and execute
+both devices in one process; isolated single-device workers cannot detect it.
+`moe_ep/test_nvfp4_training.py::test_prepare_on_two_devices` covers this case.
+The context manager also synchronizes the whole device on entry. Explicit
+`capture_begin` / `capture_end` on the chosen stream can avoid that host wait;
+order setup with `capture_stream.wait_stream(producer)` before beginning capture.
+
+An independent vendor GEMM is not a bitwise oracle for a long FP32 reduction:
+its accumulation tree can differ. Preserve byte equality for serial versus
+pipeline executions with identical arithmetic, and use the existing FP32
+forward-error budget for the independent reduction. Before changing a failing
+comparison, replay the exact operands through the previous kernel and compare
+both against FP64. The NVFP4 EP8 worker at 1,537 tokens/rank, H=1,024, I=256,
+top-k=6 reproduces this distinction; the old and new grouped kernels agree
+bitwise while cuBLAS has a different long-K rounding error.

@@ -103,6 +103,8 @@ class PeerKernels:
                 prob = cute.arch.load(ptr + slot % (self.tokens * self.k), cutlass.Float32)
             p[row] = prob
 
+    receive.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.kernel
     def publish(self, base: cute.Tensor, slots: cute.Tensor, dx: cute.Tensor, dp: cute.Tensor, generation: cute.Tensor, divisor):
         row, chunk, _ = cute.arch.block_idx()
@@ -163,6 +165,8 @@ class PeerKernels:
                             combined = cute.make_ptr(cutlass.Uint16, peer + self.combined, cute.AddressSpace.gmem)
                             cute.arch.store(combined + token * self.h + col, total.to(cutlass.BFloat16).bitcast(cutlass.Uint16))
 
+    publish.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.kernel
     def signal_return(self, base, slots, dp):
         row = cute.arch.block_idx()[0] * 128 + cute.arch.thread_idx()[0]
@@ -178,6 +182,8 @@ class PeerKernels:
             # stores happen before this cumulative system release.
             counts = cute.make_ptr(cutlass.Int32, peer + self.flags, cute.AddressSpace.gmem)
             cute.arch.atomic_add(counts + local // self.k * self.chunks + chunk, cutlass.Int32(1), sem="acq_rel", scope="sys")
+
+    signal_return.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def notify(self, base: cute.Tensor, slots: cute.Tensor, dp: cute.Tensor, stream: cuda.CUstream):
@@ -222,6 +228,8 @@ class PeerKernels:
                         cute.autovec_copy(result, cute.make_tensor(ptr.align(8), cute.make_layout(4)))
             cute.arch.sync_threads()
             entry += cute.arch.grid_dim()[0]
+
+    reduce_ready.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def drain(self, counts: cute.Tensor, gen: cute.Tensor, done: cute.Tensor, dx: cute.Tensor, combined: cute.Tensor, stream: cuda.CUstream):

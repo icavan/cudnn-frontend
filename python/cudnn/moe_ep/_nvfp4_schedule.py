@@ -145,6 +145,8 @@ class WindowBindings:
                 small_view[at] = large_view[at]
             at += 256 * cute.arch.grid_dim()[0]
 
+    copy_window.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def transfer(
         self, external: cute.Tensor, local: cute.Tensor, words: cute.Tensor, base: cute.Tensor, n: cutlass.Int32, fields: cutlass.Int32, stream: cuda.CUstream
@@ -200,6 +202,8 @@ class WindowRoutes:
         slots[tile * 256 + lane] = slot
         if lane == 0:
             experts[tile] = expert
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def launch(
