@@ -1036,8 +1036,9 @@ def test_strict_cuda_route_validation_rejects_invalid_ids(invalid):
 import torch
 from types import SimpleNamespace
 from cudnn.moe_ep._validation import _validate_expert_ids
+torch.cuda.set_device({torch.cuda.current_device()})
 config = SimpleNamespace(public_config=SimpleNamespace(model=SimpleNamespace(num_experts=2)))
-_validate_expert_ids(config, torch.tensor([0, {invalid}], device='cuda:{torch.cuda.current_device()}', dtype=torch.int32))
+_validate_expert_ids(config, torch.tensor([0, {invalid}], device='cuda', dtype=torch.int32))
 torch.cuda.synchronize()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
