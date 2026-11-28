@@ -8,6 +8,7 @@ import os
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,10 +102,23 @@ def test_pinned_blackwell_forward():
     root = os.environ.get("TRTLLM_MEGAMOE_KERNELS")
     if not root:
         pytest.skip("set TRTLLM_MEGAMOE_KERNELS for the optional pinned forward comparison")
-    validate_pinned_sources(root)
+    package = validate_pinned_sources(root)
     # An already imported cutedsl_megamoe can defeat sys.path changes. Isolate
     # both its Python modules and compiled DSL objects from the pytest process.
-    subprocess.run([sys.executable, str(Path(__file__).resolve()), str(Path(root).resolve())], check=True)
+    # Copy verified source only: existing timestamp-valid .pyc files must not
+    # silently substitute a different implementation in the child interpreter.
+    with tempfile.TemporaryDirectory(prefix="nvfp4-trtllm-") as staging:
+        stage_pinned_sources(package, staging)
+        subprocess.run([sys.executable, str(Path(__file__).resolve()), staging, str(torch.cuda.current_device())], check=True)
+
+
+def stage_pinned_sources(package, destination):
+    staged = Path(destination) / "cutedsl_megamoe"
+    for source in package.rglob("*.py"):
+        target = staged / source.relative_to(package)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    validate_pinned_sources(destination)
 
 
 def validate_pinned_sources(root):
@@ -118,7 +132,8 @@ def validate_pinned_sources(root):
     return package
 
 
-def _run_pinned_blackwell_forward(root):
+def _run_pinned_blackwell_forward(root, device_index):
+    torch.cuda.set_device(device_index)
     package = validate_pinned_sources(root)
     sys.path.insert(0, str(package.parent))
     import cutlass
@@ -286,6 +301,13 @@ def test_pinned_source_validation_rejects_changed_dependency(tmp_path, monkeypat
     manifest = {"revision": "test", "sha256": {"epilogue.py": hashlib.sha256(b"original").hexdigest()}}
     monkeypatch.setattr(json, "loads", lambda _: manifest)
     validate_pinned_sources(tmp_path)
+    cache = package / "__pycache__"
+    cache.mkdir()
+    (cache / "epilogue.pyc").write_bytes(b"unverified bytecode")
+    staged = tmp_path / "staged"
+    stage_pinned_sources(package, staged)
+    assert not list(staged.rglob("*.pyc"))
+    assert (staged / "cutedsl_megamoe/epilogue.py").read_text() == "original"
     source.write_text("changed")
     with pytest.raises(AssertionError, match="epilogue.py"):
         validate_pinned_sources(tmp_path)
@@ -296,4 +318,4 @@ def test_pinned_source_validation_rejects_changed_dependency(tmp_path, monkeypat
 
 
 if __name__ == "__main__":
-    _run_pinned_blackwell_forward(sys.argv[1])
+    _run_pinned_blackwell_forward(sys.argv[1], int(sys.argv[2]))

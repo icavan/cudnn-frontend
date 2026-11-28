@@ -19,6 +19,30 @@ V4_PRESETS = {
 }
 
 
+def _profiler_call(action, rank):
+    """Check CUDA profiler status and report a rank-0 failure to every rank."""
+    error = [None]
+    if rank == 0:
+        try:
+            getattr(torch.cuda.profiler, action)()
+        except Exception as exc:
+            error[0] = f"CUDA profiler {action} failed: {exc}"
+    dist.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise RuntimeError(error[0])
+
+
+def profile_replay(run, rank):
+    """One untimed replay; profiling failures abort before timing collectives."""
+    dist.barrier()
+    _profiler_call("start", rank)
+    try:
+        run()
+        torch.cuda.synchronize()
+    finally:
+        _profiler_call("stop", rank)
+
+
 def configure_model(args):
     args.clamp, args.route_scale = 7.0, None
     if args.model is not None:
@@ -148,15 +172,7 @@ def measure(args, t, rank, device):
                 run()
         samples = []
         if args.profile and overlap:
-            dist.barrier()
-            if rank == 0:
-                torch.cuda.cudart().cudaProfilerStart()
-            try:
-                run() if graph is None else graph.replay()
-                torch.cuda.synchronize()
-            finally:
-                if rank == 0:
-                    torch.cuda.cudart().cudaProfilerStop()
+            profile_replay(run if graph is None else graph.replay, rank)
         for iteration in range(args.repeats):
             dist.barrier()
             resident = torch.cuda.memory_allocated()

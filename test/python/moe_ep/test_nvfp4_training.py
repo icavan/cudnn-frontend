@@ -24,7 +24,7 @@ from cudnn.moe_ep import (
     MoeEpTrainingBackwardOutputs,
 )
 from cudnn.moe_ep._nvfp4 import pack
-from nvfp4_test_support import nvfp4_gpu, owned_graph
+from nvfp4_test_support import nvfp4_gpu, owned_graph, require_nvfp4_devices
 
 pytestmark = pytest.mark.L0
 
@@ -849,6 +849,7 @@ def test_two_cta_grouped_wgrad_reuses_tmem_across_expert_boundaries():
 def test_prepare_on_two_devices(monkeypatch):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two visible devices")
+    require_nvfp4_devices((0, 1))
     config = MoeEpConfig(
         model=MoeEpModelConfig(num_experts=1, hidden_size=32, intermediate_size=32, top_k=1),
         parallel=MoeEpParallelConfig(max_tokens_per_rank=1),
@@ -991,7 +992,7 @@ def test_bounded_scheduler_visits_each_live_tile_once():
         with owned_graph() as graph:
             with torch.cuda.graph(graph):
                 Nvfp4Training._live_windows(state, (), True)
-            for live in (32, 33, 64, 65):
+            for live in (32, 33, 64, 65, 96, 97, 128):
                 bounds[1].fill_(live)
                 seen.zero_()
                 bad_padding.zero_()
@@ -1005,22 +1006,22 @@ def test_bounded_scheduler_visits_each_live_tile_once():
 
 
 @pytest.mark.parametrize(
-    "installed,error,cuda_available,capability",
+    "installed,error,cuda_available,capability,reason",
     [
-        (False, None, False, None),
-        (True, "requires CuTeDSL >=4.7.0", False, None),
-        (True, None, False, None),
-        (True, None, True, (9, 0)),
+        (False, None, True, (10, 0), "require nvidia-cutlass-dsl"),
+        (True, "requires CuTeDSL >=4.7.0", True, (10, 0), "requires CuTeDSL"),
+        (True, None, False, None, "require CUDA"),
+        (True, None, True, (9, 0), "require Blackwell"),
     ],
 )
-def test_gpu_environment_gate_skips_before_kernel_import(monkeypatch, installed, error, cuda_available, capability):
+def test_gpu_environment_gate_skips_before_kernel_import(monkeypatch, installed, error, cuda_available, capability, reason):
     from cudnn.frost import buffers as device_buffers
 
     monkeypatch.setattr(device_buffers, "cutedsl_state", lambda: (installed, None))
     monkeypatch.setattr(device_buffers, "cutedsl_requirement_error", lambda _: error)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-    with pytest.raises(pytest.skip.Exception):
+    with pytest.raises(pytest.skip.Exception, match=reason):
         nvfp4_gpu.__wrapped__()
 
 
@@ -1036,7 +1037,7 @@ import torch
 from types import SimpleNamespace
 from cudnn.moe_ep._validation import _validate_expert_ids
 config = SimpleNamespace(public_config=SimpleNamespace(model=SimpleNamespace(num_experts=2)))
-_validate_expert_ids(config, torch.tensor([0, {invalid}], device='cuda', dtype=torch.int32))
+_validate_expert_ids(config, torch.tensor([0, {invalid}], device='cuda:{torch.cuda.current_device()}', dtype=torch.int32))
 torch.cuda.synchronize()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
@@ -1061,3 +1062,40 @@ def test_deepgemm_baseline_empty_operand(monkeypatch, token_axis):
     spec.loader.exec_module(module)
     payload, scales = module.fp8_operand.__wrapped__(torch.empty(0, 256), token_axis)
     assert payload.shape == (0, 256) and scales.shape == ((0, 256) if token_axis else (0, 2))
+
+
+def test_two_device_gate_checks_second_device(monkeypatch):
+    checked = []
+
+    def capability(index):
+        checked.append(index)
+        return (10, 0) if index == 0 else (9, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    with pytest.raises(pytest.skip.Exception, match="cuda:1"):
+        require_nvfp4_devices((0, 1))
+    assert checked == [0, 1]
+
+
+@pytest.mark.usefixtures("nvfp4_gpu")
+def test_prepare_rejects_capture_before_allocating(monkeypatch):
+    from cudnn.moe_ep import _nvfp4_training
+
+    config = MoeEpConfig(
+        model=MoeEpModelConfig(num_experts=1, hidden_size=32, intermediate_size=32, top_k=1),
+        parallel=MoeEpParallelConfig(max_tokens_per_rank=1),
+        data_path=MoeEpDataPathConfig(compute_format=MoeFormat.NVFP4),
+    )
+
+    def unexpected_prepare(*args, **kwargs):
+        raise AssertionError("entered allocating preparation during capture")
+
+    monkeypatch.setattr(_nvfp4_training, "Nvfp4Training", unexpected_prepare)
+    value = torch.zeros(1, device="cuda")
+    with MoeEp(config) as op, owned_graph() as graph:
+        with torch.cuda.graph(graph):
+            with pytest.raises(RuntimeError, match="before CUDA Graph capture"):
+                op.prepare_training()
+            value.add_(1)
+        graph.replay()
+        assert value.item() == 1

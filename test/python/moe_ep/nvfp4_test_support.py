@@ -33,3 +33,10 @@ def owned_graph():
         yield graph
     finally:
         graph.reset()
+
+
+def require_nvfp4_devices(devices):
+    """Gate every operand device before any test allocation or launch."""
+    for device in devices:
+        if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+            pytest.skip(f"NVFP4 test requires Blackwell SM100/SM103 on cuda:{device}")

@@ -998,9 +998,17 @@ capture stream process-wide, so preparing GPU 0 before GPU 1 can bind
 the second capture to the first GPU. The regression must prepare and execute
 both devices in one process; isolated single-device workers cannot detect it.
 `moe_ep/test_nvfp4_training.py::test_prepare_on_two_devices` covers this case.
+Gate both selected devices before allocating, and pass the admitted CUDA ordinal
+explicitly to subprocess comparisons. Negative dependency-gate tests must leave
+all other prerequisites supported and match the specific skip reason; otherwise
+a later CUDA gate can mask a missing version check.
 The context manager also synchronizes the whole device on entry. Explicit
 `capture_begin` / `capture_end` on the chosen stream can avoid that host wait;
 order setup with `capture_stream.wait_stream(producer)` before beginning capture.
+
+Hashing a vendor checkout's Python sources does not validate cached bytecode.
+Pinned implementation comparisons must stage only verified source files into a
+fresh directory, revalidate the staged bytes, and import that isolated package.
 
 An independent vendor GEMM is not a bitwise oracle for a long FP32 reduction:
 its accumulation tree can differ. Preserve byte equality for serial versus

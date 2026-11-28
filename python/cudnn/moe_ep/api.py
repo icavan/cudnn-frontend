@@ -1155,6 +1155,11 @@ class MoeEp:
         """Collectively prepare private training runtime and return contracts.
 
         ``device`` defaults to the current CUDA device. No weights are retained.
+        This explicit setup call allocates instance scratch, compiles kernels and
+        registers communication storage; it must run before CUDA Graph capture.
+        Keep the instance alive through replay and destroy caller graphs before
+        :meth:`close`. The returned requirements describe caller-owned cross-phase
+        outputs, not the private instance workspace.
         Stable symmetric input and final-output buffers are available through
         :meth:`training_symmetric_buffers`.
 
@@ -1173,6 +1178,10 @@ class MoeEp:
             resolved = execution_state.resolved_config
             config = resolved.public_config
             nvfp4 = config.data_path.compute_format is MoeFormat.NVFP4
+            if nvfp4:
+                with torch.cuda.device(device):
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError("prepare_training must run before CUDA Graph capture")
             group = config.parallel.ep_group
             if group is not None:
                 # Peer kernels derive address offsets from these static fields on each rank.
