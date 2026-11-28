@@ -12,7 +12,7 @@ from typing import Tuple, Union
 
 import torch
 
-from ._math import ceil_div
+from ._math import ceil_div, positive_fp32
 
 
 class MoeFormat(str, Enum):
@@ -343,6 +343,107 @@ class MoeEpBackwardWeightStaging:
 
 
 @dataclass(frozen=True)
+class MoeEpNvfp4ForwardWeights:
+    """Logical gate-then-up checkpoint payloads with unswizzled E4M3 scales."""
+
+    fc1: BlockScaledTensor
+    fc2: BlockScaledTensor
+    input_norm: torch.Tensor
+    fc1_norm_const: torch.Tensor
+    fc31_alpha: torch.Tensor
+    fc2_alpha: torch.Tensor
+
+    def __post_init__(self):
+        experts, gateup, hidden = self.fc1.shape
+        if gateup % 2 or self.fc2.shape != (experts, hidden, gateup // 2):
+            raise ValueError("inconsistent FC1 and FC2 NVFP4 weight geometry")
+        for name in ("input_norm", "fc1_norm_const", "fc31_alpha", "fc2_alpha"):
+            value = getattr(self, name)
+            if value.dtype != torch.float32 or value.device != self.fc1.device or (value.numel() != 1 if name == "input_norm" else value.shape != (experts,)):
+                raise ValueError(f"invalid checkpoint scale {name}")
+            if not bool((torch.isfinite(value) & (value > 0)).all()):
+                raise ValueError(f"{name} must contain finite positive checkpoint scales")
+
+    @classmethod
+    def from_trtllm(cls, view, input_norm, *, input_channel_scale):
+        """Import a checkpoint view and the owning module's optional fc31_act_scale."""
+        if input_channel_scale is not None or getattr(view, "fc31_act_scale", None) is not None:
+            raise ValueError("NVFP4 training does not implement the input channel scale gradient")
+
+        def decode(data, sf, gate_up):
+            if data.ndim != 3 or data.dtype not in (torch.uint8, getattr(torch, "float4_e2m1fn_x2", None)):
+                raise ValueError("expected a rank-3 packed NVFP4 weight payload")
+            experts, rows, k_bytes = data.shape
+            cols = k_bytes // 8
+            row_tiles, col_tiles = ceil_div(rows, 128), ceil_div(cols, 4)
+            sf_bytes = row_tiles * col_tiles * 512
+            if sf.dtype not in (torch.uint8, torch.float8_e4m3fn) or sf.ndim != 2 or sf.shape[0] != experts or sf.shape[1] < sf_bytes:
+                raise ValueError(f"expected a flat E4M3 scale carrier per expert with at least {sf_bytes} bytes")
+            raw = sf.view(torch.uint8)[:, :sf_bytes]
+            logical = raw.reshape(experts, row_tiles, col_tiles, 32, 4, 4).permute(0, 1, 4, 3, 2, 5)
+            logical = logical.reshape(experts, row_tiles * 128, col_tiles * 4)[:, :rows, :cols]
+            data = data.view(torch.uint8)
+            if gate_up:
+
+                def separate(t):
+                    return t.reshape(experts, rows // 32, 2, 16, -1).transpose(1, 2).reshape(experts, rows, -1)
+
+                data, logical = separate(data), separate(logical)
+            return BlockScaledTensor(data.contiguous(), logical.contiguous().view(torch.float8_e4m3fn), MoeFormat.NVFP4, (experts, rows, 2 * k_bytes))
+
+        return cls(
+            decode(view.fc1_weight, view.fc1_weight_sf, True),
+            decode(view.fc2_weight, view.fc2_weight_sf, False),
+            input_norm,
+            view.fc1_norm_const,
+            view.fc31_alpha,
+            view.fc2_alpha,
+        )
+
+
+@dataclass(frozen=True)
+class MoeEpNvfp4BackwardWeights:
+    """Independent reduction-axis packs made from one version of the logical master weights."""
+
+    w1_transpose: BlockScaledTensor
+    w2_transpose: BlockScaledTensor
+    w1_norm: float
+    w2_norm: float
+
+    def __post_init__(self):
+        for name in ("w1_norm", "w2_norm"):
+            object.__setattr__(self, name, positive_fp32(getattr(self, name), name))
+
+    @classmethod
+    @torch.no_grad()
+    def from_master(cls, w1, w2, *, w1_norm=1.0, w2_norm=1.0):
+        from ._nvfp4 import MasterWeightPacker
+
+        if w1.ndim != 3 or w2.shape != (w1.shape[0], w1.shape[2], w1.shape[1] // 2) or w2.device != w1.device:
+            raise ValueError("expected master weights [E,2I,H] and [E,H,I] on one device")
+
+        w1_norm, w2_norm = positive_fp32(w1_norm, "w1_norm"), positive_fp32(w2_norm, "w2_norm")
+
+        def transpose(weight, norm):
+            if not weight.is_floating_point() or weight.shape[1] % 16:
+                raise ValueError("expected floating master weights with a reduction dimension divisible by 16")
+            pack_tile = MasterWeightPacker(norm, weight.device)
+            values = weight.transpose(-1, -2)
+            experts, rows, k = values.shape
+            data = torch.empty((experts, rows, k // 2), dtype=torch.uint8, device=weight.device)
+            sf = torch.empty((experts, rows, k // 16), dtype=torch.float8_e4m3fn, device=weight.device)
+            for e in range(experts):
+                for start in range(0, rows, 256):
+                    tile = slice(start, start + 256)
+                    payload, scale = pack_tile(values[e, tile])
+                    data[e, tile].copy_(payload)
+                    sf[e, tile].copy_(scale)
+            return BlockScaledTensor(data, sf, MoeFormat.NVFP4, tuple(values.shape))
+
+        return cls(transpose(w1, w1_norm), transpose(w2, w2_norm), w1_norm, w2_norm)
+
+
+@dataclass(frozen=True)
 class MoeEpTrainingForwardOutputs:
     """Forward destinations, including the instance's symmetric output buffer."""
 
@@ -352,6 +453,10 @@ class MoeEpTrainingForwardOutputs:
     fc1_sfa: torch.Tensor | None = None
     valid_route_counts: torch.Tensor | None = None
     expert_offsets: torch.Tensor | None = None
+    saved_a: torch.Tensor | None = None
+    saved_sfa: torch.Tensor | None = None
+    route_slots: torch.Tensor | None = None
+    activation_norms: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -366,13 +471,23 @@ class MoeEpTrainingBackwardOutputs:
     fc2_sfa: torch.Tensor | None = None
     fc2_b: torch.Tensor | None = None
     fc2_sfb: torch.Tensor | None = None
+    fc1_wgrad_a: torch.Tensor | None = None
+    fc1_wgrad_sfa: torch.Tensor | None = None
+    wgrad_expert_offsets: torch.Tensor | None = None
+    wgrad_valid_route_counts: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class MoeEpTrainingWgradOperands:
-    """Non-owning views over caller-owned fixed-capacity WGrad operands.
+    """Fixed-capacity WGrad operand views and their matching routing metadata.
 
-    ``fc1_a`` and ``fc2_a`` are contiguous token-major activations with shapes
+    In NVFP4 mode each payload is [tile, feature, 128] (two E2M1 codes
+    per byte), with logical E4M3 scales [tile, feature, 16]. Tiles cover
+    256 routes of one expert. The prepared training_wgrad consumer applies
+    the configured global encoding multipliers. NVFP4 segment metadata is
+    snapshotted at backward time and shares the lifetime of the backward bundle.
+
+    In MXFP8 mode ``fc1_a`` and ``fc2_a`` are contiguous token-major activations with shapes
     ``(T, H)`` and ``(T, I)``. Their corresponding token-major gradient
     outputs are ``fc1_b=(T, 2I)`` and ``fc2_b=(T, H)``.
 
@@ -393,6 +508,7 @@ class MoeEpTrainingWgradOperands:
     fc2_sfb: torch.Tensor
     expert_offsets: torch.Tensor
     valid_route_counts: torch.Tensor
+    encoding_norms: tuple[float, float, float, float] | None = None
 
 
 MoeTensor = Union[torch.Tensor, BlockScaledTensor]
@@ -416,6 +532,8 @@ __all__ = [
     "MoeEpTrainingForwardOutputs",
     "MoeEpTrainingWgradOperands",
     "MoeFormat",
+    "MoeEpNvfp4ForwardWeights",
+    "MoeEpNvfp4BackwardWeights",
     "MoeTensor",
     "parse_native_weight_storage_mode",
     "parse_format",

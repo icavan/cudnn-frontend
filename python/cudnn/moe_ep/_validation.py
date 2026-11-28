@@ -126,12 +126,21 @@ def _validate_expert_ids(
 ) -> None:
     expert_ids = topk_idx.reshape(-1)
     num_experts = config.public_config.model.num_experts
-    if expert_ids.numel() > 0 and bool(((expert_ids < 0) | (expert_ids >= num_experts)).any().item()):
-        raise ValueError(
-            "topk_idx must contain a valid global expert id in "
-            f"[0, {num_experts}) for every route; negative and "
-            "dropped-route sentinel values are not supported"
-        )
+    if expert_ids.numel() == 0:
+        return
+    message = (
+        "topk_idx must contain a valid global expert id in "
+        f"[0, {num_experts}) for every route; negative and "
+        "dropped-route sentinel values are not supported"
+    )
+    valid = ((expert_ids >= 0) & (expert_ids < num_experts)).all()
+    if expert_ids.is_cuda:
+        # Keep strict eager validation on-device. A failed CUDA assertion is
+        # asynchronous and requires restarting the process, like other device
+        # assertions. Capture retains the documented caller-validated contract.
+        torch._assert_async(valid, message)
+    elif not bool(valid):
+        raise ValueError(message)
 
 
 def _validate_routes(
@@ -671,6 +680,13 @@ def validate_training_non_aliasing(
         byte_start, byte_end = _tensor_byte_range(tensor)
         _assert_no_overlap(name, (byte_start, byte_end), ranges)
         ranges.append((byte_start, byte_end, name))
+
+
+def validate_readonly_against_outputs(readonly: Mapping[str, torch.Tensor], outputs: Mapping[str, torch.Tensor]) -> None:
+    """Read-only views may share storage with one another."""
+    ranges = [(*_tensor_byte_range(value), name) for name, value in outputs.items() if value.numel()]
+    for name, value in readonly.items():
+        _assert_no_overlap(name, _tensor_byte_range(value), ranges)
 
 
 def validate_training_forward_outputs(
