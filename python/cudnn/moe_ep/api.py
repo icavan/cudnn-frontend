@@ -1157,6 +1157,8 @@ class MoeEp:
         ``device`` defaults to the current CUDA device. No weights are retained.
         This explicit setup call allocates instance scratch, compiles kernels and
         registers communication storage; it must run before CUDA Graph capture.
+        Every EP rank must enter preparation outside capture in the same order.
+        Precondition rejection is local; it does not recover mismatched peer calls.
         Keep the instance alive through replay and destroy caller graphs before
         :meth:`close`. The returned requirements describe caller-owned cross-phase
         outputs, not the private instance workspace.
